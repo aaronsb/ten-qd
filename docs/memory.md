@@ -63,7 +63,9 @@ layout_collapsed = ["cd"]
 
 It is read defensively, because a hand-edited file is a file someone can get
 wrong: unknown tokens are ignored, a unit named twice is placed once, and
-anything left out is appended in factory order. A malformed arrangement costs
+anything left out is put back where the factory had it — not appended,
+so a unit added in a later version arrives among its neighbours rather than at
+the bottom of everyone's rack. A malformed arrangement costs
 you the arrangement, never the ability to start.
 
 ## What does not

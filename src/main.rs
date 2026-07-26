@@ -1174,13 +1174,23 @@ impl App {
         // PLAY over a stopped decoder.
         {
             let a = &self.stack.aux.state;
-            let live = self.engine.as_ref().is_some_and(|e| e.capture.state.running());
-            let np = self.mpris.now_playing();
             let mut next = a.clone();
-            next.live = live && np.as_ref().is_some_and(|n| n.playing);
-            next.player = np.as_ref().map(|n| n.player.clone());
-            next.title = np.as_ref().map(|n| n.title.clone()).unwrap_or_default();
-            next.artist = np.as_ref().map(|n| n.artist.clone()).unwrap_or_default();
+            // Only when something is actually plugged in. `capture.running()`
+            // means "pw-record is producing bytes" and MPRIS with no preference
+            // reports whichever player happens to be playing — neither is a
+            // statement about this cable. Left ungated, the bay described a
+            // player going straight to the speakers as though it were coming
+            // through the rack.
+            if a.source.is_some() {
+                let live = self.engine.as_ref().is_some_and(|e| e.capture.state.running());
+                let np = self.mpris.now_playing();
+                next.live = live && np.as_ref().is_some_and(|n| n.playing);
+                next.player = np.as_ref().map(|n| n.player.clone());
+                next.title = np.as_ref().map(|n| n.title.clone()).unwrap_or_default();
+                next.artist = np.as_ref().map(|n| n.artist.clone()).unwrap_or_default();
+            } else {
+                next = Default::default();
+            }
             if next != *a {
                 self.stack.apply(Patch { aux: Some(next), ..Default::default() });
             }
@@ -1818,6 +1828,18 @@ fn main() -> Result<()> {
     // Park the radio where it was left. The transport stays stopped: a
     // terminal program that starts making noise on launch is a bad neighbour,
     // whatever the car would have done when you turned the key.
+    // Tell the decoder which source the panel came up on.
+    //
+    // Without this the selector could read TAPE or TUNER while the decoder sat
+    // on its own default of Cd — and the first transport press would then cue
+    // a track from the *disc*, light the CD transport, and leave the deck
+    // reading STOP over music it was not playing.
+    let epoch = app.new_epoch();
+    let source = app.stack.source;
+    if let Some(e) = &app.engine {
+        e.send(EngineCmd::SelectSource { source, epoch });
+    }
+
     if let Some(e) = &app.engine {
         e.radio.send(RadioCmd::Tune(app.stack.tuner.freq));
         e.radio.send(RadioCmd::Enable(

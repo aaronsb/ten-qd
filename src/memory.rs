@@ -40,7 +40,14 @@ use crate::ui::theme::Ill;
 
 /// Bumped when a field changes meaning rather than merely being added. Unknown
 /// versions are discarded rather than misread.
-const VERSION: u32 = 1;
+///
+/// 2: `amp_power`, `eq_defeat` and `tuner_power` became entries in the
+/// `powered_off` list. A v1 file parses cleanly under v2 — serde ignores the
+/// three departed fields and defaults the list to empty — so an amplifier that
+/// was off, a bypassed equaliser and a powered-down tuner would all quietly
+/// come back on. Discarding a v1 file costs the operator their settings once;
+/// reading it costs them three settings without saying anything.
+const VERSION: u32 = 2;
 
 /// Minimum gap between writes. Nudging the volume runs through a dozen values
 /// in a second; there is no reason to touch the disk for each one.
@@ -321,7 +328,7 @@ impl Memory {
     /// The arrangement this file describes.
     ///
     /// Hand-editable, so it is read defensively: unknown tokens are ignored,
-    /// omitted units are appended in factory order, and a unit named twice is
+    /// omitted units are put back where the factory had them, and a unit named twice is
     /// only placed once. A malformed `[layout]` costs you your arrangement,
     /// never your ability to start.
     pub fn layout(&self) -> Layout {
@@ -354,6 +361,7 @@ impl Memory {
         match self.source.as_str() {
             "tape" => SourceKind::Tape,
             "tuner" => SourceKind::Tuner,
+            "aux" => SourceKind::Aux,
             _ => SourceKind::Cd,
         }
     }
@@ -512,6 +520,19 @@ impl Keeper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `source_name` gained an "aux" arm and its inverse did not, so AUX was
+    /// written out and read back as CD. Every kind, both directions.
+    #[test]
+    fn every_source_survives_the_round_trip() {
+        for kind in [SourceKind::Cd, SourceKind::Tape, SourceKind::Tuner, SourceKind::Aux] {
+            let m = Memory { source: source_name(kind).into(), ..Default::default() };
+            assert_eq!(m.source_kind(), kind, "{kind:?} did not come back");
+        }
+        // Anything unrecognised is still a disc rather than a panic.
+        let m = Memory { source: "gramophone".into(), ..Default::default() };
+        assert_eq!(m.source_kind(), SourceKind::Cd);
+    }
 
     #[test]
     fn round_trips_through_toml() {
