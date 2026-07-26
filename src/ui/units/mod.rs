@@ -3,6 +3,7 @@
 //! another unit's state or another unit's area.
 
 pub mod amp;
+pub mod aux_in;
 pub mod cd;
 pub mod ctrl;
 pub mod eq;

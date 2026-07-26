@@ -72,9 +72,6 @@ pub enum EngineCmd {
     SelectSource { source: SourceKind, epoch: u64 },
     Load { disc: Arc<Disc>, start: usize, epoch: u64 },
     LoadTape { tape: Arc<Tape>, epoch: u64 },
-    /// Put an adapter in the deck: stop decoding, start passing the cable
-    /// through.
-    LoadAdapter { epoch: u64 },
     Play,
     Pause,
     Stop { epoch: u64 },
@@ -147,23 +144,9 @@ pub fn start(preferred: Option<&str>) -> Result<Engine> {
 
     // The rack holds its own opinion about where sound goes, rather than
     // following the system default. That is not a preference — it is what
-    // makes the adapter safe. Set KDE's output to "ten-qd cassette adapter"
+    // makes the aux input safe. Set KDE's output to "ten-qd aux input"
     // and a rack that followed the default would be driving its own input.
-    let device = preferred
-        .and_then(|want| {
-            host.output_devices()
-                .ok()
-                .and_then(|mut ds| {
-                    ds.find(|d: &cpal::Device| {
-                        d.description().is_ok_and(|x| x.name() == want)
-                    })
-                })
-        })
-        .filter(|d| {
-            !d.description().map(|x| x.name().contains(crate::adapter::SINK)).unwrap_or(false)
-        })
-        .or_else(|| host.default_output_device())
-        .ok_or_else(|| anyhow!("no output device"))?;
+    let device = choose_output(&host, preferred).ok_or_else(|| anyhow!("no output device"))?;
     let supported = device.default_output_config().context("no default output config")?;
 
     let sample_rate = supported.sample_rate();
@@ -294,7 +277,8 @@ pub fn start(preferred: Option<&str>) -> Result<Engine> {
     // --- adapter ----------------------------------------------------------
     // Started unconditionally and left running: it retries quietly until the
     // sink exists, so inserting the adapter later needs no coordination.
-    let capture = capture::Capture::start(crate::adapter::MONITOR, sample_rate, adapter_prod);
+    // The sink, not `<sink>.monitor` — `Capture` taps the monitor ports itself.
+    let capture = capture::Capture::start(crate::adapter::SINK, sample_rate, adapter_prod);
 
     Ok(Engine {
         params,
@@ -440,9 +424,6 @@ struct DecodeState {
     tape_index: usize,
     tape_side: Side,
     auto_reverse: bool,
-    /// The tape in the deck is an adapter, so there is nothing to decode —
-    /// the audio arrives over the cable.
-    tape_is_adapter: bool,
     playing: bool,
     repeat: bool,
     random: bool,
@@ -465,7 +446,7 @@ impl DecodeState {
         match self.source {
             SourceKind::Cd => self.disc.as_ref().map(|d| d.tracks.as_slice()),
             SourceKind::Tape => self.tape.as_ref().map(|t| t.tracks.as_slice()),
-            SourceKind::Tuner => None,
+            SourceKind::Tuner | SourceKind::Aux => None,
         }
     }
 
@@ -482,7 +463,7 @@ impl DecodeState {
         match self.source {
             SourceKind::Cd => self.cd_index = self.index,
             SourceKind::Tape => self.tape_index = self.index,
-            SourceKind::Tuner => {}
+            SourceKind::Tuner | SourceKind::Aux => {}
         }
     }
 }
@@ -506,7 +487,6 @@ fn decoder_loop(
         tape_index: 0,
         tape_side: Side::A,
         auto_reverse: true,
-        tape_is_adapter: false,
         playing: false,
         repeat: false,
         random: false,
@@ -550,10 +530,10 @@ fn decoder_loop(
                     st.index = match source {
                         SourceKind::Cd => st.cd_index,
                         SourceKind::Tape => st.tape_index,
-                        SourceKind::Tuner => 0,
+                        SourceKind::Tuner | SourceKind::Aux => 0,
                     };
                     st.src = None;
-                    st.playing = source == SourceKind::Tuner;
+                    st.playing = is_live_source(source);
                     st.epoch = epoch;
                     do_flush(&mut st);
                 }
@@ -568,16 +548,7 @@ fn decoder_loop(
                         do_flush(&mut st);
                     }
                 }
-                EngineCmd::LoadAdapter { epoch } => {
-                    st.tape_is_adapter = true;
-                    st.tape = None;
-                    st.src = None;
-                    st.playing = st.source == SourceKind::Tape;
-                    st.epoch = epoch;
-                    do_flush(&mut st);
-                }
                 EngineCmd::LoadTape { tape, epoch } => {
-                    st.tape_is_adapter = false;
                     st.tape_side = Side::A;
                     st.tape_index = 0;
                     st.tape = Some(tape);
@@ -590,8 +561,7 @@ fn decoder_loop(
                     }
                 }
                 EngineCmd::Play => {
-                    let live = st.source == SourceKind::Tuner
-                        || (st.source == SourceKind::Tape && st.tape_is_adapter);
+                    let live = is_live_source(st.source);
                     if st.program().is_some() || live {
                         st.playing = true;
                     }
@@ -626,7 +596,7 @@ fn decoder_loop(
                             st.tape_index = 0;
                             st.tape_side = Side::A;
                         }
-                        SourceKind::Tuner => {}
+                        SourceKind::Tuner | SourceKind::Aux => {}
                     }
                     st.index = 0;
                     st.epoch = epoch;
@@ -690,9 +660,7 @@ fn decoder_loop(
         // match rather than through a trait object chosen above it.
         let got = match st.source {
             SourceKind::Tuner => Some(radio.pop_slice(&mut radio_buf[..want])),
-            SourceKind::Tape if st.tape_is_adapter => {
-                Some(adapter.pop_slice(&mut radio_buf[..want]))
-            }
+            SourceKind::Aux => Some(adapter.pop_slice(&mut radio_buf[..want])),
             _ => None,
         };
         if let Some(got) = got {
@@ -789,6 +757,55 @@ fn decoder_loop(
     }
 }
 
+/// Is this the adapter's own sink?
+///
+/// Checked by name against both the sink's internal name and the description
+/// the desktop shows, because which of the two a host backend reports is not
+/// something to bet the feedback loop on.
+fn is_own_adapter(name: &str) -> bool {
+    name.contains(crate::adapter::SINK) || name.contains(crate::adapter::DESCRIPTION)
+}
+
+/// Pick where the rack sends sound.
+///
+/// In order: what the operator chose, then the system default, then anything
+/// at all — and never the adapter, at any of those three steps. That last part
+/// is the whole point. Set the desktop's output to "ten-qd aux input"
+/// (which is exactly what you do to run everything through the rack) and a
+/// rack that took the system default would be driving its own input: it would
+/// capture its own output, feed it back through the equaliser, and go silent
+/// or howl. Guarding only the operator's choice, as this did, left the default
+/// path wide open — and the default is precisely the one that changes out from
+/// under you.
+fn choose_output(host: &cpal::Host, preferred: Option<&str>) -> Option<cpal::Device> {
+    let named = |d: &cpal::Device| d.description().map(|x| x.name().to_string()).unwrap_or_default();
+
+    let chosen = preferred.and_then(|want| {
+        host.output_devices().ok().and_then(|mut ds| ds.find(|d| named(d) == want))
+    });
+    if let Some(d) = chosen.filter(|d| !is_own_adapter(&named(d))) {
+        return Some(d);
+    }
+
+    if let Some(d) = host.default_output_device().filter(|d| !is_own_adapter(&named(d))) {
+        return Some(d);
+    }
+
+    // The default *is* the adapter. Any other output is better than a loop.
+    host.output_devices().ok()?.find(|d| !is_own_adapter(&named(d)))
+}
+
+/// Whether selecting this source should start it playing at once.
+///
+/// A live source has nothing to cue. The tuner is already receiving and the
+/// adapter's cable is already carrying whatever is on the other end of it —
+/// there is no track to seek to and no transport to spin up, so "selected" and
+/// "playing" are the same state. Only a disc or a real tape has a position to
+/// hold, and those come up stopped.
+fn is_live_source(source: SourceKind) -> bool {
+    matches!(source, SourceKind::Tuner | SourceKind::Aux)
+}
+
 /// Move to the next track, honouring repeat, random, sides and auto-reverse.
 /// Returns false when the transport has reached the end of what it may play.
 fn advance(st: &mut DecodeState) -> bool {
@@ -869,6 +886,23 @@ fn interleave_stereo(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this pins down: selecting the deck with an adapter in it left
+    /// the decoder stopped, while MPRIS independently drove the panel to PLAY
+    /// because the *player* was playing. The rack read PLAY over a stopped
+    /// decoder and produced silence, with correct routing all the way in.
+    #[test]
+    fn selecting_aux_starts_it_the_way_the_tuner_does() {
+        assert!(is_live_source(SourceKind::Tuner), "the tuner is already receiving");
+        assert!(is_live_source(SourceKind::Aux), "the cable is already carrying");
+    }
+
+    #[test]
+    fn a_disc_or_a_real_tape_still_comes_up_stopped() {
+        // These have a position to hold, so selecting them must not start them.
+        assert!(!is_live_source(SourceKind::Cd));
+        assert!(!is_live_source(SourceKind::Tape));
+    }
 
     #[test]
     fn resampler_passthrough_is_exact() {

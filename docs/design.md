@@ -97,19 +97,90 @@ The **ILL** key swaps the lamp colour of every illuminated button and nothing
 else, because that is what it did in the car — it changed bulbs, not ink. This
 is also the one control that has no effect on the audio and was kept anyway.
 
-![The same rack with green illumination](img/rack-green-browser.png)
+Compare the green rack further down this page against the orange one on the
+[front page](../README.md). The spine
+lamps change colour; the *materials* do not. The printed legends are green in
+both, because they are ink. The VFD numerals are amber in both, because that is
+the phosphor. Had ILL been implemented as a global hue rotation — the obvious
+shortcut — the whole panel would have shifted, and the illusion of three
+separate materials would have collapsed.
 
-Compare the two: the spine lamps go from orange to green, and *nothing else
-moves*. The printed legends stay green because they are ink, and the VFD
-numerals stay amber because that is the phosphor. Had ILL been implemented as a
-global hue rotation — the obvious shortcut — the whole panel would have shifted
-and the illusion of three separate materials would have collapsed.
+## The rack is a cabinet
+
+The six units are *separates*, so which of them are in the cabinet and in what
+order is the operator's business. `~` opens the arranger: the arrows move a
+cursor, space picks a unit up so the arrows carry it, enter takes it out or
+puts it back, `r` restores the factory arrangement. Escape closes — there is
+nothing to cancel, because the arranging *was* the editing.
+
+![The arranger over a reordered rack, three units taken out](img/rack-arrange.png)
+
+The control head has been hoisted to the top of that rack, and three units are
+out of it — dimmed, with dark lamps, each saying so. The colophon says the rest:
+*CASSETTE out of the rack — it still plays.*
+
+Each unit also carries a bar, which is both the seam between components and the
+unit's own control:
+
+```text
+  ━━[-][●]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ━━[+][●]━━━━━━━━━━━━━━━[AM/FM STEREO TUNER LT-581]━━━━━━━━━━
+```
+
+![Every unit folded — the whole rack in nine rows](img/rack-folded.png)
+
+Folded all the way down, seven units and the colophon occupy nine rows. Every
+one of them is still playing, still answering its keys; there is simply nothing
+of them to look at but the plate and the lamp.
+
+`[-]` folds the faceplate away and `[+]` brings it back; the shifted form of
+whichever key already operates the unit does the same from the keyboard. The
+type plate only appears on the folded form, because an open bay already carries
+it in the corner and printing it twice would read as two units.
+
+### Out of sight is not out of circuit
+
+Two different things can be true of a unit, and the panel keeps them apart.
+
+| | |
+|---|---|
+| **hidden / folded** | not on screen. Still in the signal path, still playing, still answering its keys. |
+| **powered down** | out of the signal path. Still on screen, saying so with a dark POWER lamp. |
+
+Every unit wears its power switch in the same place — the lamp at the left of
+its spine — and what the unit *does* sits on the right: EJECT, AM/FM, SELECT.
+The left column of the whole rack then reads as one row of switches.
+
+![Five units switched out of the signal path, the aux input still carrying](img/rack-power.png)
+
+Five lamps dark, and the equaliser saying `DEFEAT — CURVE BYPASSED` with its
+sliders greyed — because for an equaliser those are the same fact. Every unit
+is still on screen, still showing what it holds; the CD player has not even
+forgotten its track. They are simply not in the chain.
+
+For most units "off" is obvious. Two are worth stating: the amplifier's power
+mutes the output outright rather than turning it down, and the equaliser's
+power *is* its bypass — DEFEAT is only the car-audio word for it, so giving the
+QE-581 both would be two controls for one circuit. DEFEAT survives as the word
+for the state, printed in red on the readout row while it is true.
+
+Switching off the source you are listening to stops the transport rather than
+silently falling through to another one. The rack does not choose for you.
+
+**Arranging touches nothing.** A unit that is folded shut, or taken out of
+the rack entirely, still plays, still answers its keys, and still lights its
+lamp — which is what the lamp is for. It burns steadily while the unit is doing
+something and flares red on any command aimed at it, so a tuner you cannot see
+still visibly answers a preset key. Hiding a faceplate is moving a box in a
+cabinet, not switching it off, and the panel should never blur the two.
 
 ## The dimmer
 
 Every car has a rheostat on the instrument lighting, because a dash that is
 comfortable at noon is blinding at midnight. The rack has the same control,
-global to all six bays, shown next to `? KEYS` in the colophon.
+global to every bay, shown next to `? KEYS` in the colophon.
+
+![The rack with the instrument lighting turned down](img/rack-dimmed.png)
 
 It cost one function, and that is the whole argument for the token layer.
 Because every colour in the build is constructed in `theme.rs` and nowhere

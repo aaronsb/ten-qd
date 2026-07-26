@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Bank, SourceKind, Stack};
+use crate::state::{Bank, Layout, SourceKind, Stack, Unit};
 use crate::ui::theme::Ill;
 
 /// Bumped when a field changes meaning rather than merely being added. Unknown
@@ -50,6 +50,8 @@ const WRITE_INTERVAL: Duration = Duration::from_secs(3);
 /// nulls, so the sentinel costs nothing and keeps the file a flat array.
 const PRESET_EMPTY: f64 = 0.0;
 
+
+
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 #[serde(default)]
 pub struct Memory {
@@ -59,6 +61,8 @@ pub struct Memory {
     pub source: String,
     pub volume: f32,
     pub att: bool,
+    #[serde(default)]
+    pub gain_db: i8,
     pub bass: i8,
     pub treble: i8,
     pub fader: f32,
@@ -66,17 +70,22 @@ pub struct Memory {
     /// Instrument dimmer position. A driver who set the dash lighting for
     /// night driving expects to find it there next time.
     pub dimmer: u8,
-    pub amp_power: bool,
+    /// Every unit switched out of the signal path, as unit tokens.
+    ///
+    /// One list rather than a boolean per unit, because they are all the same
+    /// fact — including the equaliser, whose power switch *is* its bypass.
+    /// Empty is a rack that is entirely on, which is both the factory state
+    /// and what a file written before per-unit power described.
+    #[serde(default)]
+    pub powered_off: Vec<String>,
 
     // equaliser
-    pub eq_defeat: bool,
     pub eq_front: Vec<f32>,
     pub eq_rear: Vec<f32>,
 
     // tuner
     pub tuner_freq: f64,
     pub tuner_local: bool,
-    pub tuner_power: bool,
     pub tuner_presets: Vec<f64>,
 
     // transports
@@ -92,11 +101,24 @@ pub struct Memory {
     /// The output device the rack drives, by name.
     ///
     /// Deliberately independent of the system default. The whole point of the
-    /// adapter is that you can set *KDE's* output to "ten-qd cassette adapter"
+    /// aux input is that you can set *KDE's* output to "ten-qd aux input"
     /// and have everything flow through the rack — at which moment following
     /// the system default would send our own output straight back into our own
     /// input. The rack has to hold its own opinion about where sound goes.
     pub output: Option<String>,
+
+    // how the rack is arranged
+    /// Draw order, top to bottom, as unit tokens. Anything missing is appended
+    /// in factory order and anything unrecognised is dropped, so this stays
+    /// safe to edit by hand.
+    #[serde(default)]
+    pub layout_order: Vec<String>,
+    /// Units taken out of the rack. They still play; they are just not shown.
+    #[serde(default)]
+    pub layout_hidden: Vec<String>,
+    /// Units folded down to their bar.
+    #[serde(default)]
+    pub layout_collapsed: Vec<String>,
 }
 
 impl Default for Memory {
@@ -107,18 +129,20 @@ impl Default for Memory {
             source: source_name(s.source).into(),
             volume: s.ctrl.volume,
             att: s.ctrl.att,
+            gain_db: s.ctrl.gain_db,
+            layout_order: layout_tokens(&s.layout.order),
+            layout_hidden: flagged(&s.layout, false),
+            layout_collapsed: flagged(&s.layout, true),
             bass: s.ctrl.bass,
             treble: s.ctrl.treble,
             fader: s.ctrl.fader,
             ill: ill_name(s.ctrl.ill).into(),
             dimmer: s.ctrl.dimmer,
-            amp_power: s.amp.power,
-            eq_defeat: s.eq.defeat,
+            powered_off: powered_off(&s),
             eq_front: s.eq.front.to_vec(),
             eq_rear: s.eq.rear.to_vec(),
             tuner_freq: s.tuner.freq,
             tuner_local: s.tuner.local,
-            tuner_power: s.tuner.power,
             tuner_presets: vec![PRESET_EMPTY; 6],
             repeat: s.cd.repeat,
             random: s.cd.random,
@@ -132,10 +156,41 @@ impl Default for Memory {
     }
 }
 
+/// The units currently out of the signal path.
+fn powered_off(s: &Stack) -> Vec<String> {
+    [
+        (Unit::Cd, s.cd.power),
+        (Unit::Tape, s.tape.power),
+        (Unit::Tuner, s.tuner.power),
+        (Unit::Aux, s.aux.power),
+        (Unit::Eq, !s.eq.defeat),
+        (Unit::Amp, s.amp.power),
+    ]
+    .into_iter()
+        .filter(|(_, on)| !on)
+        .map(|(u, _)| u.token().to_string())
+        .collect()
+}
+
+fn layout_tokens(order: &[Unit; 7]) -> Vec<String> {
+    order.iter().map(|u| u.token().to_string()).collect()
+}
+
+/// The units carrying one of the two per-unit flags, as tokens.
+fn flagged(layout: &Layout, collapsed: bool) -> Vec<String> {
+    let flags = if collapsed { &layout.collapsed } else { &layout.hidden };
+    Unit::ALL
+        .into_iter()
+        .filter(|u| flags[u.index()])
+        .map(|u| u.token().to_string())
+        .collect()
+}
+
 fn source_name(s: SourceKind) -> &'static str {
     match s {
         SourceKind::Cd => "cd",
         SourceKind::Tape => "tape",
+        SourceKind::Aux => "aux",
         SourceKind::Tuner => "tuner",
     }
 }
@@ -232,18 +287,20 @@ impl Memory {
             source: source_name(stack.source).into(),
             volume: stack.ctrl.volume,
             att: stack.ctrl.att,
+            gain_db: stack.ctrl.gain_db,
+            layout_order: layout_tokens(&stack.layout.order),
+            layout_hidden: flagged(&stack.layout, false),
+            layout_collapsed: flagged(&stack.layout, true),
             bass: stack.ctrl.bass,
             treble: stack.ctrl.treble,
             fader: stack.ctrl.fader,
             ill: ill_name(stack.ctrl.ill).into(),
             dimmer: stack.ctrl.dimmer,
-            amp_power: stack.amp.power,
-            eq_defeat: stack.eq.defeat,
+            powered_off: powered_off(stack),
             eq_front: stack.eq.front.to_vec(),
             eq_rear: stack.eq.rear.to_vec(),
             tuner_freq: stack.tuner.freq,
             tuner_local: stack.tuner.local,
-            tuner_power: stack.tuner.power,
             tuner_presets: stack
                 .tuner
                 .presets
@@ -259,6 +316,38 @@ impl Memory {
             browser: browser.map(Path::to_path_buf),
             output: stack.output.clone(),
         }
+    }
+
+    /// The arrangement this file describes.
+    ///
+    /// Hand-editable, so it is read defensively: unknown tokens are ignored,
+    /// omitted units are appended in factory order, and a unit named twice is
+    /// only placed once. A malformed `[layout]` costs you your arrangement,
+    /// never your ability to start.
+    pub fn layout(&self) -> Layout {
+        let mut l = Layout::default();
+        let named: Vec<Unit> =
+            self.layout_order.iter().filter_map(|t| Unit::from_token(t)).collect();
+        for (slot, u) in l.order.iter_mut().zip(named) {
+            *slot = u;
+        }
+        l.sanitise();
+        for t in &self.layout_hidden {
+            if let Some(u) = Unit::from_token(t) {
+                l.hidden[u.index()] = true;
+            }
+        }
+        for t in &self.layout_collapsed {
+            if let Some(u) = Unit::from_token(t) {
+                l.collapsed[u.index()] = true;
+            }
+        }
+        l
+    }
+
+    /// Whether `u` should come up in the signal path.
+    pub fn powered(&self, u: Unit) -> bool {
+        !self.powered_off.iter().any(|t| Unit::from_token(t) == Some(u))
     }
 
     pub fn source_kind(&self) -> SourceKind {

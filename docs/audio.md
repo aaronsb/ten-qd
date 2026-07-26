@@ -88,6 +88,27 @@ power). Only the former trigger a retune; the latter are read fresh every
 block. Output gain is smoothed with a one-pole at about 5 ms, so a volume press
 does not click.
 
+## Gain, and why there is a trim
+
+The volume dial spans 0 to unity and no further: at full travel `out_gain()`
+returns exactly 1.0. That is correct for a control called *volume*, and useless
+when the source is quiet — a stream mastered low, or an auxiliary input fed
+from something polite — because the top of the dial is still not loud enough.
+
+**GAIN** is the makeup, 0 to +12 dB in whole steps, applied on top of volume and
+kept in the 12-volt memory. It is a separate control on purpose: the dial keeps
+meaning what it meant, and nothing gets louder until someone asks for it. The
+attenuator still multiplies in afterwards, so ATT drops the level however much
+makeup is dialled in.
+
+Because that trim (and nine bands of EQ boost) can push past full scale, the
+output has a **soft clipper**. Below 0.8 amplitude it is the identity function,
+so nothing that was not going to clip is touched; above it, samples bend toward
+the rail with a `tanh` knee instead of wrapping. A head unit ran out of
+headroom in its power amp and got progressively less polite about it — this
+rounds the corners rather than producing the square-edged mess that digital
+arithmetic gives you for free.
+
 ## Resampling
 
 The device usually runs at 48 kHz and discs are 44.1 kHz, so the resampler is
