@@ -39,7 +39,7 @@ bus, which is holding a microphone to a speaker without the room in the way.
 
 | mode | writes | captures | cannot know |
 |---|---|---|---|
-| **TRACK** | an M3U playlist | the sequence — what played, in order, with its source | anything without a title. A microphone contributes nothing. |
+| **TRACK** | an M3U playlist | the sequence — what played, in order, with its source | what a nameless signal *is*. It can still say where it came from. |
 | **AUDIO** | a file per take | the signal, exactly as it was | which parts of it were which. |
 
 The modes are not two settings of one feature. They are two different machines
@@ -58,9 +58,31 @@ runs at 2 Hz and reports title, artist and album. A change in that tuple is a
 track boundary.
 
 **AUDIO is for the things that have no playlist.** A microphone, a line input,
-a broadcast. Those exist only as signal, and a playlist cannot represent them at
-all — which is the mode saying something true about its own limits rather than a
-gap to paper over.
+a broadcast. Those exist only as signal, and no playlist can carry them.
+
+But they are not anonymous. PipeWire names every device, and the names are
+better than anything we would invent:
+
+```
+  OBSBOT Meet 2 Analog Stereo
+  RemoteSL + ZeroSL Analog Stereo
+  Maonocaster E2 Analog Stereo
+```
+
+That is real provenance, and it arrives in the same `description` field
+`adapter::sinks()` already reads — a `Source { name, description }` twin of the
+existing `Sink`, from `pactl -f json list sources`.
+
+So TRACK's blind spot is narrower than "a microphone contributes nothing". It
+cannot say *what* a nameless signal is, because nothing knows; it can say
+exactly where it came from and how long it ran:
+
+```
+  #EXTINF:214,OBSBOT Meet 2 Analog Stereo
+```
+
+An entry that names its input and admits it has no title is honest. Omitting it
+would be the tape quietly losing four minutes of your afternoon.
 
 ### Honest about the jumble
 
@@ -69,8 +91,9 @@ differently, both correctly:
 
 - AUDIO records the sum, indistinguishable, because that is what it was. The
   aux sink is already a mix bus — PipeWire sums whatever is moved onto it.
-- TRACK records three interleaved entries with their players attached, and says
-  nothing about the microphone, because a microphone has no title.
+- TRACK records three interleaved entries with their players attached, plus one
+  for the microphone naming the device rather than a title — because that is
+  everything anyone knows about it.
 
 Neither mode pretends to the other's knowledge.
 
