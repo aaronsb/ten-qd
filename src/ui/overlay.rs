@@ -63,6 +63,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("; '", "fader rear/front"),
     ("i  w", "illumination colour · amplifier power"),
     ("-  =", "instrument dimmer, down and up"),
+    ("O", "output device the rack drives"),
     ("", ""),
     ("EQUALISER", ""),
     ("h l  j k", "select band · cut/boost"),

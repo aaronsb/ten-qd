@@ -108,6 +108,8 @@ impl App {
         stack.tuner.freq = mem.tuner_freq;
         stack.tuner.local = mem.tuner_local;
         stack.tuner.power = mem.tuner_power;
+        stack.output = mem.output.clone();
+        stack.outputs = audio::output_devices();
         stack.tuner.presets = mem.presets();
         stack.cd.repeat = mem.repeat;
         stack.cd.random = mem.random;
@@ -743,6 +745,31 @@ impl App {
                 self.publish(false);
             }
 
+            Command::NextOutput => {
+                if self.stack.outputs.is_empty() {
+                    self.stack.outputs = audio::output_devices();
+                }
+                if self.stack.outputs.is_empty() {
+                    self.status("no output devices offered");
+                    return;
+                }
+                let cur = self
+                    .stack
+                    .output
+                    .as_ref()
+                    .and_then(|o| self.stack.outputs.iter().position(|d| d == o));
+                let next = match cur {
+                    Some(i) => (i + 1) % self.stack.outputs.len(),
+                    None => 0,
+                };
+                let name = self.stack.outputs[next].clone();
+                self.stack.apply(Patch { output: Some(Some(name.clone())), ..Default::default() });
+                // Changing device means rebuilding the output stream, which
+                // this does not do live — the choice is remembered and taken
+                // on the next start. Saying so beats silently doing nothing.
+                self.status(format!("output: {name} — takes effect on restart"));
+            }
+
             Command::DimUp | Command::DimDown => {
                 let d = &mut self.stack.ctrl.dimmer;
                 let v = if matches!(cmd, Command::DimUp) {
@@ -1145,6 +1172,7 @@ impl App {
             (KeyCode::Char('-'), _) => Some(Command::DimDown),
             (KeyCode::Char('='), _) | (KeyCode::Char('+'), _) => Some(Command::DimUp),
             (KeyCode::Char('w'), _) => Some(Command::AmpPower),
+            (KeyCode::Char('O'), _) => Some(Command::NextOutput),
 
             // equaliser
             (KeyCode::Char('h'), _) => {
@@ -1241,7 +1269,7 @@ fn screenshot(app: &mut App, width: u16, height: u16) -> Result<()> {
 /// this proves the whole path against the actual antenna, which is the only
 /// thing that can tell you the dongle is tuned where you think it is.
 fn radio_check() -> Result<()> {
-    let engine = audio::start()?;
+    let engine = audio::start(None)?;
     let radio = &engine.radio;
 
     // Give the device thread a moment to open and report itself.
@@ -1307,7 +1335,7 @@ fn radio_check() -> Result<()> {
 /// The unit tests cover the pactl plumbing; only this can tell you the cable
 /// is carrying sound all the way through the DSP chain to the meters.
 fn adapter_check() -> Result<()> {
-    let engine = audio::start()?;
+    let engine = audio::start(None)?;
     let mut a = adapter::Adapter::insert()?;
     println!("adapter in: \"{}\" ({SINK_NOTE})", adapter::DESCRIPTION, SINK_NOTE = adapter::SINK);
 
@@ -1375,11 +1403,14 @@ fn main() -> Result<()> {
     let shot = args.iter().any(|a| a == "--screenshot");
     let arg = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
 
+    // A sink outliving a killed process strands whatever was plugged into it.
+    adapter::remove_orphan();
+
     let loaded = Memory::load();
 
     // The panel should come up even with no sound card — it says so in the
     // colophon rather than refusing to start.
-    let (engine, engine_err) = match audio::start() {
+    let (engine, engine_err) = match audio::start(loaded.memory.output.as_deref()) {
         Ok(e) => (Some(e), None),
         Err(e) => (None, Some(e.to_string())),
     };

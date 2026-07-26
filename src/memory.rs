@@ -89,6 +89,14 @@ pub struct Memory {
     pub disc: Option<PathBuf>,
     pub tape: Option<PathBuf>,
     pub browser: Option<PathBuf>,
+    /// The output device the rack drives, by name.
+    ///
+    /// Deliberately independent of the system default. The whole point of the
+    /// adapter is that you can set *KDE's* output to "ten-qd cassette adapter"
+    /// and have everything flow through the rack — at which moment following
+    /// the system default would send our own output straight back into our own
+    /// input. The rack has to hold its own opinion about where sound goes.
+    pub output: Option<String>,
 }
 
 impl Default for Memory {
@@ -119,6 +127,7 @@ impl Default for Memory {
             disc: None,
             tape: None,
             browser: None,
+            output: None,
         }
     }
 }
@@ -248,6 +257,7 @@ impl Memory {
             disc: stack.cd.disc.as_ref().map(|d| d.path.clone()),
             tape: stack.tape.tape.as_ref().map(|t| t.path.clone()),
             browser: browser.map(Path::to_path_buf),
+            output: stack.output.clone(),
         }
     }
 

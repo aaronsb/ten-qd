@@ -128,18 +128,24 @@ pub struct Adapter {
 
 impl Adapter {
     /// Insert the adapter: create the sink.
-    ///
-    /// If one is already loaded — a previous run that did not get to clean up
-    /// — it is adopted rather than duplicated.
     pub fn insert() -> Result<Self> {
-        if let Some(module) = existing_module()? {
-            return Ok(Adapter { module, moved: Vec::new() });
-        }
+        // Never adopt a leftover. A sink from a dead process has no capture
+        // attached, so anything still routed to it is playing into nothing.
+        remove_orphan();
         let out = pactl(&[
             "load-module",
             "module-null-sink",
             &format!("sink_name={SINK}"),
-            &format!("sink_properties=device.description=\"{DESCRIPTION}\""),
+            // `priority.session=0` matters more than it looks. WirePlumber
+            // elects a default output by session priority, and a freshly
+            // created sink can win that election — which silently moves *the
+            // whole desktop's* audio into the adapter. If ten-qd then exits
+            // without cleaning up, sound goes nowhere and the cause is not
+            // remotely obvious. A virtual device should never be a candidate
+            // for the default output.
+            &format!(
+                "sink_properties=device.description=\"{DESCRIPTION}\" priority.session=0 priority.driver=0"
+            ),
         ])?;
         let module = out
             .trim()
@@ -182,17 +188,35 @@ impl Drop for Adapter {
     }
 }
 
-/// Find an adapter sink left over from a previous run.
-fn existing_module() -> Result<Option<u32>> {
-    let Ok(json) = pactl(&["-f", "json", "list", "modules"]) else { return Ok(None) };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else { return Ok(None) };
-    let Some(items) = v.as_array() else { return Ok(None) };
+/// Remove an adapter sink left behind by a previous run.
+///
+/// Called at start-up and before inserting. If ten-qd is killed rather than
+/// asked to quit, `Drop` never runs and the sink outlives the process —
+/// with whatever was plugged into it still routed there, now playing into
+/// nothing. Unloading the module makes PipeWire move those streams back to
+/// the default output, which is the outcome the user wants and cannot easily
+/// arrive at themselves, because the cause is invisible.
+pub fn remove_orphan() {
+    if let Ok(Some(module)) = existing_module() {
+        let _ = pactl(&["unload-module", &module.to_string()]);
+    }
+}
 
-    Ok(items.iter().find_map(|m| {
-        let args = m.get("argument")?.as_str()?;
-        args.contains(&format!("sink_name={SINK}"))
-            .then(|| m.get("index")?.as_u64().map(|i| i as u32))
-            .flatten()
+/// Find an adapter sink left over from a previous run.
+///
+/// Uses `pactl list short modules` rather than the JSON form, because the
+/// JSON for modules carries no `index` field at all — only `argument`,
+/// `name`, `properties` and `usage_counter`. The lookup this replaced asked
+/// for `index`, got nothing every time, and so silently never found an
+/// orphan. The short form is tab-separated `index<TAB>name<TAB>argument`.
+fn existing_module() -> Result<Option<u32>> {
+    let Ok(text) = pactl(&["list", "short", "modules"]) else { return Ok(None) };
+    Ok(text.lines().find_map(|line| {
+        let mut f = line.split('\t');
+        let index: u32 = f.next()?.trim().parse().ok()?;
+        let name = f.next()?;
+        let args = f.next().unwrap_or("");
+        (name == "module-null-sink" && args.contains(&format!("sink_name={SINK}"))).then_some(index)
     }))
 }
 

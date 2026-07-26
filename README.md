@@ -124,6 +124,7 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `f` `d` `0` | front/rear bank · defeat · flat |
 | `i` `w` | illumination colour · amplifier power |
 | `-` `=` | instrument dimmer, down and up |
+| `O` | output device the rack drives |
 
 ### The radio
 

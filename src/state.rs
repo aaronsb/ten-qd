@@ -170,6 +170,8 @@ pub enum Command {
     Treble(i8),
     Fader(f32),
     Ill,
+    /// Step to the next output device the rack could drive.
+    NextOutput,
     /// Instrument dimmer, the way the dash rheostat works: one step per press.
     DimUp,
     DimDown,
@@ -464,6 +466,11 @@ pub struct Stack {
     pub eq: EqState,
     pub amp: AmpState,
     pub ctrl: CtrlState,
+    /// The output device the rack drives, by name. `None` follows the system
+    /// default, which is only safe while the default is not the adapter.
+    pub output: Option<String>,
+    /// Every output device offered, for cycling.
+    pub outputs: Vec<String>,
     /// Last line of the colophon — what the engine last reported. Errors land
     /// here rather than being swallowed.
     pub status: String,
@@ -522,6 +529,8 @@ pub struct Patch {
     pub dimmer: Option<u8>,
 
     pub status: Option<String>,
+    pub output: Option<Option<String>>,
+    pub outputs: Option<Vec<String>>,
 }
 
 impl Stack {
@@ -650,6 +659,12 @@ impl Stack {
         }
         if let Some(v) = p.dimmer {
             self.ctrl.dimmer = v.min(crate::ui::theme::DIM_MAX);
+        }
+        if let Some(v) = p.output {
+            self.output = v;
+        }
+        if let Some(v) = p.outputs {
+            self.outputs = v;
         }
         if let Some(v) = p.status {
             self.status = v;

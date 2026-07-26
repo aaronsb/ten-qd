@@ -105,7 +105,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // ATT and the source selector, wearing the same caps as every other
     // operable control on the rack. The attenuator's 70% / 60% marks stay up
     // on the volume row as boxed legends, because those report rather than do.
-    let ky = inner.y + 6;
+    let ky = inner.y + 7;
     chassis::sublegend(buf, x, ky, "SOURCE", theme, false);
     let mut row = chassis::KeyRow::new(x + 8, ky);
 
@@ -118,6 +118,20 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         let r = row.key(buf, label.len() as u16 + 2, label, theme, stack.source == kind, true);
         hits.add(r.x, r.y, r.width, r.height, Command::Source(kind));
     }
+
+    // Which speakers the rack drives. A control-head concern: it is the same
+    // question as the fader, one level further out.
+    let oy = inner.y + 6;
+    chassis::sublegend(buf, x, oy, "OUTPUT", theme, false);
+    let name = stack.output.clone().unwrap_or_else(|| "system default".into());
+    let name: String = name.chars().take(34).collect();
+    buf.set_string(
+        x + 8,
+        oy,
+        &name,
+        Style::default().fg(theme.ink_white).bg(theme.chassis),
+    );
+    hits.add_row(x, oy, 44, Command::NextOutput);
 
     chassis::model_corner(buf, inner, &["CONTROL HEAD LT-581"], theme);
 }

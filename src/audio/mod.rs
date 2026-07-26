@@ -142,9 +142,41 @@ struct Flush {
 // Start-up
 // ---------------------------------------------------------------------------
 
-pub fn start() -> Result<Engine> {
+/// Every output device the rack could drive, excluding its own adapter.
+pub fn output_devices() -> Vec<String> {
+    // cpal 0.18 replaced `Device::name()` with `description()`.
     let host = cpal::default_host();
-    let device = host.default_output_device().ok_or_else(|| anyhow!("no output device"))?;
+    host.output_devices()
+        .map(|ds| {
+            ds.filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
+                .filter(|n| !n.contains(crate::adapter::SINK))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn start(preferred: Option<&str>) -> Result<Engine> {
+    let host = cpal::default_host();
+
+    // The rack holds its own opinion about where sound goes, rather than
+    // following the system default. That is not a preference — it is what
+    // makes the adapter safe. Set KDE's output to "ten-qd cassette adapter"
+    // and a rack that followed the default would be driving its own input.
+    let device = preferred
+        .and_then(|want| {
+            host.output_devices()
+                .ok()
+                .and_then(|mut ds| {
+                    ds.find(|d: &cpal::Device| {
+                        d.description().is_ok_and(|x| x.name() == want)
+                    })
+                })
+        })
+        .filter(|d| {
+            !d.description().map(|x| x.name().contains(crate::adapter::SINK)).unwrap_or(false)
+        })
+        .or_else(|| host.default_output_device())
+        .ok_or_else(|| anyhow!("no output device"))?;
     let supported = device.default_output_config().context("no default output config")?;
 
     let sample_rate = supported.sample_rate();
