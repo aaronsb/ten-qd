@@ -2,6 +2,9 @@
 
 *A design note. None of this is built yet.*
 
+**In one line:** the deck keeps an append-only log of everything you listen to,
+across every service, and a playlist is something you cut out of it later.
+
 ## The machine does not decide
 
 Old equipment did not make decisions about what was allowed. A tape deck had a
@@ -49,6 +52,72 @@ that happen to share a button.
 they were manufacturing music; they were recording an *order* — this song, then
 this one, because of how the second lands after the first. That is the artefact.
 The audio was only ever the storage medium it had to be written on.
+
+### It is a log, not a tape
+
+The obvious shape is "press REC, get a tape". The better shape is **always
+appending**: the deck keeps a running record of what you listened to, and a
+*tape* is something you cut out of it afterwards.
+
+That falls out of what the mode is actually for. Play YouTube Music in a tab in
+the morning and Spotify in the afternoon, and what you want at the end of the
+week is not two tapes — it is one list of the things you liked, gathered across
+services that have no interest in letting you hold that list. TRACK mode is a
+way of getting your own listening back out of them, and appending is what makes
+that work without you having to decide in advance that a moment was worth
+keeping.
+
+So the mode has two settings, both persisted in the 12-volt memory:
+
+| | |
+|---|---|
+| **record mode** | TRACK or AUDIO |
+| **always append** | keep logging whenever the rack is running |
+
+### The log, and what is cut from it
+
+The native format is ours, append-only, and richer than a playlist:
+
+```
+  ~/.local/state/ten-qd/listening.jsonl
+```
+
+One JSON object per line, appended and never rewritten. That choice is
+load-bearing rather than aesthetic: appending a line is a single write that
+cannot corrupt what came before, a torn final line after a crash is discardable
+on its own, and the whole thing stays greppable. A TOML or XML log would have to
+be re-serialised on every track change — a rewrite of the entire history, several
+times an hour, for a program that should survive being killed.
+
+Each entry carries what a playlist cannot:
+
+```json
+{"at":"2026-07-26T21:55:56Z","session":"...","player":"Spotify",
+ "artist":"Boards of Canada","title":"Age Of Capricorn",
+ "album":"Tomorrow's Harvest","seconds":214,"uri":"spotify:track:..."}
+```
+
+**Sessions** group entries into contiguous listening. A session is a run of the
+rack, so "that Tuesday evening" is a thing you can name and select — and
+selecting a set of sessions and projecting them into M3U or PLS is how a tape
+gets made. The log is the archive; a playlist is a *view* of it.
+
+That projection is the point where this stops being a music player feature and
+becomes genuinely useful: pick a month, dedupe, rank by play count, and you have
+your actual taste across every service you used, in a format any player can
+open. Nothing about that requires the services to cooperate, and none of them
+offer it.
+
+### Noticing what is playing
+
+Appending only works if the deck notices sources arriving and leaving on their
+own. `mpris.rs` polls at 2 Hz and picks *one* player; TRACK mode needs
+`find_all()` and needs to treat players as coming and going — Chromium at
+breakfast, Spotify after lunch, both at once while one is paused.
+
+A new entry is warranted when a player's `(artist, title, album)` tuple changes,
+or when a player appears already playing something. A player disappearing closes
+its current entry with however long it actually ran.
 
 So TRACK writes down the order and nothing else. It costs no disk, duplicates
 no content, and produces a tape that loads straight back into the deck — which
@@ -137,7 +206,17 @@ running — and worth building in from the start rather than retrofitting. The
 input meter is already a record-level meter; that is what those are.
 
 **TRACK mode needs `find_all()`, not `find()`.** `mpris.rs` picks one player
-today, which is right for driving transport keys and wrong for recording a mix.
+today, which is right for driving transport keys and wrong for logging
+everything that plays.
+
+**Projection needs a command.** Selecting sessions and emitting a playlist is a
+separate verb from recording — likely `--export` with a session range and a
+format, rather than anything on the panel. The deck records; cutting a tape out
+of the log is a different job.
+
+**Deduplication belongs to projection, not the log.** The log keeps every play,
+because how often you played something is the signal. The playlist that comes
+out of it collapses repeats.
 
 **A track's duration is what you played, not what it was.** MPRIS reports
 position. Skip halfway and the `#EXTINF` should say so, because sides are split
