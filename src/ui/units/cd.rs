@@ -119,36 +119,28 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
 
     // --- transport keys --------------------------------------------------
     let ky = inner.y + 6;
-    let mut kx = inner.x + SPINE + 1;
+    let kx = inner.x + SPINE + 1;
     let playing = cd.transport == Transport::Play;
 
-    let mut key = |kx: &mut u16, label: &str, active: bool, cmd: Command, hits: &mut HitMap| {
-        let w = chassis::key(buf, *kx, ky, 6, label, theme, active);
-        hits.add(*kx, ky, w, 3, cmd);
-        *kx += w + 1;
+    let mut row = chassis::KeyRow::new(kx, ky);
+    let mut press = |row: &mut chassis::KeyRow, w, label: &str, active, cmd, hits: &mut HitMap| {
+        let r = row.key(buf, w, label, theme, active, true);
+        hits.add(r.x, r.y, r.width, r.height, cmd);
     };
-    key(&mut kx, tr::PREV, false, Command::CdPrev, hits);
-    key(
-        &mut kx,
+    press(&mut row, 6, tr::PREV, false, Command::CdPrev, hits);
+    press(
+        &mut row,
+        6,
         if playing { tr::PAUSE } else { tr::PLAY },
         playing,
         Command::CdPlayPause,
         hits,
     );
-    key(&mut kx, tr::NEXT, false, Command::CdNext, hits);
-    key(
-        &mut kx,
-        tr::STOP,
-        cd.transport == Transport::Stop,
-        Command::CdStop,
-        hits,
-    );
-    kx += 1;
-
-    chassis::boxed(buf, kx, ky + 1, "RPT", theme, cd.repeat, false);
-    hits.add_row(kx, ky + 1, 5, Command::CdRepeat);
-    chassis::boxed(buf, kx + 6, ky + 1, "RND", theme, cd.random, false);
-    hits.add_row(kx + 6, ky + 1, 5, Command::CdRandom);
+    press(&mut row, 6, tr::NEXT, false, Command::CdNext, hits);
+    press(&mut row, 6, tr::STOP, cd.transport == Transport::Stop, Command::CdStop, hits);
+    row.gap(2);
+    press(&mut row, 6, "RPT", cd.repeat, Command::CdRepeat, hits);
+    press(&mut row, 6, "RND", cd.random, Command::CdRandom, hits);
 
     // --- badge, model, and the shelf strip -------------------------------
     let badge_x = inner.x + inner.width.saturating_sub(24);

@@ -48,12 +48,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         hits.add_row(bar_x + i, row_vol, 1, Command::Volume(level));
     }
 
-    // The attenuator's 70% / 60% steps light per the panel's own logic.
-    chassis::boxed(buf, bar_x + bar_w + 6, row_vol, "ATT", theme, c.att, false);
-    hits.add_row(bar_x + bar_w + 6, row_vol, 5, Command::Att);
+    // The attenuator's 70% / 60% steps are readouts, not controls, so they
+    // stay boxed legends — the ATT key that drives them is down in the key row.
     chassis::boxed_green(
         buf,
-        bar_x + bar_w + 12,
+        bar_x + bar_w + 6,
         row_vol,
         "70%",
         theme,
@@ -62,7 +61,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     );
     chassis::boxed_green(
         buf,
-        bar_x + bar_w + 18,
+        bar_x + bar_w + 12,
         row_vol,
         "60%",
         theme,
@@ -92,16 +91,22 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     );
     hits.add_row(ix, row_fader, 8, Command::Ill);
 
-    // --- source selector -------------------------------------------------
-    // The head unit's most consequential control, so it gets its own row.
-    let row_src = inner.y + 6;
-    chassis::sublegend(buf, x, row_src, "SOURCE", theme, false);
-    let mut sx = x + 8;
+    // --- key row ----------------------------------------------------------
+    // ATT and the source selector, wearing the same caps as every other
+    // operable control on the rack. The attenuator's 70% / 60% marks stay up
+    // on the volume row as boxed legends, because those report rather than do.
+    let ky = inner.y + 6;
+    chassis::sublegend(buf, x, ky, "SOURCE", theme, false);
+    let mut row = chassis::KeyRow::new(x + 8, ky);
+
+    let r = row.key(buf, 5, "ATT", theme, c.att, true);
+    hits.add(r.x, r.y, r.width, r.height, Command::Att);
+    row.gap(2);
+
     for kind in [SourceKind::Cd, SourceKind::Tape, SourceKind::Tuner] {
-        let on = stack.source == kind;
-        chassis::boxed(buf, sx, row_src, kind.label(), theme, on, false);
-        hits.add_row(sx, row_src, kind.label().len() as u16 + 2, Command::Source(kind));
-        sx += kind.label().len() as u16 + 4;
+        let label = kind.label();
+        let r = row.key(buf, label.len() as u16 + 2, label, theme, stack.source == kind, true);
+        hits.add(r.x, r.y, r.width, r.height, Command::Source(kind));
     }
 
     chassis::model_corner(buf, inner, &["CONTROL HEAD LT-581"], theme);
@@ -147,13 +152,11 @@ fn tone(
 /// Front/rear balance. The marker slides between the two bus labels.
 fn fader(buf: &mut Buffer, x: u16, y: u16, value: f32, theme: &Theme, hits: &mut HitMap) {
     const W: u16 = 17;
-    buf.set_string(x, y, "R", Style::default().fg(theme.ink_legend).bg(theme.chassis));
-    buf.set_string(
-        x + W + 1,
-        y,
-        "F",
-        Style::default().fg(theme.ink_legend).bg(theme.chassis),
-    );
+    let ink = Style::default().fg(theme.ink_legend).bg(theme.chassis);
+    // The track runs from x+2 to x+2+W-1, so F sits one clear of its end.
+    // Placing it at x+W+1 put it under the track's last cell.
+    buf.set_string(x, y, "R", ink);
+    buf.set_string(x + W + 3, y, "F", ink);
 
     let pos = (value.clamp(0.0, 1.0) * (W - 1) as f32).round() as u16;
     for i in 0..W {

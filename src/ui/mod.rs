@@ -29,8 +29,8 @@ pub const H_CD: u16 = 12;
 pub const H_TAPE: u16 = 12;
 pub const H_TUNER: u16 = 12;
 pub const H_EQ: u16 = 15;
-pub const H_AMP: u16 = 9;
-pub const H_CTRL: u16 = 10;
+pub const H_AMP: u16 = 10;
+pub const H_CTRL: u16 = 11;
 pub const H_COLOPHON: u16 = 2;
 
 pub const RACK_HEIGHT: u16 =

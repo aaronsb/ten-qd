@@ -1,9 +1,14 @@
 .DEFAULT_GOAL := help
-.PHONY: help deps build release run test lint fmt fmt-check check clean install screenshot radio-check
+.PHONY: help deps build release run test lint fmt fmt-check check clean install uninstall forget screenshot radio-check
 
 # Edition 2024.
 MIN_RUST := 1.85
 BIN      := target/release/ten-qd
+
+# XDG user-scope install. Override with `make install PREFIX=/usr/local`.
+PREFIX   ?= $(or $(XDG_DATA_HOME),$(HOME)/.local)
+BINDIR   ?= $(PREFIX)/bin
+STATEDIR := $(or $(XDG_STATE_HOME),$(HOME)/.local/state)/ten-qd
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -105,8 +110,24 @@ release: ## Optimised build
 run: release ## Build and run the panel
 	./$(BIN)
 
-install: ## Install the binary to ~/.cargo/bin
-	cargo install --path .
+install: release ## Install to $XDG_DATA_HOME/bin (default ~/.local/bin)
+	@mkdir -p "$(BINDIR)"
+	@install -m 755 "$(BIN)" "$(BINDIR)/ten-qd"
+	@echo "installed $(BINDIR)/ten-qd"
+	@case ":$$PATH:" in \
+		*":$(BINDIR):"*) echo "$(BINDIR) is on your PATH — run 'ten-qd'";; \
+		*) echo; echo "  $(BINDIR) is NOT on your PATH. Add it:"; \
+		   echo "    export PATH=\"$(BINDIR):\$$PATH\"";; \
+	esac
+
+uninstall: ## Remove the installed binary (leaves the memory alone)
+	@rm -f "$(BINDIR)/ten-qd" && echo "removed $(BINDIR)/ten-qd"
+	@if [ -e "$(STATEDIR)/memory.toml" ]; then \
+		echo "settings kept at $(STATEDIR)/memory.toml — 'make forget' clears them"; \
+	fi
+
+forget: ## Clear the 12-volt memory (presets, tone, last disc)
+	@rm -rf "$(STATEDIR)" && echo "cleared $(STATEDIR)"
 
 screenshot: release ## Render one frame to stdout and exit
 	./$(BIN) --screenshot

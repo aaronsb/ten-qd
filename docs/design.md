@@ -105,9 +105,34 @@ numerals stay amber because that is the phosphor. Had ILL been implemented as a
 global hue rotation — the obvious shortcut — the whole panel would have shifted
 and the illusion of three separate materials would have collapsed.
 
+## Caps and legends
+
 Key caps are dark with a lit slot, and the legend is printed on the **panel
 beneath** the cap, not on the cap. Drawing them as one object was wrong and
 looked it.
+
+**Every operable control on the rack is one of these caps** — transport keys,
+RPT and RND, APS and FLIP, TUNE and SEEK, the six radio presets, POWER, ATT,
+and the source selector. Anything that only *reports* is a boxed legend inside
+a display window instead: DISC, STEREO, REW, FF, DOLBY, the attenuator's
+70% / 60% marks.
+
+That split is the fastest way to read the panel — **if it has a cap, you can
+press it.** Getting there meant converting several controls that had started
+life as boxed legends, because a boxed legend that happened to be clickable
+taught the eye nothing.
+
+Caps have three states, which is enough to say everything a button needs to:
+
+| | |
+|---|---|
+| available | slot lit dim, legend in green ink |
+| active | slot lit amber, legend amber and bold |
+| unavailable | slot dark, legend dim grey — the cap is still drawn |
+
+The last one matters for radio presets. An unstored preset keeps its cap,
+because the button is physically there; it simply is not lit. A control that
+vanished when it had nothing to recall would be a menu, not a panel.
 
 ## Where faithfulness lost
 
@@ -152,7 +177,9 @@ once, after the rack is drawn. Later registrations win, so a key cap drawn over
 its bay receives the click.
 
 This is why a slider takes a click anywhere along its travel: each of its five
-rows registers its own zone carrying the gain that row represents.
+rows registers its own zone carrying the gain that row represents. `KeyRow`
+lays out a run of caps and hands back the rect of each one, so a key's click
+target is literally the rectangle it was drawn into.
 
 ## The contract
 

@@ -189,6 +189,9 @@ pub struct Track {
 pub struct Disc {
     pub title: String,
     pub tracks: Vec<Track>,
+    /// The folder this was loaded from, so the memory can put it back in the
+    /// tray next time.
+    pub path: PathBuf,
 }
 
 impl Disc {
@@ -242,10 +245,12 @@ pub struct Tape {
     pub tracks: Vec<Track>,
     /// Index of the first track on side B.
     pub split: usize,
+    /// The folder this was compiled from.
+    pub path: PathBuf,
 }
 
 impl Tape {
-    pub fn from_tracks(title: String, tracks: Vec<Track>) -> Self {
+    pub fn from_tracks(title: String, path: PathBuf, tracks: Vec<Track>) -> Self {
         let total: f64 = tracks.iter().map(|t| t.seconds).sum();
         let mut run = 0.0;
         let mut split = tracks.len();
@@ -258,7 +263,7 @@ impl Tape {
         }
         // A one-track tape is all side A; never produce an empty side A.
         let split = split.clamp(1.min(tracks.len()), tracks.len());
-        Tape { title, tracks, split }
+        Tape { title, tracks, split, path }
     }
 
     /// The half-open track range belonging to a side.
@@ -620,7 +625,7 @@ mod tests {
     fn tape_splits_by_running_time_not_track_count() {
         // One long opener then three short ones: a real compilation would put
         // the long one alone on side A, and so does this.
-        let t = Tape::from_tracks("x".into(), vec![track(600.0), track(60.0), track(60.0), track(60.0)]);
+        let t = Tape::from_tracks("x".into(), "/x".into(), vec![track(600.0), track(60.0), track(60.0), track(60.0)]);
         assert_eq!(t.split, 1);
         assert_eq!(t.side_range(Side::A).len(), 1);
         assert_eq!(t.side_range(Side::B).len(), 3);
@@ -628,21 +633,21 @@ mod tests {
 
     #[test]
     fn tape_sides_are_balanced_for_even_tracks() {
-        let t = Tape::from_tracks("x".into(), vec![track(100.0); 6]);
+        let t = Tape::from_tracks("x".into(), "/x".into(), vec![track(100.0); 6]);
         assert_eq!(t.split, 3);
         assert!((t.side_seconds(Side::A) - t.side_seconds(Side::B)).abs() < 1.0);
     }
 
     #[test]
     fn a_single_track_tape_is_all_side_a() {
-        let t = Tape::from_tracks("x".into(), vec![track(100.0)]);
+        let t = Tape::from_tracks("x".into(), "/x".into(), vec![track(100.0)]);
         assert_eq!(t.side_range(Side::A).len(), 1);
         assert!(t.side_range(Side::B).is_empty());
     }
 
     #[test]
     fn an_empty_tape_has_empty_sides() {
-        let t = Tape::from_tracks("x".into(), vec![]);
+        let t = Tape::from_tracks("x".into(), "/x".into(), vec![]);
         assert!(t.side_range(Side::A).is_empty());
         assert!(t.side_range(Side::B).is_empty());
     }

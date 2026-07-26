@@ -96,42 +96,30 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
 
     // --- keys -------------------------------------------------------------
     let ky = inner.y + 6;
-    let mut kx = inner.x + SPINE + 1;
+    let kx = inner.x + SPINE + 1;
 
-    // TUNE is one rocker: a chevron at each end of a single bar.
-    let rw = chassis::key(buf, kx, ky, 9, "⌄ TUNE ⌃", theme, false);
-    hits.add(kx, ky, rw / 2, 3, Command::TunerStepDown);
-    hits.add(kx + rw / 2, ky, rw - rw / 2, 3, Command::TunerStepUp);
-    kx += rw + 2;
+    let mut row = chassis::KeyRow::new(kx, ky);
 
-    let sw = chassis::key(buf, kx, ky, 9, "◀ SEEK ▶", theme, t.seeking);
-    hits.add(kx, ky, sw / 2, 3, Command::TunerSeekDown);
-    hits.add(kx + sw / 2, ky, sw - sw / 2, 3, Command::TunerSeekUp);
-    kx += sw + 3;
+    // TUNE is one rocker: a chevron at each end of a single bar, so the cap is
+    // split down the middle for hit testing rather than being two keys.
+    let r = row.key(buf, 9, "⌄ TUNE ⌃", theme, false, true);
+    hits.add(r.x, r.y, r.width / 2, r.height, Command::TunerStepDown);
+    hits.add(r.x + r.width / 2, r.y, r.width - r.width / 2, r.height, Command::TunerStepUp);
+    row.gap(1);
+
+    let r = row.key(buf, 9, "◀ SEEK ▶", theme, t.seeking, true);
+    hits.add(r.x, r.y, r.width / 2, r.height, Command::TunerSeekDown);
+    hits.add(r.x + r.width / 2, r.y, r.width - r.width / 2, r.height, Command::TunerSeekUp);
+    row.gap(2);
 
     // --- presets ----------------------------------------------------------
-    chassis::sublegend(buf, kx, ky, "PRESET", theme, false);
-    for i in 0..6u16 {
-        let px = kx + i * 4;
-        let stored = t.presets[i as usize].is_some();
-        let active = t.preset == Some(i as usize);
-        let style = if active {
-            Style::default().fg(theme.vfd).bg(theme.chassis).add_modifier(Modifier::BOLD)
-        } else if stored {
-            Style::default().fg(theme.ink_legend).bg(theme.chassis)
-        } else {
-            Style::default().fg(theme.ink_grey).bg(theme.chassis).add_modifier(Modifier::DIM)
-        };
-        buf.set_string(px + 1, ky + 1, format!("{}", i + 1), style);
-        buf.set_string(
-            px,
-            ky + 2,
-            if stored { "▬▬▬" } else { "───" },
-            Style::default()
-                .fg(if stored { theme.cap_slot } else { theme.seam })
-                .bg(theme.chassis),
-        );
-        hits.add(px, ky + 1, 3, 2, Command::TunerPreset(i as usize));
+    // Same cap as every other button; six numbered caps under a radio need no
+    // caption. An unstored preset keeps its cap — the button is physically
+    // there — but its slot and number stay dark.
+    for i in 0..6usize {
+        let stored = t.presets[i].is_some();
+        let r = row.key(buf, 4, &format!("{}", i + 1), theme, t.preset == Some(i), stored);
+        hits.add(r.x, r.y, r.width, r.height, Command::TunerPreset(i));
     }
 
     let badge_x = inner.x + inner.width.saturating_sub(24);

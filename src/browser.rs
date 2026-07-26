@@ -68,9 +68,12 @@ fn count_here(dir: &Path) -> usize {
 }
 
 impl Browser {
-    pub fn new(root: PathBuf) -> Self {
+    /// `start` is where the browser opens — the folder it was left in last
+    /// time, if the memory has one and it still exists.
+    pub fn new(root: PathBuf, start: Option<PathBuf>) -> Self {
+        let cwd = start.filter(|p| p.is_dir() && p.starts_with(&root)).unwrap_or_else(|| root.clone());
         let mut b = Browser {
-            cwd: root.clone(),
+            cwd,
             root,
             entries: Vec::new(),
             cursor: 0,
@@ -163,34 +166,42 @@ impl Browser {
         }
     }
 
-    /// Gather every track below the highlighted directory into a tape.
-    ///
-    /// Sorted by path so a multi-disc set stays in its intended order, then
-    /// split into two sides by running time.
+    /// Compile the highlighted directory into a tape.
     pub fn as_tape(&self) -> Result<Tape> {
         let Some(e) = self.selected() else { bail!("nothing selected") };
-
-        let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(&e.path)
-            .max_depth(SCAN_DEPTH)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|x| x.ok())
-            .filter(|x| x.file_type().is_file() && disc::is_audio(x.path()))
-            .map(|x| x.path().to_path_buf())
-            .collect();
-        paths.sort();
-
-        if paths.is_empty() {
-            bail!("no audio under {}", e.name);
-        }
-
-        let tracks: Vec<Track> = paths.iter().filter_map(|p| disc::probe_track(p).ok()).collect();
-        if tracks.is_empty() {
-            bail!("nothing under {} could be decoded", e.name);
-        }
-
-        Ok(Tape::from_tracks(e.name.clone(), tracks))
+        tape_from_dir(&e.path)
     }
+}
+
+/// Gather every track below `dir` into a tape.
+///
+/// Sorted by path so a multi-disc set stays in its intended order, then split
+/// into two sides by running time. Shared with the memory, which needs to put
+/// the same tape back in the deck at start-up without going through the
+/// browser to do it.
+pub fn tape_from_dir(dir: &Path) -> Result<Tape> {
+    let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+
+    let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+        .max_depth(SCAN_DEPTH)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|x| x.ok())
+        .filter(|x| x.file_type().is_file() && disc::is_audio(x.path()))
+        .map(|x| x.path().to_path_buf())
+        .collect();
+    paths.sort();
+
+    if paths.is_empty() {
+        bail!("no audio under {name}");
+    }
+
+    let tracks: Vec<Track> = paths.iter().filter_map(|p| disc::probe_track(p).ok()).collect();
+    if tracks.is_empty() {
+        bail!("nothing under {name} could be decoded");
+    }
+
+    Ok(Tape::from_tracks(name, dir.to_path_buf(), tracks))
 }
 
 fn is_hidden(p: &Path) -> bool {

@@ -46,10 +46,16 @@ librtlsdr (the tuner), and pkg-config to find them. `make deps` checks all of
 it and prints the install line for your package manager if anything is missing:
 
 ```sh
-make deps      # check build and runtime dependencies
-make run       # build optimised and start the panel
-make help      # every target
+make deps        # check build and runtime dependencies
+make run         # build optimised and start the panel
+make install     # copy to ~/.local/bin (XDG user scope)
+make help        # every target
 ```
+
+`make install` puts the binary in `$XDG_DATA_HOME/bin`, defaulting to
+`~/.local/bin`, and tells you if that is not on your `PATH`. `make uninstall`
+removes it and leaves your settings alone; `make forget` clears those too.
+Override the location with `make install PREFIX=/usr/local`.
 
 Rust 1.85 or newer (edition 2024). `make check` runs clippy with warnings as
 errors, plus the tests.
@@ -78,7 +84,7 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `SPACE` `s` | play/pause · stop (acts on the selected source) |
 | `←` `→` / `p` `n` | previous · next  (tuner: seek) |
 | `1`–`9` | cue a track  (tuner: recall preset) |
-| `!` … `^` | store the current station as a preset |
+| `!` … `^` | store the current station as a preset (kept between runs) |
 | `[` `]` `g` | tune down/up · LOCAL |
 | `e` `r` `z` | eject · repeat · random |
 | `v` `y` `a` | flip the tape · Dolby · auto-reverse |
@@ -111,6 +117,7 @@ measured to make the meters honest.
 | [docs/audio.md](docs/audio.md) | the signal path, the DSP, and the clock the display runs on |
 | [docs/tuner.md](docs/tuner.md) | FM demodulation on an RTL-SDR, and calibrating it against the band |
 | [docs/design.md](docs/design.md) | the panel language: glyphs, colour, and what is invented |
+| [docs/memory.md](docs/memory.md) | the 12-volt memory: what persists, where, and how it heals |
 | [docs/the-ad.md](docs/the-ad.md) | the 1986 advertisement this came from, and what was taken from it |
 | [docs/panel-reference.html](docs/panel-reference.html) | the original HTML prototype this was ported from |
 
@@ -131,6 +138,7 @@ measured to make the meters honest.
 | `disc.rs` | a folder is a disc; its file order is the TOC. |
 | `browser.rs` | the shelf — what to put in the machine, and how. |
 | `state.rs` | unit state, and the one function allowed to mutate it. |
+| `memory.rs` | the 12-volt memory — what survives the ignition going off. |
 
 ## Known limits
 
@@ -143,4 +151,3 @@ measured to make the meters honest.
 - **Resampling is 4-point Hermite**, and it is in the path constantly (48 kHz
   device, 44.1 kHz discs). `rubato` is the drop-in upgrade; `hermite()` in
   `audio/mod.rs` is the only function that would change.
-- **Presets are not persisted** across runs.

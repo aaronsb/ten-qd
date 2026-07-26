@@ -18,5 +18,7 @@ ratatui = "0.30.2"
 ringbuf = "0.5.1"
 rtlsdr_mt = "2.2.0"
 rustfft = "6.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
 symphonia = { version = "0.6.0", features = ["flac", "mp3", "aac", "isomp4", "ogg", "vorbis", "wav", "alac", "pcm"] }
+toml = "1.1.3"
 walkdir = "2.5.0"

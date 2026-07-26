@@ -136,36 +136,33 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
 
     // --- keys -------------------------------------------------------------
     let ky = inner.y + 6;
-    let mut kx = inner.x + SPINE + 1;
+    let kx = inner.x + SPINE + 1;
     let playing = t.transport == Transport::Play;
 
-    let mut key = |kx: &mut u16, label: &str, active: bool, cmd: Command, hits: &mut HitMap| {
-        let kw = chassis::key(buf, *kx, ky, 6, label, theme, active);
-        hits.add(*kx, ky, kw, 3, cmd);
-        *kx += kw + 1;
+    let mut row = chassis::KeyRow::new(kx, ky);
+    let mut press = |row: &mut chassis::KeyRow, w, label: &str, active, cmd, hits: &mut HitMap| {
+        let r = row.key(buf, w, label, theme, active, true);
+        hits.add(r.x, r.y, r.width, r.height, cmd);
     };
-    key(&mut kx, tr::REW, t.transport == Transport::Rew, Command::TapeRew, hits);
-    key(
-        &mut kx,
+    press(&mut row, 6, tr::REW, t.transport == Transport::Rew, Command::TapeRew, hits);
+    press(
+        &mut row,
+        6,
         if playing { tr::PAUSE } else { tr::PLAY },
         playing,
         Command::TapePlayPause,
         hits,
     );
-    key(&mut kx, tr::FF, t.transport == Transport::Ff, Command::TapeFf, hits);
-    key(&mut kx, tr::STOP, t.transport == Transport::Stop, Command::TapeStop, hits);
-    kx += 1;
+    press(&mut row, 6, tr::FF, t.transport == Transport::Ff, Command::TapeFf, hits);
+    press(&mut row, 6, tr::STOP, t.transport == Transport::Stop, Command::TapeStop, hits);
+    row.gap(2);
 
     // APS — Automatic Program Search, the deck's name for track skip. It finds
     // the gaps between tracks rather than knowing where they are.
-    chassis::boxed(buf, kx, ky + 1, "◀APS", theme, false, false);
-    hits.add_row(kx, ky + 1, 6, Command::TapeApsPrev);
-    chassis::boxed(buf, kx + 7, ky + 1, "APS▶", theme, false, false);
-    hits.add_row(kx + 7, ky + 1, 6, Command::TapeApsNext);
-
-    let side_x = kx + 15;
-    chassis::boxed_green(buf, side_x, ky + 1, "FLIP", theme, t.side == Side::B, false);
-    hits.add_row(side_x, ky + 1, 6, Command::TapeFlip);
+    press(&mut row, 6, "◀APS", false, Command::TapeApsPrev, hits);
+    press(&mut row, 6, "APS▶", false, Command::TapeApsNext, hits);
+    row.gap(1);
+    press(&mut row, 6, "FLIP", t.side == Side::B, Command::TapeFlip, hits);
 
     // --- badge and shelf strip -------------------------------------------
     let badge_x = inner.x + inner.width.saturating_sub(24);

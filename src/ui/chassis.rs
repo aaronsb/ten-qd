@@ -157,12 +157,20 @@ pub fn boxed_green(
     buf.set_string(x, y, glyph::boxed(label), style);
 }
 
-/// A transport key: a dark cap with a lit slot, and the green legend printed on
-/// the panel beneath it. Three rows tall, `w` wide. Returns the width used.
+/// A key: a dark cap with a lit slot, and the green legend printed on the
+/// panel beneath it. Three rows tall, `w` wide. Returns the width used.
 ///
-/// The cap and the legend are drawn in different colours on purpose — on the
-/// real deck the legend is on the panel, not on the button.
-pub fn key(
+/// **Every operable control on the rack is one of these.** The cap and the
+/// legend are drawn in different colours on purpose — on the real deck the
+/// legend is on the panel, not on the button. Things that only *report* — DISC,
+/// STEREO, REW, the attenuator steps — are `boxed` legends inside a display
+/// window instead, and the distinction is the fastest way to read the panel:
+/// if it has a cap, you can press it.
+/// A key that may be unavailable — an empty radio preset, say. An unavailable
+/// key still has a cap, because the button is physically there; its slot and
+/// legend simply are not lit.
+#[allow(clippy::too_many_arguments)]
+pub fn key_with(
     buf: &mut Buffer,
     x: u16,
     y: u16,
@@ -170,11 +178,18 @@ pub fn key(
     label: &str,
     theme: &Theme,
     active: bool,
+    available: bool,
 ) -> u16 {
     let w = w.max(4);
     let cap_style = Style::default().fg(theme.cap).bg(theme.chassis);
     let slot_style = Style::default()
-        .fg(if active { theme.vfd } else { theme.cap_slot })
+        .fg(if active {
+            theme.vfd
+        } else if available {
+            theme.cap_slot
+        } else {
+            theme.seam
+        })
         .bg(theme.cap);
 
     let inner = (w - 2) as usize;
@@ -191,14 +206,51 @@ pub fn key(
     // Legend, centred under the cap.
     let lw = label.chars().count() as u16;
     let lx = x + w.saturating_sub(lw) / 2;
-    let style = if active {
-        Style::default().fg(theme.ink_legend).bg(theme.chassis).add_modifier(Modifier::BOLD)
+    let style = if !available {
+        Style::default().fg(theme.ink_grey).bg(theme.chassis).add_modifier(Modifier::DIM)
+    } else if active {
+        Style::default().fg(theme.vfd).bg(theme.chassis).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.ink_legend).bg(theme.chassis)
     };
     buf.set_string(lx, y + 2, label, style);
 
     w
+}
+
+/// Lay out a row of keys, returning the x each one starts at. Keeps the gap
+/// between caps identical everywhere on the rack.
+pub struct KeyRow {
+    pub x: u16,
+    pub y: u16,
+}
+
+impl KeyRow {
+    pub fn new(x: u16, y: u16) -> Self {
+        KeyRow { x, y }
+    }
+
+    /// Draw one key and advance. Returns the rect it occupies, for the hit map.
+    #[allow(clippy::too_many_arguments)]
+    pub fn key(
+        &mut self,
+        buf: &mut Buffer,
+        w: u16,
+        label: &str,
+        theme: &Theme,
+        active: bool,
+        available: bool,
+    ) -> Rect {
+        let used = key_with(buf, self.x, self.y, w, label, theme, active, available);
+        let r = Rect::new(self.x, self.y, used, 3);
+        self.x += used + 1;
+        r
+    }
+
+    /// Extra space between groups of keys.
+    pub fn gap(&mut self, n: u16) {
+        self.x += n;
+    }
 }
 
 /// One of the big illuminated buttons down the left spine.

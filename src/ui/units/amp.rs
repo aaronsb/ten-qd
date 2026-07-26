@@ -81,16 +81,16 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     );
     chassis::badge(buf, rx, inner.y + 2, theme);
 
-    chassis::boxed(buf, rx, inner.y + 4, "POWER", theme, amp.power, false);
+    let r = chassis::KeyRow::new(rx, inner.y + 4).key(buf, 8, "POWER", theme, amp.power, true);
+    hits.add(r.x, r.y, r.width, r.height, Command::AmpPower);
     chassis::sublegend(
         buf,
-        rx + 9,
-        inner.y + 4,
+        rx + 10,
+        inner.y + 5,
         if amp.power { "IND ▰" } else { "IND ▱" },
         theme,
         false,
     );
-    hits.add_row(rx, inner.y + 4, 14, Command::AmpPower);
 
     chassis::model_corner(buf, inner, &["POWER AMPLIFIER QM-571"], theme);
 }

@@ -167,6 +167,7 @@ pub fn load(dir: &Path) -> Result<Disc> {
             dir.file_name().unwrap_or_default().to_string_lossy().into_owned()
         }),
         tracks: tracks.into_iter().map(|(_, t)| t).collect(),
+        path: dir.to_path_buf(),
     })
 }
 

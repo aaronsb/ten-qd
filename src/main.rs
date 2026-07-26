@@ -8,6 +8,7 @@
 mod audio;
 mod browser;
 mod disc;
+mod memory;
 mod state;
 mod ui;
 
@@ -28,11 +29,24 @@ use audio::dsp::DspParams;
 use audio::radio::RadioCmd;
 use audio::{EngineCmd, EngineEvent};
 use browser::Browser;
+use memory::{Keeper, Memory};
 use state::{Bank, Command, Patch, Side, SourceKind, Stack, Transport};
 use ui::hit::HitMap;
 use ui::units::eq::{snap, RANGE_DB, STEP_DB};
 
 const FRAME: Duration = Duration::from_millis(33);
+
+const USAGE: &str = "\
+ten-qd — a terminal music player wearing an 80s car stereo
+
+    ten-qd [FOLDER]        load FOLDER as a disc, or resume the last one
+    ten-qd --screenshot    render one frame to stdout and exit
+    ten-qd --radio-check   sweep the FM band and report signal per channel
+    ten-qd --forget        clear the 12-volt memory (presets, tone, last disc)
+    ten-qd --help          this
+
+Settings persist to $XDG_STATE_HOME/ten-qd/memory.toml.
+Press ? inside the panel for the key map.";
 
 /// A pending track start, waiting for the output clock to reach it.
 struct Mark {
@@ -60,11 +74,32 @@ struct App {
 }
 
 impl App {
-    fn new(engine: Option<audio::Engine>) -> Self {
+    fn new(engine: Option<audio::Engine>, mem: &Memory) -> Self {
         let mut stack = Stack::default();
         if let Some(e) = &engine {
             stack.cd.sample_rate = e.sample_rate;
         }
+
+        // Restore the panel before the first frame, so nothing is ever drawn
+        // in a state the operator did not leave it in.
+        stack.source = mem.source_kind();
+        stack.ctrl.volume = mem.volume;
+        stack.ctrl.att = mem.att;
+        stack.ctrl.bass = mem.bass;
+        stack.ctrl.treble = mem.treble;
+        stack.ctrl.fader = mem.fader;
+        stack.ctrl.ill = mem.illumination();
+        stack.amp.power = mem.amp_power;
+        stack.eq.defeat = mem.eq_defeat;
+        stack.eq.front = mem.eq_bank(Bank::Front);
+        stack.eq.rear = mem.eq_bank(Bank::Rear);
+        stack.tuner.freq = mem.tuner_freq;
+        stack.tuner.local = mem.tuner_local;
+        stack.tuner.presets = mem.presets();
+        stack.cd.repeat = mem.repeat;
+        stack.cd.random = mem.random;
+        stack.tape.dolby = mem.dolby;
+        stack.tape.auto_reverse = mem.auto_reverse;
         App {
             stack,
             engine,
@@ -76,7 +111,10 @@ impl App {
             show_help: false,
             running: true,
             hits: HitMap::new(),
-            browser: Browser::new(music_dir().unwrap_or_else(|| PathBuf::from("/"))),
+            browser: Browser::new(
+                music_dir().unwrap_or_else(|| PathBuf::from("/")),
+                mem.browser.clone(),
+            ),
         }
     }
 
@@ -499,29 +537,7 @@ impl App {
             Command::BrowserLoadTape => match self.browser.as_tape() {
                 Ok(tape) => {
                     self.browser.open = false;
-                    let msg = format!(
-                        "tape: {} · {} tracks · side A {}, side B {}",
-                        tape.title,
-                        tape.tracks.len(),
-                        tape.side_range(Side::A).len(),
-                        tape.side_range(Side::B).len()
-                    );
-                    let epoch = self.new_epoch();
-                    if let Some(e) = &self.engine {
-                        e.send(EngineCmd::LoadTape { tape: Arc::new(tape.clone()), epoch });
-                    }
-                    if self.stack.source != SourceKind::Tape {
-                        self.select_source(SourceKind::Tape);
-                    }
-                    self.stack.apply(Patch {
-                        tape: Some(Some(tape)),
-                        tape_side: Some(Side::A),
-                        tape_index: Some(0),
-                        tape_counter: Some(0.0),
-                        tape_transport: Some(Transport::Stop),
-                        ..Default::default()
-                    });
-                    self.status(msg);
+                    self.insert_tape(tape, true);
                 }
                 Err(e) => self.browser.error = Some(e.to_string()),
             },
@@ -677,6 +693,43 @@ impl App {
             tuner_preset: Some(None),
             ..Default::default()
         });
+    }
+
+    /// Put a tape in the deck. `select` switches the source to it, which the
+    /// browser wants and a start-up restore does not — the memory decides
+    /// which source is live on its own.
+    fn insert_tape(&mut self, tape: state::Tape, select: bool) {
+        let msg = format!(
+            "tape: {} · {} tracks · side A {}, side B {}",
+            tape.title,
+            tape.tracks.len(),
+            tape.side_range(Side::A).len(),
+            tape.side_range(Side::B).len()
+        );
+        let epoch = self.new_epoch();
+        if let Some(e) = &self.engine {
+            e.send(EngineCmd::LoadTape { tape: Arc::new(tape.clone()), epoch });
+        }
+        if select && self.stack.source != SourceKind::Tape {
+            self.select_source(SourceKind::Tape);
+        }
+        self.stack.apply(Patch {
+            tape: Some(Some(tape)),
+            tape_side: Some(Side::A),
+            tape_index: Some(0),
+            tape_counter: Some(0.0),
+            tape_transport: Some(Transport::Stop),
+            ..Default::default()
+        });
+        self.status(msg);
+    }
+
+    /// Restore a remembered tape. A folder that has since moved or emptied is
+    /// simply not loaded — it is not worth an error on the way in.
+    fn load_tape_from(&mut self, dir: &std::path::Path) {
+        if let Ok(tape) = browser::tape_from_dir(dir) {
+            self.insert_tape(tape, false);
+        }
     }
 
     fn track_count(&self) -> usize {
@@ -1095,8 +1148,27 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--radio-check") {
         return radio_check();
     }
+    if args.iter().any(|a| a == "--forget") {
+        return match Memory::forget() {
+            Ok(Some(p)) => {
+                println!("memory cleared: {}", p.display());
+                Ok(())
+            }
+            Ok(None) => {
+                println!("no memory to clear");
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        };
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let shot = args.iter().any(|a| a == "--screenshot");
     let arg = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from);
+
+    let loaded = Memory::load();
 
     // The panel should come up even with no sound card — it says so in the
     // colophon rather than refusing to start.
@@ -1105,18 +1177,36 @@ fn main() -> Result<()> {
         Err(e) => (None, Some(e.to_string())),
     };
 
-    let mut app = App::new(engine);
+    let mut app = App::new(engine, &loaded.memory);
     if let Some(msg) = engine_err {
         app.status(format!("audio engine unavailable: {msg}"));
     }
     app.publish(true);
 
-    // Put something in the tray: the argument, or the first album under the
-    // user's music directory.
-    let start_disc = arg.or_else(|| music_dir().and_then(|m| disc::first_disc(&m)));
+    // Restore what was in the machine. An explicit path on the command line
+    // wins; otherwise the disc that was in the tray last time, and only then
+    // a first-run guess at the music directory.
+    let remembered_tape = loaded.memory.tape.clone().filter(|p| p.is_dir());
+    let start_disc = arg
+        .or_else(|| loaded.memory.disc.clone().filter(|p| p.is_dir()))
+        .or_else(|| music_dir().and_then(|m| disc::first_disc(&m)));
     match start_disc {
         Some(p) => app.load(p),
         None => app.status("no disc — pass a directory of audio files as an argument"),
+    }
+    if let Some(p) = remembered_tape {
+        app.load_tape_from(&p);
+    }
+
+    // Park the radio where it was left. The transport stays stopped: a
+    // terminal program that starts making noise on launch is a bad neighbour,
+    // whatever the car would have done when you turned the key.
+    if let Some(e) = &app.engine {
+        e.radio.send(RadioCmd::Tune(app.stack.tuner.freq));
+        e.radio.send(RadioCmd::Enable(app.stack.source == SourceKind::Tuner));
+    }
+    if let Some(note) = &loaded.note {
+        app.status(note.clone());
     }
 
     if shot {
@@ -1133,14 +1223,20 @@ fn main() -> Result<()> {
         return screenshot(&mut app, 110, ui::RACK_HEIGHT);
     }
 
+    let mut keeper = Keeper::new(&loaded);
+
     let mut terminal = ratatui::init();
     // Mouse capture costs the terminal's native text selection; most emulators
     // still give it back under Shift, and having the panel be clickable is
     // worth that trade for a device that was all buttons.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let res = run(&mut terminal, &mut app);
+    let res = run(&mut terminal, &mut app, &mut keeper);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+
+    // Last write on the way out, so the final few seconds of fiddling are not
+    // swallowed by the rate limiter.
+    keeper.flush(&app.stack, Some(&app.browser.cwd));
     res
 }
 
@@ -1150,11 +1246,20 @@ fn music_dir() -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    keeper: &mut Keeper,
+) -> Result<()> {
     let mut last = Instant::now();
 
     while app.running {
         app.poll_engine();
+
+        keeper.maybe_save(&app.stack, Some(&app.browser.cwd));
+        if let Some(err) = keeper.error.take() {
+            app.status(err);
+        }
 
         let view_h = terminal.size()?.height;
         app.scroll = ui::clamp_scroll(app.scroll as i32, view_h);
