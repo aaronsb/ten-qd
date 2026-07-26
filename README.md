@@ -85,7 +85,7 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `←` `→` / `p` `n` | previous · next  (tuner: seek) |
 | `1`–`9` | cue a track  (tuner: recall preset) |
 | `!` … `^` | store the current station as a preset (kept between runs) |
-| `[` `]` `g` | tune down/up · LOCAL |
+| `[` `]` `g` `P` | tune down/up · LOCAL · tuner power |
 | `e` `r` `z` | eject · repeat · random |
 | `v` `y` `a` | flip the tape · Dolby · auto-reverse |
 | `↑` `↓` `m` | volume · attenuator |
@@ -93,7 +93,8 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `;` `'` | fader rear/front |
 | `h` `l` / `j` `k` | select equaliser band · cut/boost |
 | `f` `d` `0` | front/rear bank · defeat · flat |
-| `i` `w` | illumination colour · amp power |
+| `i` `w` | illumination colour · amplifier power |
+| `-` `=` | instrument dimmer, down and up |
 
 ### The radio
 

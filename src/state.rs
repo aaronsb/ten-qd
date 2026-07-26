@@ -124,6 +124,7 @@ pub enum Command {
     TunerPreset(usize),
     TunerStorePreset(usize),
     TunerLocal,
+    TunerPower,
 
     // source selection
     Source(SourceKind),
@@ -165,6 +166,9 @@ pub enum Command {
     Treble(i8),
     Fader(f32),
     Ill,
+    /// Instrument dimmer, the way the dash rheostat works: one step per press.
+    DimUp,
+    DimDown,
 
     Quit,
 }
@@ -320,6 +324,10 @@ pub const FM_STEP: f64 = 0.1;
 
 #[derive(Clone, Debug)]
 pub struct TunerState {
+    /// The tuner's own power switch, separate from the amplifier's. Off means
+    /// the display goes dark and the front end stops — a radio that is off,
+    /// not merely unselected.
+    pub power: bool,
     pub freq: f64,
     /// True once the demodulator has locked a 19 kHz pilot.
     pub stereo: bool,
@@ -337,6 +345,7 @@ pub struct TunerState {
 impl Default for TunerState {
     fn default() -> Self {
         TunerState {
+            power: true,
             freq: 88.5,
             stereo: false,
             rssi: 0.0,
@@ -403,6 +412,9 @@ pub struct CtrlState {
     /// 0.0 = all rear, 0.5 = centred, 1.0 = all front.
     pub fader: f32,
     pub ill: crate::ui::theme::Ill,
+    /// Instrument-lighting rheostat, 0..=7. Global to the whole rack, because
+    /// on a car it is one knob wired to every lamp on the dash.
+    pub dimmer: u8,
 }
 
 impl Default for CtrlState {
@@ -414,6 +426,7 @@ impl Default for CtrlState {
             treble: 0,
             fader: 0.5,
             ill: crate::ui::theme::Ill::Orange,
+            dimmer: crate::ui::theme::DIM_DEFAULT,
         }
     }
 }
@@ -466,6 +479,7 @@ pub struct Patch {
     pub tuner_preset: Option<Option<usize>>,
     pub tuner_presets: Option<[Option<f64>; 6]>,
     pub tuner_device: Option<Option<String>>,
+    pub tuner_power: Option<bool>,
 
     pub eq_defeat: Option<bool>,
     pub eq_front: Option<[f32; 9]>,
@@ -480,6 +494,7 @@ pub struct Patch {
     pub treble: Option<i8>,
     pub fader: Option<f32>,
     pub ill: Option<crate::ui::theme::Ill>,
+    pub dimmer: Option<u8>,
 
     pub status: Option<String>,
 }
@@ -559,6 +574,9 @@ impl Stack {
         if let Some(v) = p.tuner_device {
             self.tuner.device = v;
         }
+        if let Some(v) = p.tuner_power {
+            self.tuner.power = v;
+        }
 
         if let Some(v) = p.eq_defeat {
             self.eq.defeat = v;
@@ -601,6 +619,9 @@ impl Stack {
         }
         if let Some(v) = p.ill {
             self.ctrl.ill = v;
+        }
+        if let Some(v) = p.dimmer {
+            self.ctrl.dimmer = v.min(crate::ui::theme::DIM_MAX);
         }
         if let Some(v) = p.status {
             self.status = v;

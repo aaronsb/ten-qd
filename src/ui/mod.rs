@@ -20,7 +20,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::Frame;
 
-use crate::state::Stack;
+use crate::state::{Command, Stack};
 use theme::Theme;
 
 /// Natural height of each bay, in rows. These are fixed: the panels have the
@@ -46,7 +46,7 @@ pub const MIN_WIDTH: u16 = 84;
 pub fn draw(f: &mut Frame, stack: &Stack, scroll: u16, hits: &mut hit::HitMap) {
     hits.clear();
     let view = f.area();
-    let theme = Theme::new(stack.ctrl.ill);
+    let theme = Theme::for_stack(stack);
 
     if view.width < MIN_WIDTH {
         let msg = format!(
@@ -82,7 +82,7 @@ pub fn draw(f: &mut Frame, stack: &Stack, scroll: u16, hits: &mut hit::HitMap) {
     units::eq::draw(&mut rack, row(&mut y, H_EQ), stack, &theme, hits);
     units::amp::draw(&mut rack, row(&mut y, H_AMP), stack, &theme, hits);
     units::ctrl::draw(&mut rack, row(&mut y, H_CTRL), stack, &theme, hits);
-    colophon(&mut rack, row(&mut y, H_COLOPHON), stack, &theme);
+    colophon(&mut rack, row(&mut y, H_COLOPHON), stack, &theme, hits);
 
     let scroll = scroll.min(RACK_HEIGHT.saturating_sub(view.height));
     blit(f.buffer_mut(), view, &rack, scroll);
@@ -116,7 +116,7 @@ pub fn clamp_scroll(scroll: i32, view_height: u16) -> u16 {
     scroll.clamp(0, max.max(0)) as u16
 }
 
-fn colophon(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme) {
+fn colophon(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &mut hit::HitMap) {
     let y = area.y + 1;
     let left = if stack.status.is_empty() {
         "controls emit commands · state arrives from the engine".to_string()
@@ -125,12 +125,28 @@ fn colophon(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme) {
     };
     buf.set_string(2, y, &left, Style::default().fg(theme.ink_grey));
 
-    let right = "? KEYS   Q QUIT";
-    let x = area.width.saturating_sub(right.len() as u16 + 2);
-    buf.set_string(
-        x,
-        y,
-        right,
-        Style::default().fg(theme.ink_grey).add_modifier(Modifier::DIM),
-    );
+    // The dimmer sits with the other whole-panel controls rather than in a
+    // bay, because that is what it is — one rheostat wired to every lamp.
+    let grey = Style::default().fg(theme.ink_grey).add_modifier(Modifier::DIM);
+    let tail = "? KEYS   Q QUIT";
+    let bar_w = theme::DIM_MAX as u16 + 1;
+    let dim_w = 5 + bar_w;
+    let x = area.width.saturating_sub(tail.len() as u16 + dim_w + 5);
+
+    buf.set_string(x, y, "DIM", grey);
+    for i in 0..bar_w {
+        let lit = i <= theme.dim as u16;
+        buf.set_string(
+            x + 4 + i,
+            y,
+            if lit { "▮" } else { "▯" },
+            Style::default().fg(if lit { theme.led_a } else { theme.led_off }),
+        );
+    }
+    // Left half steps down, right half steps up — one control, two directions,
+    // like the rocker it stands in for.
+    hits.add_row(x, y, 4 + bar_w / 2, Command::DimDown);
+    hits.add_row(x + 4 + bar_w / 2, y, bar_w / 2 + 1, Command::DimUp);
+
+    buf.set_string(area.width.saturating_sub(tail.len() as u16 + 2), y, tail, grey);
 }

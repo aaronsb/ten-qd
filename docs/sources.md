@@ -61,6 +61,11 @@ the reason both exist.
 
 ## A station is a station
 
+The tuner has its own POWER switch, separate from the amplifier's and from
+being the selected source. Off means the display goes dark — all ghost
+segments, no reading — and the front end stops. A radio that is off, rather
+than one that is merely not being listened to.
+
 See [tuner.md](tuner.md).
 
 ## The browser

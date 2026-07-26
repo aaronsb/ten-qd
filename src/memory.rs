@@ -63,6 +63,9 @@ pub struct Memory {
     pub treble: i8,
     pub fader: f32,
     pub ill: String,
+    /// Instrument dimmer position. A driver who set the dash lighting for
+    /// night driving expects to find it there next time.
+    pub dimmer: u8,
     pub amp_power: bool,
 
     // equaliser
@@ -73,6 +76,7 @@ pub struct Memory {
     // tuner
     pub tuner_freq: f64,
     pub tuner_local: bool,
+    pub tuner_power: bool,
     pub tuner_presets: Vec<f64>,
 
     // transports
@@ -99,12 +103,14 @@ impl Default for Memory {
             treble: s.ctrl.treble,
             fader: s.ctrl.fader,
             ill: ill_name(s.ctrl.ill).into(),
+            dimmer: s.ctrl.dimmer,
             amp_power: s.amp.power,
             eq_defeat: s.eq.defeat,
             eq_front: s.eq.front.to_vec(),
             eq_rear: s.eq.rear.to_vec(),
             tuner_freq: s.tuner.freq,
             tuner_local: s.tuner.local,
+            tuner_power: s.tuner.power,
             tuner_presets: vec![PRESET_EMPTY; 6],
             repeat: s.cd.repeat,
             random: s.cd.random,
@@ -192,6 +198,7 @@ impl Memory {
         self.bass = self.bass.clamp(-2, 2);
         self.treble = self.treble.clamp(-2, 2);
         self.tuner_freq = self.tuner_freq.clamp(crate::state::FM_LO, crate::state::FM_HI);
+        self.dimmer = self.dimmer.min(crate::ui::theme::DIM_MAX);
 
         for bank in [&mut self.eq_front, &mut self.eq_rear] {
             bank.resize(9, 0.0);
@@ -220,12 +227,14 @@ impl Memory {
             treble: stack.ctrl.treble,
             fader: stack.ctrl.fader,
             ill: ill_name(stack.ctrl.ill).into(),
+            dimmer: stack.ctrl.dimmer,
             amp_power: stack.amp.power,
             eq_defeat: stack.eq.defeat,
             eq_front: stack.eq.front.to_vec(),
             eq_rear: stack.eq.rear.to_vec(),
             tuner_freq: stack.tuner.freq,
             tuner_local: stack.tuner.local,
+            tuner_power: stack.tuner.power,
             tuner_presets: stack
                 .tuner
                 .presets
@@ -439,12 +448,13 @@ mod tests {
     fn out_of_range_values_are_clamped_not_trusted() {
         let m: Memory = toml::from_str(
             "version = 1\nvolume = 9.5\nbass = 100\ntuner_freq = 5000.0\n\
-             eq_front = [99.0, -99.0]\ntuner_presets = [1.0, 89.0]\n",
+             eq_front = [99.0, -99.0]\ntuner_presets = [1.0, 89.0]\ndimmer = 200\n",
         )
         .unwrap();
         let m = m.sanitised();
         assert_eq!(m.volume, 1.0);
         assert_eq!(m.bass, 2);
+        assert!(m.dimmer <= crate::ui::theme::DIM_MAX);
         assert_eq!(m.tuner_freq, crate::state::FM_HI);
         assert_eq!(m.eq_front.len(), 9, "a short bank must be padded");
         assert_eq!(m.eq_front[0], 12.0);

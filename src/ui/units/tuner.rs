@@ -24,18 +24,28 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let inner = chassis::bay(buf, area, theme);
     let t = &stack.tuner;
     let live = stack.source == SourceKind::Tuner;
-    let ok = matches!(t.device, Some(ref d) if !d.is_empty());
+    // A radio that is switched off shows nothing, whatever the hardware says.
+    let ok = t.power && matches!(t.device, Some(ref d) if !d.is_empty());
 
     chassis::legend(buf, inner.x, inner.y, "TUNER", theme);
-    let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 4);
+    let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 5);
     chassis::lamp(buf, lamp, "AM/FM", theme, live);
     hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::TunerBand);
+
+    // --- power ------------------------------------------------------------
+    // Its own switch, on the right where the advertisement puts it. The
+    // display window makes room for it rather than running under it.
+    const POWER_W: u16 = 10;
+    let px = inner.x + inner.width.saturating_sub(POWER_W);
+    let plamp = Rect::new(px, inner.y + 1, POWER_W, 5);
+    chassis::lamp(buf, plamp, "POWER", theme, t.power);
+    hits.add(plamp.x, plamp.y, plamp.width, plamp.height, Command::TunerPower);
 
     // --- window -----------------------------------------------------------
     let win = Rect::new(
         inner.x + SPINE + 1,
         inner.y,
-        inner.width.saturating_sub(SPINE + 1),
+        inner.width.saturating_sub(SPINE + 2 + POWER_W),
         6,
     );
     let w = chassis::window(buf, win, theme, live && ok);
@@ -50,10 +60,14 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // --- frequency --------------------------------------------------------
     // Always five cells: the hundreds digit is blank below 100 MHz, exactly as
     // it is on a real dial, and the field does not shift when it lights.
+    // Five cells either way. The blank keeps its decimal point, because a
+    // space ghosts as a full `8` (three cells) while `.` ghosts as itself
+    // (one) — an all-blank string is wider than a real reading and runs into
+    // the indicators beside it.
     let text = if ok {
         format!("{:>5.1}", t.freq)
     } else {
-        "  . ".to_string()
+        "   . ".to_string()
     };
     let fw = glyph::seven_seg_width("888.8");
     let fx = w.x + 8;
@@ -61,7 +75,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
 
     // --- indicators -------------------------------------------------------
     let ix = fx + fw + 4;
-    chassis::boxed(buf, ix, w.y, "STEREO", theme, t.stereo, true);
+    chassis::boxed(buf, ix, w.y, "STEREO", theme, ok && t.stereo, true);
     chassis::boxed_green(buf, ix, w.y + 1, "LOCAL", theme, t.local, true);
     hits.add_row(ix, w.y + 1, 8, Command::TunerLocal);
     if t.seeking {
@@ -73,7 +87,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     chassis::sublegend(buf, mx, w.y + 3, "SIGNAL", theme, true);
     let bars = 10u16;
     for i in 0..bars {
-        let lit = t.rssi * bars as f32 > i as f32;
+        let lit = ok && t.rssi * bars as f32 > i as f32;
         // The meter is on glass, not on the panel, so it sits on the window
         // colour rather than the chassis.
         buf.set_string(
@@ -87,9 +101,10 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     }
 
     // What the radio actually is, or why there is not one.
-    let note = match &t.device {
-        Some(d) if !d.is_empty() => d.clone(),
-        Some(_) | None => "no radio".to_string(),
+    let note = match (&t.device, t.power) {
+        (_, false) => "off".to_string(),
+        (Some(d), _) if !d.is_empty() => d.clone(),
+        _ => "no radio".to_string(),
     };
     let note: String = note.chars().take(w.width.saturating_sub(2) as usize).collect();
     chassis::sublegend(buf, w.x + 8, w.y + 3, &note, theme, true);
@@ -122,11 +137,13 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         hits.add(r.x, r.y, r.width, r.height, Command::TunerPreset(i));
     }
 
-    let badge_x = inner.x + inner.width.saturating_sub(24);
+    let badge_x = inner.x + inner.width.saturating_sub(POWER_W + 16);
     chassis::badge(buf, badge_x, ky, theme);
 
     // The shelf strip: what is tuned, in words rather than numerals.
-    let strip = if !ok {
+    let strip = if !t.power {
+        "tuner off".to_string()
+    } else if !ok {
         "no radio — see README for RTL-SDR setup".to_string()
     } else if let Some(p) = t.preset {
         format!("FM {:.1} MHz · preset {} · {}", t.freq, p + 1, if t.stereo { "stereo" } else { "mono" })

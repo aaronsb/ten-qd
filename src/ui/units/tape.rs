@@ -32,7 +32,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let running = t.transport.is_running();
 
     chassis::legend(buf, inner.x, inner.y, "CASSETTE", theme);
-    let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 4);
+    let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 5);
     chassis::lamp(buf, lamp, "EJECT", theme, t.tape.is_some());
     hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::TapeEject);
 

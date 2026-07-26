@@ -22,9 +22,19 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let c = &stack.ctrl;
 
     chassis::legend(buf, inner.x, inner.y, "CONTROL", theme);
-    let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 4);
+    let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 5);
     chassis::lamp(buf, lamp, "ILL", theme, true);
     hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::Ill);
+
+    // The advertisement's top module puts VOLUME on the right as one wide
+    // rocker with a chevron at each end — not a pair of buttons. Split down
+    // the middle for hit testing, the same way the tuner's TUNE bar is.
+    const VOL_W: u16 = 12;
+    let vx = inner.x + inner.width.saturating_sub(VOL_W);
+    let vol = Rect::new(vx, inner.y + 1, VOL_W, 5);
+    chassis::lamp(buf, vol, "⌄ VOL ⌃", theme, true);
+    hits.add(vol.x, vol.y, vol.width / 2, vol.height, Command::VolDown);
+    hits.add(vol.x + vol.width / 2, vol.y, vol.width - vol.width / 2, vol.height, Command::VolUp);
 
     let x = inner.x + SPINE + 2;
     let row_vol = inner.y + 1;

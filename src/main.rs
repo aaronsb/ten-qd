@@ -89,12 +89,14 @@ impl App {
         stack.ctrl.treble = mem.treble;
         stack.ctrl.fader = mem.fader;
         stack.ctrl.ill = mem.illumination();
+        stack.ctrl.dimmer = mem.dimmer.min(ui::theme::DIM_MAX);
         stack.amp.power = mem.amp_power;
         stack.eq.defeat = mem.eq_defeat;
         stack.eq.front = mem.eq_bank(Bank::Front);
         stack.eq.rear = mem.eq_bank(Bank::Rear);
         stack.tuner.freq = mem.tuner_freq;
         stack.tuner.local = mem.tuner_local;
+        stack.tuner.power = mem.tuner_power;
         stack.tuner.presets = mem.presets();
         stack.cd.repeat = mem.repeat;
         stack.cd.random = mem.random;
@@ -471,6 +473,15 @@ impl App {
                 });
             }
 
+            Command::TunerPower => {
+                let v = !self.stack.tuner.power;
+                if let Some(e) = &self.engine {
+                    e.radio.send(RadioCmd::Enable(v && self.stack.source == SourceKind::Tuner));
+                }
+                self.stack.apply(Patch { tuner_power: Some(v), ..Default::default() });
+                self.status(if v { "tuner on" } else { "tuner off" });
+            }
+
             Command::TunerLocal => {
                 let v = !self.stack.tuner.local;
                 self.stack.apply(Patch { tuner_local: Some(v), ..Default::default() });
@@ -624,6 +635,16 @@ impl App {
                 self.publish(false);
             }
 
+            Command::DimUp | Command::DimDown => {
+                let d = &mut self.stack.ctrl.dimmer;
+                let v = if matches!(cmd, Command::DimUp) {
+                    (*d + 1).min(ui::theme::DIM_MAX)
+                } else {
+                    d.saturating_sub(1)
+                };
+                self.stack.apply(Patch { dimmer: Some(v), ..Default::default() });
+            }
+
             Command::Ill => {
                 let v = self.stack.ctrl.ill.toggle();
                 self.stack.apply(Patch { ill: Some(v), ..Default::default() });
@@ -646,7 +667,9 @@ impl App {
             e.send(EngineCmd::SelectSource { source: kind, epoch });
             // Only demodulate when the tuner is actually the source; the SDR
             // keeps reading either way so seek and the meter stay live.
-            e.radio.send(RadioCmd::Enable(kind == SourceKind::Tuner));
+            e.radio.send(RadioCmd::Enable(
+                kind == SourceKind::Tuner && self.stack.tuner.power,
+            ));
         }
         // Selecting a source stops whatever the others were doing, the way a
         // single-transport head unit has to.
@@ -942,6 +965,7 @@ impl App {
             (KeyCode::Char('['), _) => Some(Command::TunerStepDown),
             (KeyCode::Char(']'), _) => Some(Command::TunerStepUp),
             (KeyCode::Char('g'), _) => Some(Command::TunerLocal),
+            (KeyCode::Char('P'), _) => Some(Command::TunerPower),
             (KeyCode::Char('e'), _) => {
                 self.transport_cmd(Command::CdEject, Command::TapeEject, None)
             }
@@ -986,6 +1010,8 @@ impl App {
             (KeyCode::Char(';'), _) => Some(Command::Fader(self.stack.ctrl.fader - 0.0625)),
             (KeyCode::Char('\''), _) => Some(Command::Fader(self.stack.ctrl.fader + 0.0625)),
             (KeyCode::Char('i'), _) => Some(Command::Ill),
+            (KeyCode::Char('-'), _) => Some(Command::DimDown),
+            (KeyCode::Char('='), _) | (KeyCode::Char('+'), _) => Some(Command::DimUp),
             (KeyCode::Char('w'), _) => Some(Command::AmpPower),
 
             // equaliser
@@ -1052,7 +1078,7 @@ fn screenshot(app: &mut App, width: u16, height: u16) -> Result<()> {
     term.draw(|f| {
         ui::draw(f, &app.stack, app.scroll, &mut hits);
         if app.browser.open {
-            let theme = ui::theme::Theme::new(app.stack.ctrl.ill);
+            let theme = ui::theme::Theme::for_stack(&app.stack);
             ui::overlay::draw_browser(f, &app.browser, &theme, &mut hits);
         }
     })?;
@@ -1203,7 +1229,9 @@ fn main() -> Result<()> {
     // whatever the car would have done when you turned the key.
     if let Some(e) = &app.engine {
         e.radio.send(RadioCmd::Tune(app.stack.tuner.freq));
-        e.radio.send(RadioCmd::Enable(app.stack.source == SourceKind::Tuner));
+        e.radio.send(RadioCmd::Enable(
+            app.stack.source == SourceKind::Tuner && app.stack.tuner.power,
+        ));
     }
     if let Some(note) = &loaded.note {
         app.status(note.clone());
@@ -1215,6 +1243,12 @@ fn main() -> Result<()> {
         app.dispatch(Command::CdPlayPause);
         if args.iter().any(|a| a == "--browser") {
             app.dispatch(Command::BrowserOpen);
+        }
+        if args.iter().any(|a| a == "--tuner-off") {
+            app.dispatch(Command::TunerPower);
+        }
+        if let Some(v) = args.iter().find_map(|a| a.strip_prefix("--dim=")) {
+            app.stack.ctrl.dimmer = v.parse().unwrap_or(ui::theme::DIM_MAX);
         }
         app.stack.eq.front = [0.0, 3.0, 6.0, 3.0, 0.0, -3.0, 0.0, 6.0, 9.0];
         app.stack.eq.rear = [6.0, 3.0, 0.0, 0.0, -3.0, -6.0, -3.0, 0.0, 3.0];
@@ -1267,7 +1301,7 @@ fn run(
         let mut hits = HitMap::new();
         terminal.draw(|f| {
             ui::draw(f, &app.stack, app.scroll, &mut hits);
-            let theme = ui::theme::Theme::new(app.stack.ctrl.ill);
+            let theme = ui::theme::Theme::for_stack(&app.stack);
             if app.browser.open {
                 ui::overlay::draw_browser(f, &app.browser, &theme, &mut hits);
             }

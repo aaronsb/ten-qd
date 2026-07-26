@@ -6,6 +6,15 @@
 //!
 //! The terminal has no alpha channel, so every `rgba(x, .08)` in the CSS
 //! becomes an explicit blend against the surface it sat on. `mix()` does that.
+//!
+//! ## The dimmer
+//!
+//! Every car has a rheostat on the instrument lighting, because a dash that is
+//! comfortable at noon is blinding at midnight. This has the same control, and
+//! because *every* colour in the build is constructed here, it needs no more
+//! than a luminance scale applied on the way out — one multiply, applied once,
+//! reaching the whole panel. That is the payoff for keeping the token layer
+//! honest: a global visual change costs a single function.
 
 use ratatui::style::Color;
 
@@ -33,7 +42,32 @@ impl Ill {
     }
 }
 
+/// Instrument-lighting level. `0` is the bottom of the rheostat's travel, not
+/// off — a dimmer that could extinguish the panel would be a power switch.
+pub const DIM_MAX: u8 = 7;
+pub const DIM_DEFAULT: u8 = DIM_MAX;
+
+/// Luminance multiplier for a dimmer position.
+///
+/// The floor is 0.45, not something near zero: a dash rheostat at its minimum
+/// is still meant to be read at night. Below roughly this the green ink stops
+/// separating from the chassis before the emissive elements have dimmed
+/// usefully far.
+fn dim_factor(level: u8) -> f32 {
+    0.45 + 0.55 * level.min(DIM_MAX) as f32 / DIM_MAX as f32
+}
+
+/// Scale a colour's luminance, keeping its hue. Straight per-channel
+/// multiplication, which is what turning down a backlight actually does.
+fn dimmed(c: (u8, u8, u8), k: f32) -> (u8, u8, u8) {
+    let f = |x: u8| (x as f32 * k).round().clamp(0.0, 255.0) as u8;
+    (f(c.0), f(c.1), f(c.2))
+}
+
 pub struct Theme {
+    /// Kept so the colophon can draw the rheostat's position.
+    pub dim: u8,
+
     // chassis + panel
     pub chassis: Color,
     pub chassis_deep: Color,
@@ -78,17 +112,38 @@ const LED_G: (u8, u8, u8) = (0x43, 0xab, 0x5c);
 const INK_GREEN: (u8, u8, u8) = (0x43, 0xab, 0x5c);
 
 /// Blend `fg` over `bg` at `a` (0..=1) — the alpha the CSS had, resolved.
-fn mix(fg: (u8, u8, u8), bg: (u8, u8, u8), a: f32) -> Color {
+fn mix_raw(fg: (u8, u8, u8), bg: (u8, u8, u8), a: f32) -> (u8, u8, u8) {
     let f = |x: u8, y: u8| (x as f32 * a + y as f32 * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
-    Color::Rgb(f(fg.0, bg.0), f(fg.1, bg.1), f(fg.2, bg.2))
+    (f(fg.0, bg.0), f(fg.1, bg.1), f(fg.2, bg.2))
 }
 
-fn rgb(c: (u8, u8, u8)) -> Color {
+fn rgb_raw(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
 impl Theme {
-    pub fn new(ill: Ill) -> Self {
+    /// The theme the panel is currently wearing.
+    pub fn for_stack(stack: &crate::state::Stack) -> Self {
+        Self::new(stack.ctrl.ill, stack.ctrl.dimmer)
+    }
+
+    pub fn new(ill: Ill, dim: u8) -> Self {
+        let k = dim_factor(dim);
+
+        // Two constructors, and which one a colour goes through *is* the model
+        // of the panel. `surface` is unlit material — chassis plastic, the
+        // glass of a display window, a key cap. A rheostat does not change the
+        // colour of plastic. `lit` is everything the dimmer is actually wired
+        // to: bulbs, phosphor, LEDs, and the legends they backlight.
+        //
+        // Dimming both was the first attempt and it was wrong twice over —
+        // physically, and because scaling the background in step with the
+        // foreground holds contrast constant, so nothing appeared to dim at
+        // all beyond the whole rack fading toward black.
+        let surface = rgb_raw;
+        let lit = |c| rgb_raw(dimmed(c, k));
+        let lit_mix = |fg, bg, a| rgb_raw(dimmed(mix_raw(fg, bg, a), k));
+
         // ILL drives the *lamp* colour only — the big illuminated buttons down
         // the left spine. Screen-printed legends and the emissive VFD/LED
         // colours do not move, because those are ink and phosphor, not bulbs.
@@ -100,32 +155,33 @@ impl Theme {
         };
 
         Theme {
-            chassis: rgb(CHASSIS),
-            chassis_deep: rgb(CHASSIS_DEEP),
-            seam: rgb(SEAM),
-            window: rgb(WINDOW),
+            dim,
+            chassis: surface(CHASSIS),
+            chassis_deep: surface(CHASSIS_DEEP),
+            seam: surface(SEAM),
+            window: surface(WINDOW),
 
-            lamp: rgb(lamp),
-            lamp_hot: rgb(lamp_hot),
-            lamp_deep: rgb(lamp_deep),
+            lamp: lit(lamp),
+            lamp_hot: lit(lamp_hot),
+            lamp_deep: lit(lamp_deep),
 
-            ink_legend: rgb(INK_GREEN),
-            ink_red: rgb((0xff, 0x4b, 0x22)),
-            ink_grey: rgb((0x7f, 0x83, 0x8c)),
-            ink_white: rgb((0xd6, 0xd8, 0xde)),
+            ink_legend: lit(INK_GREEN),
+            ink_red: lit((0xff, 0x4b, 0x22)),
+            ink_grey: lit((0x7f, 0x83, 0x8c)),
+            ink_white: lit((0xd6, 0xd8, 0xde)),
 
-            vfd: rgb(VFD),
+            vfd: lit(VFD),
             // `--vfd-dim: rgba(255,194,31,.085)` over the window black. This is
             // the unlit segment — visible as a ghost, which is exactly how a
             // real VFD looks when you can see the un-driven grid.
-            vfd_dim: mix(VFD, WINDOW, 0.16),
-            led_r: rgb(LED_R),
-            led_a: rgb(LED_A),
-            led_g: rgb(LED_G),
-            led_off: mix((0xff, 0x96, 0x28), PANEL, 0.12),
+            vfd_dim: lit_mix(VFD, WINDOW, 0.16),
+            led_r: lit(LED_R),
+            led_a: lit(LED_A),
+            led_g: lit(LED_G),
+            led_off: lit_mix((0xff, 0x96, 0x28), PANEL, 0.12),
 
-            cap: rgb((0x1c, 0x1d, 0x23)),
-            cap_slot: mix(VFD, (0x1c, 0x1d, 0x23), 0.55),
+            cap: surface((0x1c, 0x1d, 0x23)),
+            cap_slot: lit_mix(VFD, (0x1c, 0x1d, 0x23), 0.55),
         }
     }
 

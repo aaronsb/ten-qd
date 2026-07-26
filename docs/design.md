@@ -105,6 +105,36 @@ numerals stay amber because that is the phosphor. Had ILL been implemented as a
 global hue rotation — the obvious shortcut — the whole panel would have shifted
 and the illusion of three separate materials would have collapsed.
 
+## The dimmer
+
+Every car has a rheostat on the instrument lighting, because a dash that is
+comfortable at noon is blinding at midnight. The rack has the same control,
+global to all six bays, shown next to `? KEYS` in the colophon.
+
+It cost one function, and that is the whole argument for the token layer.
+Because every colour in the build is constructed in `theme.rs` and nowhere
+else, a luminance scale applied on the way out reaches the entire panel — no
+unit knows the dimmer exists.
+
+**What it dims is the interesting part.** The first attempt scaled every colour
+uniformly and was wrong twice over. Physically: a rheostat does not change the
+colour of unlit plastic. And visually: scaling foreground and background in
+step holds contrast constant, so nothing appears to dim — the whole rack just
+fades toward black together.
+
+So there are two constructors, and which one a colour goes through *is* the
+model of the panel:
+
+| | |
+|---|---|
+| `surface` | unlit material — chassis, window glass, key caps. Never dims. |
+| `lit` | bulbs, phosphor, LEDs, and the legends they backlight. Dims. |
+
+The floor is 45%, not something near zero. A dash rheostat at its minimum is
+still meant to be read at night; below roughly that, the green ink stops
+separating from the chassis before the emissive elements have dimmed usefully
+far.
+
 ## Caps and legends
 
 Key caps are dark with a lit slot, and the legend is printed on the **panel
