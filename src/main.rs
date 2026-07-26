@@ -264,8 +264,23 @@ impl App {
                         !self.stack.tape.power
                     }
                     Unit::Aux => {
-                        patch.aux_power = Some(!self.stack.aux.power);
-                        !self.stack.aux.power
+                        let on = !self.stack.aux.power;
+                        // Off takes the device off the desktop too. Nothing
+                        // else drops it — the refactor that made AUX a source
+                        // took the old eject path with it — so without this the
+                        // sink outlives its usefulness until the program exits,
+                        // still offered in everyone's audio settings.
+                        if !on {
+                            if let Some(e) = &self.engine {
+                                e.capture.arm(false);
+                            }
+                            self.adapter = None;
+                            self.streams.clear();
+                            self.mpris.prefer(None);
+                            patch.aux = Some(Default::default());
+                        }
+                        patch.aux_power = Some(on);
+                        on
                     }
                     // The equaliser's power switch *is* its bypass. Giving it
                     // a second name would be two controls for one circuit.
@@ -302,6 +317,14 @@ impl App {
                         tape_transport: Some(Transport::Stop),
                         ..Default::default()
                     });
+                }
+                // Switching a live source back on has to put it back in the
+                // chain. Stopping on power-down leaves CD and TAPE reading STOP
+                // truthfully, but AUX has no transport field to read — so
+                // without this the bay showed powered, live and metering while
+                // the decoder sat idle, and the only cure was to press `a`.
+                if on && selected {
+                    self.select_source(self.stack.source);
                 }
                 self.status(format!(
                     "{} {}",
@@ -397,7 +420,9 @@ impl App {
 
             Command::CdStop => {
                 let epoch = self.new_epoch();
-                if let Some(e) = &self.engine {
+                if let Some(e) = &self.engine
+                    && self.stack.source == SourceKind::Cd
+                {
                     e.send(EngineCmd::Stop { epoch });
                 }
                 self.stack.apply(Patch {
@@ -443,8 +468,15 @@ impl App {
             },
 
             Command::CdEject => {
+                // Every bay is drawn and clickable at all times, so a click on
+                // this one while another source is selected must empty the
+                // tray without touching the transport that is actually
+                // running. The keyboard is already routed by source; the mouse
+                // is not, and `Eject` clears `playing` for whatever is playing.
                 let epoch = self.new_epoch();
-                if let Some(e) = &self.engine {
+                if let Some(e) = &self.engine
+                    && self.stack.source == SourceKind::Cd
+                {
                     e.send(EngineCmd::Eject { epoch });
                 }
                 self.stack.apply(Patch {
@@ -532,7 +564,9 @@ impl App {
 
             Command::TapeStop => {
                 let epoch = self.new_epoch();
-                if let Some(e) = &self.engine {
+                if let Some(e) = &self.engine
+                    && self.stack.source == SourceKind::Tape
+                {
                     e.send(EngineCmd::Stop { epoch });
                 }
                 self.stack.apply(Patch {
@@ -601,7 +635,9 @@ impl App {
 
             Command::TapeEject => {
                 let epoch = self.new_epoch();
-                if let Some(e) = &self.engine {
+                if let Some(e) = &self.engine
+                    && self.stack.source == SourceKind::Tape
+                {
                     e.send(EngineCmd::Eject { epoch });
                 }
                 self.stack.apply(Patch {
@@ -634,7 +670,12 @@ impl App {
             Command::AuxOpen => {
                 if self.adapter.is_none() {
                     match adapter::Adapter::insert() {
-                        Ok(a) => self.adapter = Some(a),
+                        Ok(a) => {
+                            self.adapter = Some(a);
+                            if let Some(e) = &self.engine {
+                                e.capture.arm(true);
+                            }
+                        }
                         Err(e) => {
                             self.status(format!("no aux input: {e}"));
                             return;
@@ -1005,6 +1046,13 @@ impl App {
             self.status(format!("{} is switched off", kind.label()));
             return;
         }
+        // No sink means no cable. Capture would have nothing to target, and an
+        // unresolvable target is the failure this whole path was built to stop
+        // being silent about.
+        if kind == SourceKind::Aux && self.adapter.is_none() {
+            self.status("no aux input — press A to choose a source");
+            return;
+        }
         let epoch = self.new_epoch();
         if let Some(e) = &self.engine {
             e.send(EngineCmd::SelectSource { source: kind, epoch });
@@ -1278,6 +1326,13 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.show_help {
                     self.show_help = false;
+                    return;
+                }
+                // The overlays consume the keyboard; they have to consume the
+                // mouse too. The hit map still holds the rack's zones from the
+                // frame underneath, so a click meant for a panel row would
+                // otherwise land on the bay behind it and eject a disc.
+                if self.layout_open || self.aux_open {
                     return;
                 }
                 if let Some(cmd) = self.hits.hit(m.column, m.row).cloned() {
