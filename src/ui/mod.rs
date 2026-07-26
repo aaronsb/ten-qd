@@ -152,7 +152,7 @@ fn is_live(u: Unit, stack: &Stack) -> bool {
         Unit::Cd => stack.source == SourceKind::Cd && stack.cd.transport.is_running(),
         Unit::Tape => stack.source == SourceKind::Tape && stack.tape.transport.is_running(),
         Unit::Tuner => stack.source == SourceKind::Tuner && stack.tuner.power,
-        Unit::Aux => stack.aux.state.live,
+        Unit::Aux => stack.source == SourceKind::Aux && stack.aux.state.live,
         Unit::Eq => !stack.eq.defeat,
         Unit::Amp => stack.amp.power,
         Unit::Ctrl => true,

@@ -36,6 +36,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ringbuf::traits::Producer;
+#[cfg(test)]
+use ringbuf::traits::Split;
 
 /// How much of the previous block's reading survives into this one, giving the
 /// meter a needle's fall rather than a strobe. One block is ~21 ms, so this is
@@ -92,9 +94,24 @@ fn fold(previous: f32, block: &[f32]) -> f32 {
 pub struct Capture {
     pub state: Arc<CaptureState>,
     stop: Arc<AtomicBool>,
+    /// Whether the sink exists yet. Capture stays idle until it does.
+    armed: Arc<AtomicBool>,
 }
 
 impl Capture {
+    /// Tell capture the sink exists, or has gone away.
+    ///
+    /// Without this the thread spawned `pw-record` from engine start-up, while
+    /// the sink is only created when the operator first opens the aux picker.
+    /// An unresolvable `--target` is not an error — see the module docs — and
+    /// with `stream.capture.sink` set the fallback is the *default sink's*
+    /// monitor. The INPUT meter then showed a real, moving level sourced from
+    /// the whole desktop's output, on a meter whose entire job is to make a
+    /// cable carrying the wrong thing obvious.
+    pub fn arm(&self, on: bool) {
+        self.armed.store(on, Ordering::Relaxed);
+    }
+
     /// Start reading the monitor of sink `sink` at `rate`, pushing interleaved
     /// stereo into `prod`. Returns immediately; the reading happens on its own
     /// thread.
@@ -107,7 +124,9 @@ impl Capture {
     {
         let state = Arc::new(CaptureState::new());
         let stop = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(false));
         let (t_state, t_stop, src) = (state.clone(), stop.clone(), sink.to_string());
+        let t_armed = armed.clone();
 
         std::thread::Builder::new()
             .name("ten-qd/capture".into())
@@ -116,10 +135,18 @@ impl Capture {
                 // sink appears, and because a plugged stream ending can take
                 // the capture down with it.
                 while !t_stop.load(Ordering::Relaxed) {
+                    // Nothing to read from until the sink is loaded. Idle
+                    // rather than targeting a node that does not exist.
+                    if !t_armed.load(Ordering::Relaxed) {
+                        t_state.running.store(false, Ordering::Relaxed);
+                        t_state.set_level(0.0);
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
                     match spawn(&src, rate) {
                         Ok(child) => {
                             t_state.failed.store(false, Ordering::Relaxed);
-                            pump(child, &mut prod, &t_state, &t_stop);
+                            pump(child, &mut prod, &t_state, &t_stop, &t_armed);
                         }
                         Err(_) => {
                             t_state.failed.store(true, Ordering::Relaxed);
@@ -135,7 +162,7 @@ impl Capture {
             })
             .ok();
 
-        Capture { state, stop }
+        Capture { state, stop, armed }
     }
 }
 
@@ -184,8 +211,13 @@ fn spawn(sink: &str, rate: u32) -> std::io::Result<Child> {
         .spawn()
 }
 
-fn pump<P>(mut child: Child, prod: &mut P, state: &CaptureState, stop: &AtomicBool)
-where
+fn pump<P>(
+    mut child: Child,
+    prod: &mut P,
+    state: &CaptureState,
+    stop: &AtomicBool,
+    armed: &AtomicBool,
+) where
     P: Producer<Item = f32>,
 {
     let Some(mut out) = child.stdout.take() else { return };
@@ -195,7 +227,7 @@ where
     let mut samples: Vec<f32> = Vec::with_capacity(4096);
 
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || !armed.load(Ordering::Relaxed) {
             break;
         }
         match out.read(&mut bytes) {
@@ -233,6 +265,19 @@ mod tests {
     /// The bug this guards against is silent: targeting `<sink>.monitor` does
     /// not fail, it records the default input. The adapter then carries the
     /// room, at a level low enough to look like a gain fault somewhere else.
+    /// Capture must not target a node that does not exist. `pw-record` treats
+    /// an unresolvable target as a cue to record the default device instead, so
+    /// running before the sink is loaded meant metering the whole desktop on a
+    /// meter built to expose exactly that mistake.
+    #[test]
+    fn capture_idles_until_it_is_armed() {
+        let (prod, _cons) = ringbuf::HeapRb::<f32>::new(64).split();
+        let c = Capture::start("no_such_sink_ten_qd_test", 48_000, prod);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!c.state.running(), "capture ran with nothing to target");
+        assert_eq!(c.state.level(), 0.0, "an unarmed capture must read nothing");
+    }
+
     #[test]
     fn capture_targets_the_sink_and_asks_for_its_monitor() {
         let a = args(crate::adapter::SINK, 48_000);
