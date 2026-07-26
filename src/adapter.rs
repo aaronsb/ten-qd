@@ -118,6 +118,74 @@ pub fn streams() -> Result<Vec<Stream>> {
         .collect())
 }
 
+/// An output the rack can drive: PipeWire's own name for it, and the friendly
+/// description the desktop shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sink {
+    pub name: String,
+    pub description: String,
+}
+
+/// Every output sink, as the desktop sees them.
+///
+/// This replaced enumerating cpal/ALSA devices, which listed ALSA's plugin
+/// chain and hardware nodes under names nobody recognises — and, worse, left
+/// out Bluetooth entirely, because ALSA does not enumerate bluez sinks. The
+/// user's actual default output was missing from the picker.
+pub fn sinks() -> Vec<Sink> {
+    let Ok(json) = pactl(&["-f", "json", "list", "sinks"]) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else { return Vec::new() };
+    let Some(items) = v.as_array() else { return Vec::new() };
+
+    items
+        .iter()
+        .filter_map(|s| {
+            let name = s.get("name")?.as_str()?.to_string();
+            // Never offer our own adapter as an output: that is the loop.
+            if name == SINK {
+                return None;
+            }
+            let description = s
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or(&name)
+                .to_string();
+            Some(Sink { name, description })
+        })
+        .collect()
+}
+
+/// Send this process's own audio to `sink`.
+///
+/// Moving our own sink-input is how the rack holds an output independent of
+/// the system default, and it takes effect immediately — no stream rebuild,
+/// no restart. It is the same `move-sink-input` used to plug a stream into
+/// the adapter, pointed the other way.
+pub fn route_own_output(sink: &str) -> Result<()> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let pkg = env!("CARGO_PKG_NAME");
+
+    let json = pactl(&["-f", "json", "list", "sink-inputs"])?;
+    let v: serde_json::Value = serde_json::from_str(&json)?;
+    let Some(items) = v.as_array() else { bail!("no streams") };
+
+    let mine = items.iter().find_map(|s| {
+        let props = s.get("properties")?;
+        let get = |k: &str| props.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let identity = format!("{} {}", get("node.name"), get("application.name"));
+        (identity.contains(pkg) || (!exe.is_empty() && identity.contains(&exe)))
+            .then(|| s.get("index")?.as_u64())
+            .flatten()
+    });
+
+    let Some(index) = mine else { bail!("our own output stream is not on the graph yet") };
+    pactl(&["move-sink-input", &index.to_string(), sink])?;
+    Ok(())
+}
+
 /// A loaded null sink, and a memory of every stream moved onto it.
 pub struct Adapter {
     module: u32,

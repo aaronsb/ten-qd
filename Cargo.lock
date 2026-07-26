@@ -2017,6 +2017,7 @@ dependencies = [
  "arc-swap",
  "cpal",
  "crossbeam-channel",
+ "libc",
  "mpris",
  "ratatui",
  "ringbuf",

@@ -142,43 +142,6 @@ struct Flush {
 // Start-up
 // ---------------------------------------------------------------------------
 
-/// Every output device the rack could drive, excluding its own adapter.
-pub fn output_devices() -> Vec<String> {
-    // cpal 0.18 replaced `Device::name()` with `description()`.
-    //
-    // ALSA enumerates its plugin chain as devices, so the raw list is mostly
-    // things you cannot play to — rate converters, channel up/downmixers,
-    // "Discard all samples". Filtering by name would be a losing game, so the
-    // test is whether the device will actually give a default output config:
-    // a real sink does, a plugin stub does not.
-    // Two of ALSA's entries open successfully and are still not outputs
-    // anyone would choose: the null device and the JACK bridge. The config
-    // test cannot catch those, so they are named — a short, stable list of
-    // ALSA's own pseudo-devices, not a general attempt to guess quality.
-    const NOT_AN_OUTPUT: [&str; 3] =
-        ["Discard all samples", "JACK Audio Connection Kit", "Open Sound System"];
-
-    let host = cpal::default_host();
-    let mut seen = Vec::new();
-    let Ok(devices) = host.output_devices() else { return seen };
-    for d in devices {
-        if d.default_output_config().is_err() {
-            continue;
-        }
-        let Ok(name) = d.description().map(|x| x.name().to_string()) else { continue };
-        // Never offer our own adapter: choosing it would route the rack's
-        // output into the rack's input.
-        if name.contains(crate::adapter::SINK)
-            || seen.contains(&name)
-            || NOT_AN_OUTPUT.iter().any(|bad| name.starts_with(bad))
-        {
-            continue;
-        }
-        seen.push(name);
-    }
-    seen
-}
-
 pub fn start(preferred: Option<&str>) -> Result<Engine> {
     let host = cpal::default_host();
 

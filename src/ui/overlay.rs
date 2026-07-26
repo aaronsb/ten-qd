@@ -270,7 +270,7 @@ pub fn draw_outputs(f: &mut Frame, stack: &Stack, cursor: usize, theme: &Theme, 
     f.buffer_mut().set_string(
         inner.x + 1,
         inner.y + inner.height - 1,
-        "↑↓ move · ⏎ choose · esc close · applies on restart",
+        "↑↓ move · ⏎ choose · esc close",
         Style::default().fg(theme.ink_legend).bg(theme.window),
     );
 }

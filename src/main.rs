@@ -112,7 +112,7 @@ impl App {
         stack.tuner.local = mem.tuner_local;
         stack.tuner.power = mem.tuner_power;
         stack.output = mem.output.clone();
-        stack.outputs = audio::output_devices();
+        stack.outputs = adapter::sinks().into_iter().map(|s| s.description).collect();
         stack.tuner.presets = mem.presets();
         stack.cd.repeat = mem.repeat;
         stack.cd.random = mem.random;
@@ -754,7 +754,8 @@ impl App {
                 // Re-enumerate on open: devices come and go with a Bluetooth
                 // connection or a USB interface, and a stale list would offer
                 // something that is no longer there.
-                let list = audio::output_devices();
+                let list: Vec<String> =
+                    adapter::sinks().into_iter().map(|s| s.description).collect();
                 self.outputs_cursor = self
                     .stack
                     .output
@@ -784,12 +785,24 @@ impl App {
                     self.outputs_cursor = i;
                     return;
                 }
-                let Some(name) = self.stack.outputs.get(i).cloned() else { return };
+                let Some(desc) = self.stack.outputs.get(i).cloned() else { return };
                 self.outputs_open = false;
-                self.stack.apply(Patch { output: Some(Some(name.clone())), ..Default::default() });
-                // Changing device means rebuilding the output stream, which
-                // this does not do live. Saying so beats silently doing nothing.
-                self.status(format!("output: {name} — takes effect on restart"));
+                // Moving our own sink-input applies immediately; there is no
+                // stream to rebuild and nothing to restart.
+                let sink = adapter::sinks().into_iter().find(|s| s.description == desc);
+                match sink {
+                    Some(s) => match adapter::route_own_output(&s.name) {
+                        Ok(()) => {
+                            self.stack.apply(Patch {
+                                output: Some(Some(desc.clone())),
+                                ..Default::default()
+                            });
+                            self.status(format!("output: {desc}"));
+                        }
+                        Err(e) => self.status(format!("could not route output: {e}")),
+                    },
+                    None => self.status(format!("{desc} is no longer there")),
+                }
             }
 
             Command::DimUp | Command::DimDown => {
@@ -1449,6 +1462,17 @@ fn main() -> Result<()> {
     // A sink outliving a killed process strands whatever was plugged into it.
     adapter::remove_orphan();
 
+    // librtlsdr prints "[R82XX] PLL not locked!" straight to fd 2 from C every
+    // time the tuner is retuned — several times a second during a seek. No
+    // Rust-side logging switch can intercept a C library writing to a
+    // descriptor, and inside the alternate screen it lands on top of the
+    // panel. The descriptor itself is the only place to stop it.
+    //
+    // Done before the engine opens the radio so the start-up chatter never
+    // reaches the terminal either. The diagnostics above return before this
+    // point and keep their stderr.
+    let saved_stderr = silence_stderr();
+
     let loaded = Memory::load();
 
     // The panel should come up even with no sound card — it says so in the
@@ -1477,6 +1501,22 @@ fn main() -> Result<()> {
     }
     if let Some(p) = remembered_tape {
         app.load_tape_from(&p);
+    }
+
+    // Re-route to the remembered output. The stream has to exist on the graph
+    // before it can be moved, so this happens after the engine is up.
+    if let Some(want) = app.stack.output.clone()
+        && let Some(s) = adapter::sinks().into_iter().find(|s| s.description == want)
+    {
+        // The stream has to appear on the graph before it can be moved, and
+        // cpal creates it asynchronously — so retry briefly rather than
+        // racing it and silently keeping the default output.
+        for _ in 0..20 {
+            if adapter::route_own_output(&s.name).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     // Park the radio where it was left. The transport stays stopped: a
@@ -1525,11 +1565,45 @@ fn main() -> Result<()> {
     let res = run(&mut terminal, &mut app, &mut keeper);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    restore_stderr(saved_stderr);
 
     // Last write on the way out, so the final few seconds of fiddling are not
     // swallowed by the rate limiter.
     keeper.flush(&app.stack, Some(&app.browser.cwd));
     res
+}
+
+/// Point fd 2 at /dev/null, returning the original so it can be put back.
+///
+/// Blunt, and deliberately so: the noise comes from a C library writing to the
+/// descriptor directly, so it cannot be filtered by level or module. Errors
+/// this program raises itself go to the colophon, not to stderr, so nothing
+/// worth reading is lost — and stderr is restored before exit so a panic
+/// message still reaches the terminal.
+fn silence_stderr() -> Option<i32> {
+    unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        if saved < 0 {
+            return None;
+        }
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if null < 0 {
+            libc::close(saved);
+            return None;
+        }
+        libc::dup2(null, libc::STDERR_FILENO);
+        libc::close(null);
+        Some(saved)
+    }
+}
+
+fn restore_stderr(saved: Option<i32>) {
+    if let Some(fd) = saved {
+        unsafe {
+            libc::dup2(fd, libc::STDERR_FILENO);
+            libc::close(fd);
+        }
+    }
 }
 
 fn music_dir() -> Option<PathBuf> {
