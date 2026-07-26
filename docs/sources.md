@@ -59,6 +59,46 @@ the reason both exist.
   no index to jump to, so this scrubs rather than skipping.
 - **FLIP** turns the cassette over and restarts the counter.
 
+## An adapter is a wire
+
+The tape-shaped shell with a headphone lead hanging off it, that you plugged
+into a Discman and pushed into the deck. The mechanism spun and believed it was
+playing a tape; the audio arrived over the cable and then went through
+everything downstream.
+
+That is what this is. `A` loads a PipeWire null sink named **ten-qd cassette
+adapter** — the same trick EasyEffects uses for its virtual sink — and captures
+its monitor into the same DSP chain a disc uses. From the equaliser onward
+there is no difference between Spotify and a FLAC on disk.
+
+- **Plugging in.** `1`–`9` moves a currently-playing stream onto the adapter,
+  remembering the sink it came from. Nothing moves unless you ask; you can also
+  select the adapter in the player's own output menu. Eject restores everything
+  and removes the device.
+- **Transport.** The deck's keys drive the plugged-in player over MPRIS, which
+  every likely source already speaks — the Spotify client, Chromium (so
+  YouTube Music, Apple Music, Pandora in a tab), Firefox, mpv. This is the one
+  place the build improves on the object it imitates: a real adapter was a
+  one-way cable.
+- **The counter still runs, and still means nothing.** There is a loop of tape
+  going past the heads and it is not the music.
+
+Two things this got wrong on the way, both worth knowing:
+
+**Never offer your own output stream.** Plugging the rack's output back into
+its own input is a feedback loop, and it is the one stream in the list that can
+make one. PipeWire does not populate `application.process.id` for sink-inputs,
+so a PID test matches nothing and silently lets the loop close — it has to be
+matched on `node.name` / `application.name`, both of which carry the executable
+name. Matching only the running executable is still not enough: under
+`cargo test` the binary is `ten_qd-<hash>`, so the fixed package name is
+checked too.
+
+**A quiet reading is usually a quiet source.** The first end-to-end test showed
+almost nothing on the meters; the default sink's own monitor measured the same
+−52 dBFS, so the path was fine and the source was simply playing that quietly.
+Measure the monitor you are comparing against before blaming the wiring.
+
 ## A station is a station
 
 The tuner has its own POWER switch, separate from the amplifier's and from

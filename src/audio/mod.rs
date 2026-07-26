@@ -23,6 +23,7 @@
 //! both touching the ring during a reset.
 
 pub mod analysis;
+pub mod capture;
 pub mod dsp;
 pub mod radio;
 
@@ -71,6 +72,9 @@ pub enum EngineCmd {
     SelectSource { source: SourceKind, epoch: u64 },
     Load { disc: Arc<Disc>, start: usize, epoch: u64 },
     LoadTape { tape: Arc<Tape>, epoch: u64 },
+    /// Put an adapter in the deck: stop decoding, start passing the cable
+    /// through.
+    LoadAdapter { epoch: u64 },
     Play,
     Pause,
     Stop { epoch: u64 },
@@ -108,6 +112,7 @@ pub struct Engine {
     pub meters: Arc<Meters>,
     pub events: Receiver<EngineEvent>,
     pub radio: radio::RadioHandle,
+    pub capture: capture::Capture,
     cmd_tx: Sender<EngineCmd>,
     /// Output rate, which is what the clock is denominated in.
     pub sample_rate: u32,
@@ -158,6 +163,7 @@ pub fn start() -> Result<Engine> {
     // single producer on the output ring is what makes the flush handshake
     // sound — two producers could not be paused coherently.
     let (radio_prod, mut radio_cons) = HeapRb::<f32>::new(RING_FRAMES * 2).split();
+    let (adapter_prod, mut adapter_cons) = HeapRb::<f32>::new(RING_FRAMES * 2).split();
     let (mut an_prod, mut an_cons) = HeapRb::<f32>::new(FFT_SIZE * 8).split();
     let (cmd_tx, cmd_rx) = bounded::<EngineCmd>(64);
     let (evt_tx, evt_rx) = bounded::<EngineEvent>(256);
@@ -252,11 +258,24 @@ pub fn start() -> Result<Engine> {
     // --- decoder thread --------------------------------------------------
     let dec_flush = flush.clone();
     std::thread::Builder::new().name("ten-qd/decode".into()).spawn(move || {
-        decoder_loop(cmd_rx, evt_tx, &mut prod, &mut radio_cons, dec_flush, sample_rate);
+        decoder_loop(
+            cmd_rx,
+            evt_tx,
+            &mut prod,
+            &mut radio_cons,
+            &mut adapter_cons,
+            dec_flush,
+            sample_rate,
+        );
     })?;
 
     // --- radio ------------------------------------------------------------
     let radio = radio::spawn(radio_prod, sample_rate);
+
+    // --- adapter ----------------------------------------------------------
+    // Started unconditionally and left running: it retries quietly until the
+    // sink exists, so inserting the adapter later needs no coordination.
+    let capture = capture::Capture::start(crate::adapter::MONITOR, sample_rate, adapter_prod);
 
     Ok(Engine {
         params,
@@ -265,6 +284,7 @@ pub fn start() -> Result<Engine> {
         cmd_tx,
         sample_rate,
         radio,
+        capture,
         _stream: stream,
     })
 }
@@ -401,6 +421,9 @@ struct DecodeState {
     tape_index: usize,
     tape_side: Side,
     auto_reverse: bool,
+    /// The tape in the deck is an adapter, so there is nothing to decode —
+    /// the audio arrives over the cable.
+    tape_is_adapter: bool,
     playing: bool,
     repeat: bool,
     random: bool,
@@ -445,11 +468,13 @@ impl DecodeState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decoder_loop(
     cmds: Receiver<EngineCmd>,
     events: Sender<EngineEvent>,
     prod: &mut impl Producer<Item = f32>,
     radio: &mut impl Consumer<Item = f32>,
+    adapter: &mut impl Consumer<Item = f32>,
     flush: Arc<Flush>,
     out_rate: u32,
 ) {
@@ -462,6 +487,7 @@ fn decoder_loop(
         tape_index: 0,
         tape_side: Side::A,
         auto_reverse: true,
+        tape_is_adapter: false,
         playing: false,
         repeat: false,
         random: false,
@@ -523,7 +549,16 @@ fn decoder_loop(
                         do_flush(&mut st);
                     }
                 }
+                EngineCmd::LoadAdapter { epoch } => {
+                    st.tape_is_adapter = true;
+                    st.tape = None;
+                    st.src = None;
+                    st.playing = st.source == SourceKind::Tape;
+                    st.epoch = epoch;
+                    do_flush(&mut st);
+                }
                 EngineCmd::LoadTape { tape, epoch } => {
+                    st.tape_is_adapter = false;
                     st.tape_side = Side::A;
                     st.tape_index = 0;
                     st.tape = Some(tape);
@@ -536,7 +571,9 @@ fn decoder_loop(
                     }
                 }
                 EngineCmd::Play => {
-                    if st.program().is_some() || st.source == SourceKind::Tuner {
+                    let live = st.source == SourceKind::Tuner
+                        || (st.source == SourceKind::Tape && st.tape_is_adapter);
+                    if st.program().is_some() || live {
                         st.playing = true;
                     }
                 }
@@ -624,10 +661,22 @@ fn decoder_loop(
             continue;
         }
 
-        // --- tuner: pump the radio's ring straight through ----------------
-        if st.source == SourceKind::Tuner {
-            let want = radio_buf.len().min(prod.vacant_len()) & !1;
-            let got = radio.pop_slice(&mut radio_buf[..want]);
+        // --- live sources: pump their ring straight through ----------------
+        // The tuner and the adapter differ only in where the samples came
+        // from. Neither decodes, neither seeks, and both drop rather than
+        // buffer when the ring is full, because there is nothing to catch up
+        // to on a live input.
+        let want = radio_buf.len().min(prod.vacant_len()) & !1;
+        // `Consumer` is not dyn-compatible, so the pop happens inside the
+        // match rather than through a trait object chosen above it.
+        let got = match st.source {
+            SourceKind::Tuner => Some(radio.pop_slice(&mut radio_buf[..want])),
+            SourceKind::Tape if st.tape_is_adapter => {
+                Some(adapter.pop_slice(&mut radio_buf[..want]))
+            }
+            _ => None,
+        };
+        if let Some(got) = got {
             if got == 0 {
                 std::thread::sleep(Duration::from_millis(4));
                 continue;

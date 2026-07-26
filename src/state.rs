@@ -114,6 +114,10 @@ pub enum Command {
     TapeEject,
     TapeDolby,
     TapeAutoReverse,
+    /// Insert the cassette adapter — create the sink and start listening.
+    TapeInsertAdapter,
+    /// Plug the n-th listed stream into the adapter.
+    TapePlugStream(usize),
 
     // LT-581 tuner
     TunerBand,
@@ -295,6 +299,25 @@ pub struct TapeState {
     pub dolby: bool,
     pub auto_reverse: bool,
     pub tape: Option<Tape>,
+    /// An adapter in the deck: the tape-shaped shell with a wire, carrying
+    /// whatever is plugged into the other end. There is no tape to index, so
+    /// most of the deck's readouts stop meaning anything — which is exactly
+    /// what a real adapter did to a real deck.
+    pub adapter: Option<AdapterTape>,
+}
+
+/// What is on the other end of the cable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdapterTape {
+    /// The stream plugged in, if one has been chosen.
+    pub source: Option<String>,
+    /// The MPRIS player driving it, if one was found.
+    pub player: Option<String>,
+    /// Metadata the player reports. A real adapter had none of this.
+    pub title: String,
+    pub artist: String,
+    /// Whether audio is actually arriving over the cable.
+    pub live: bool,
 }
 
 impl Default for TapeState {
@@ -307,6 +330,7 @@ impl Default for TapeState {
             dolby: true,
             auto_reverse: true,
             tape: None,
+            adapter: None,
         }
     }
 }
@@ -470,6 +494,7 @@ pub struct Patch {
     pub tape_dolby: Option<bool>,
     pub tape_auto_reverse: Option<bool>,
     pub tape: Option<Option<Tape>>,
+    pub adapter: Option<Option<AdapterTape>>,
 
     pub tuner_freq: Option<f64>,
     pub tuner_stereo: Option<bool>,
@@ -548,6 +573,9 @@ impl Stack {
         }
         if let Some(v) = p.tape {
             self.tape.tape = v;
+        }
+        if let Some(v) = p.adapter {
+            self.tape.adapter = v;
         }
 
         if let Some(v) = p.tuner_freq {

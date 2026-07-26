@@ -21,6 +21,33 @@ What survived from the original design brief is the part worth keeping: **every
 lit thing on the panel is connected to something real.** No decorative meters,
 no indicator that is always on.
 
+## Everything modern turns out to have an ancestor
+
+The thing that kept happening while building this: every feature a music
+player is supposed to have in 2026 already existed in 1985, under a different
+name, solving the same problem. The 80s vocabulary is not a costume over
+modern concepts — it is a set of concepts that were already correct.
+
+| now | then |
+|---|---|
+| a folder of audio files | a disc, and its file order is the table of contents |
+| an M3U playlist | a compiled tape, split into two sides by running time |
+| Spotify, YouTube Music, Apple Music | a **cassette adapter** — the dummy tape with a wire |
+| a PipeWire null sink | the wire itself |
+| MPRIS over D-Bus | reaching over to hit next on the Discman |
+| a settings file in `~/.local/state` | the **12-volt memory**, on the battery feed |
+| a terminal's character grid | a vacuum-fluorescent display, already |
+| a dark-mode toggle | the dash rheostat on the instrument lighting |
+| a system-wide EQ like EasyEffects | the QE-581, second bay from the bottom |
+
+The last two rows are the ones that changed the build. The dimmer became a
+luminance scale on the token layer because a dash dimmer is *exactly* that.
+And the adapter is EasyEffects' virtual-sink trick with a better name for the
+cable — which means the rack is a general audio processor: anything that can
+choose an output device gets the equaliser, the tone controls, the fader and
+the meters. Discord will offer it as an output. That is not a side effect, it
+is the design.
+
 ## Why a terminal
 
 The first pass was an HTML page, and it worked. But shipping that as an
@@ -88,6 +115,8 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `[` `]` `g` `P` | tune down/up · LOCAL · tuner power |
 | `e` `r` `z` | eject · repeat · random |
 | `v` `y` `a` | flip the tape · Dolby · auto-reverse |
+| `A` | insert / eject the cassette adapter |
+| `1`–`9` | …with the adapter in: plug that stream through the rack |
 | `↑` `↓` `m` | volume · attenuator |
 | `,` `.` / `<` `>` | bass · treble |
 | `;` `'` | fader rear/front |

@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 
-use crate::browser::Browser;
+use crate::browser::{Browser, Kind};
 use crate::state::Command;
 use crate::ui::hit::HitMap;
 use crate::ui::theme::Theme;
@@ -53,6 +53,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("e", "eject"),
     ("r  z", "repeat · random"),
     ("v  y  a", "flip the tape · Dolby · auto-reverse"),
+    ("A", "insert/eject the cassette adapter"),
+    ("1-9", "…with the adapter in: plug that stream through"),
     ("g  P", "tuner LOCAL · tuner power"),
     ("", ""),
     ("CONTROL HEAD", ""),
@@ -158,11 +160,17 @@ pub fn draw_browser(f: &mut Frame, b: &Browser, theme: &Theme, hits: &mut HitMap
         let w = inner.width.saturating_sub(2) as usize;
         f.buffer_mut().set_string(inner.x + 1, y, " ".repeat(w), style);
 
-        let name: String = e.name.chars().take(w.saturating_sub(18)).collect();
-        f.buffer_mut().set_string(inner.x + 2, y, &name, style);
+        let mark = if e.kind == Kind::Playlist { "≡ " } else { "▸ " };
+        let name: String = e.name.chars().take(w.saturating_sub(20)).collect();
+        f.buffer_mut().set_string(inner.x + 2, y, mark, style);
+        f.buffer_mut().set_string(inner.x + 4, y, &name, style);
 
-        // `here` is what a disc load would give you, `below` what a tape would.
-        let counts = format!("{:>4} disc {:>5} tape", e.here, e.below);
+        // `here` is what a disc load would give you, `below` what a tape
+        // would. A playlist is only ever a tape.
+        let counts = match e.kind {
+            Kind::Playlist => format!("{:>15} tape", e.below),
+            Kind::Folder => format!("{:>4} disc {:>5} tape", e.here, e.below),
+        };
         let cx = inner.x + inner.width.saturating_sub(counts.len() as u16 + 2);
         f.buffer_mut().set_string(cx, y, &counts, style);
 

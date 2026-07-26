@@ -5,10 +5,13 @@
 //! is the same one-way contract the HTML prototype set up, and keeping it is
 //! what stops the transport from claiming to play a file it could not open.
 
+mod adapter;
 mod audio;
 mod browser;
 mod disc;
 mod memory;
+mod mpris;
+mod playlist;
 mod state;
 mod ui;
 
@@ -42,6 +45,7 @@ ten-qd — a terminal music player wearing an 80s car stereo
     ten-qd [FOLDER]        load FOLDER as a disc, or resume the last one
     ten-qd --screenshot    render one frame to stdout and exit
     ten-qd --radio-check   sweep the FM band and report signal per channel
+    ten-qd --adapter-check insert the cassette adapter and check the cable
     ten-qd --forget        clear the 12-volt memory (presets, tone, last disc)
     ten-qd --help          this
 
@@ -71,6 +75,13 @@ struct App {
     running: bool,
     hits: HitMap,
     browser: Browser,
+    /// The null sink, while an adapter is inserted. Dropping it removes the
+    /// sink, so the desktop never keeps a phantom audio device after we exit.
+    adapter: Option<adapter::Adapter>,
+    /// Watches whatever is on the other end of the cable.
+    mpris: mpris::Mpris,
+    /// Streams offered for plugging in, refreshed when the adapter goes in.
+    streams: Vec<adapter::Stream>,
 }
 
 impl App {
@@ -117,6 +128,9 @@ impl App {
                 music_dir().unwrap_or_else(|| PathBuf::from("/")),
                 mem.browser.clone(),
             ),
+            adapter: None,
+            mpris: mpris::Mpris::start(),
+            streams: Vec::new(),
         }
     }
 
@@ -320,6 +334,15 @@ impl App {
 
             // ---- cassette deck --------------------------------------------
             Command::TapePlayPause => {
+                if self.stack.tape.adapter.is_some() {
+                    // A real adapter's deck keys did nothing to the Discman.
+                    // These do, over MPRIS — and say so when there is nothing
+                    // listening rather than pretending the press landed.
+                    if !self.mpris.send(mpris::Transport::PlayPause) {
+                        self.status("nothing on the cable is listening");
+                    }
+                    return;
+                }
                 if self.stack.tape.tape.is_none() {
                     self.status("no tape loaded");
                     return;
@@ -357,6 +380,10 @@ impl App {
             }
 
             Command::TapeStop => {
+                if self.stack.tape.adapter.is_some() {
+                    self.mpris.send(mpris::Transport::Stop);
+                    return;
+                }
                 let epoch = self.new_epoch();
                 if let Some(e) = &self.engine {
                     e.send(EngineCmd::Stop { epoch });
@@ -369,11 +396,19 @@ impl App {
             }
 
             Command::TapeApsNext => {
+                if self.stack.tape.adapter.is_some() {
+                    self.mpris.send(mpris::Transport::Next);
+                    return;
+                }
                 let i = self.stack.tape.index + 1;
                 self.tape_cue(i);
             }
 
             Command::TapeApsPrev => {
+                if self.stack.tape.adapter.is_some() {
+                    self.mpris.send(mpris::Transport::Previous);
+                    return;
+                }
                 // Same three-second rule as the CD: past it, APS restarts the
                 // track rather than stepping back.
                 let cur = self.stack.tape.index;
@@ -426,18 +461,91 @@ impl App {
             }
 
             Command::TapeEject => {
+                // Dropping the adapter restores every moved stream and removes
+                // the sink.
+                self.adapter = None;
+                self.streams.clear();
+                self.mpris.prefer(None);
                 let epoch = self.new_epoch();
                 if let Some(e) = &self.engine {
                     e.send(EngineCmd::Eject { epoch });
                 }
                 self.stack.apply(Patch {
                     tape: Some(None),
+                    adapter: Some(None),
                     tape_transport: Some(Transport::Stop),
                     tape_counter: Some(0.0),
                     tape_side: Some(Side::A),
                     ..Default::default()
                 });
                 self.status("tape ejected");
+            }
+
+            // ---- the cassette adapter -------------------------------------
+            Command::TapeInsertAdapter => {
+                if self.adapter.is_some() {
+                    self.dispatch(Command::TapeEject);
+                    return;
+                }
+                match adapter::Adapter::insert() {
+                    Ok(a) => {
+                        self.adapter = Some(a);
+                        self.streams = adapter::streams().unwrap_or_default();
+                        let epoch = self.new_epoch();
+                        if let Some(e) = &self.engine {
+                            e.send(EngineCmd::LoadAdapter { epoch });
+                        }
+                        self.stack.apply(Patch {
+                            adapter: Some(Some(state::AdapterTape::default())),
+                            tape: Some(None),
+                            tape_transport: Some(Transport::Stop),
+                            ..Default::default()
+                        });
+                        if self.stack.source != SourceKind::Tape {
+                            self.select_source(SourceKind::Tape);
+                        }
+                        self.status(if self.streams.is_empty() {
+                            format!("adapter in — select \"{}\" as your player's output", adapter::DESCRIPTION)
+                        } else {
+                            format!(
+                                "adapter in — {} playing, press 1-9 to plug one in",
+                                self.streams.len()
+                            )
+                        });
+                    }
+                    Err(e) => self.status(format!("no adapter: {e}")),
+                }
+            }
+
+            Command::TapePlugStream(i) => {
+                // Re-list first: indices are the server's, and a stream that
+                // ended since the menu was drawn must not be moved by number.
+                self.streams = adapter::streams().unwrap_or_default();
+                let Some(s) = self.streams.get(i).cloned() else {
+                    self.status("no such stream");
+                    return;
+                };
+                let Some(a) = self.adapter.as_mut() else {
+                    self.status("insert the adapter first");
+                    return;
+                };
+                match a.plug(&s) {
+                    Ok(()) => {
+                        self.mpris.prefer(Some(s.app.clone()));
+                        let mut t = self.stack.tape.adapter.clone().unwrap_or_default();
+                        t.source = Some(s.label());
+                        self.stack.apply(Patch {
+                            adapter: Some(Some(t)),
+                            tape_transport: Some(Transport::Play),
+                            ..Default::default()
+                        });
+                        if let Some(e) = &self.engine {
+                            e.send(EngineCmd::Play);
+                        }
+                        self.status(format!("plugged in: {}", s.label()));
+                    }
+                    Err(e) => self.status(format!("could not plug in: {e}")),
+                }
             }
 
             Command::TapeDolby => {
@@ -818,6 +926,25 @@ impl App {
             self.current = self.marks.pop_front();
         }
 
+        // The cable reports what is on the other end of it.
+        if let Some(a) = &self.stack.tape.adapter {
+            let live = self.engine.as_ref().is_some_and(|e| e.capture.state.running());
+            let np = self.mpris.now_playing();
+            let mut next = a.clone();
+            next.live = live;
+            next.player = np.as_ref().map(|n| n.player.clone());
+            next.title = np.as_ref().map(|n| n.title.clone()).unwrap_or_default();
+            next.artist = np.as_ref().map(|n| n.artist.clone()).unwrap_or_default();
+            if next != *a {
+                let running = np.as_ref().is_some_and(|n| n.playing);
+                self.stack.apply(Patch {
+                    adapter: Some(Some(next)),
+                    tape_transport: Some(if running { Transport::Play } else { Transport::Pause }),
+                    ..Default::default()
+                });
+            }
+        }
+
         // The radio reports itself continuously; it has no marks to promote.
         let radio = self.engine.as_ref().map(|e| &e.radio);
         let tuner_patch = radio.map(|r| Patch {
@@ -972,6 +1099,7 @@ impl App {
             (KeyCode::Char('r'), _) => Some(Command::CdRepeat),
             (KeyCode::Char('z'), _) => Some(Command::CdRandom),
             (KeyCode::Char('v'), _) => Some(Command::TapeFlip),
+            (KeyCode::Char('A'), _) => Some(Command::TapeInsertAdapter),
             (KeyCode::Char('y'), _) => Some(Command::TapeDolby),
             (KeyCode::Char('a'), _) => Some(Command::TapeAutoReverse),
 
@@ -980,6 +1108,10 @@ impl App {
                 let n = c.to_digit(10).unwrap() as usize - 1;
                 Some(if tuner {
                     Command::TunerPreset(n)
+                } else if self.stack.tape.adapter.is_some()
+                    && self.stack.source == SourceKind::Tape
+                {
+                    Command::TapePlugStream(n)
                 } else if self.stack.source == SourceKind::Tape {
                     let base = self
                         .stack
@@ -1169,10 +1301,59 @@ fn radio_check() -> Result<()> {
     Ok(())
 }
 
+/// Insert the adapter, plug in whatever is playing, and report whether audio
+/// actually reached the amplifier.
+///
+/// The unit tests cover the pactl plumbing; only this can tell you the cable
+/// is carrying sound all the way through the DSP chain to the meters.
+fn adapter_check() -> Result<()> {
+    let engine = audio::start()?;
+    let mut a = adapter::Adapter::insert()?;
+    println!("adapter in: \"{}\" ({SINK_NOTE})", adapter::DESCRIPTION, SINK_NOTE = adapter::SINK);
+
+    let streams = adapter::streams()?;
+    if streams.is_empty() {
+        println!("\nnothing is playing. Start something, choose \"{}\"", adapter::DESCRIPTION);
+        println!("as its output, and run this again.");
+        return Ok(());
+    }
+    for (i, s) in streams.iter().enumerate() {
+        println!("  {}. {}", i + 1, s.label());
+    }
+
+    // A diagnostic plugs everything: the question being answered is whether
+    // the cable carries at all, and picking one stream risks picking a silent
+    // one and blaming the wiring.
+    for s in &streams {
+        a.plug(s)?;
+    }
+    println!("\nplugged in all {} stream(s)", streams.len());
+
+    engine.send(EngineCmd::SelectSource { source: SourceKind::Tape, epoch: 1 });
+    engine.send(EngineCmd::LoadAdapter { epoch: 2 });
+    engine.send(EngineCmd::Play);
+    std::thread::sleep(Duration::from_millis(2000));
+
+    let bands = engine.meters.read();
+    let lit = bands.iter().filter(|v| **v > 0.02).count();
+    println!("capture running: {}", engine.capture.state.running());
+    println!("meters: {:?}", bands.map(|v| (v * 100.0) as u32));
+    if lit == 0 {
+        println!("\nno audio reached the amplifier — the cable is not carrying.");
+    } else {
+        println!("\naudio present in {lit}/9 bands — it went through the whole rack.");
+    }
+    // Dropping `a` restores the stream and removes the sink.
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--radio-check") {
         return radio_check();
+    }
+    if args.iter().any(|a| a == "--adapter-check") {
+        return adapter_check();
     }
     if args.iter().any(|a| a == "--forget") {
         return match Memory::forget() {

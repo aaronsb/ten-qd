@@ -73,14 +73,16 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     buf.set_string(
         w.x + 2,
         w.y + 1,
-        "DECK QD-581",
+        if t.adapter.is_some() { "ADAPTER QD-581" } else { "DECK QD-581" },
         Style::default().fg(theme.ink_white).bg(theme.window),
     );
 
     // --- the counter ------------------------------------------------------
     // Four digits and no colon: a deck counts tape, not time, and cannot tell
-    // you where a track begins.
-    let counter = if t.tape.is_some() {
+    // you where a track begins. With an adapter in, the hubs are turning
+    // against a loop of tape that is not the music — so the counter still
+    // runs, and now it means nothing at all.
+    let counter = if t.tape.is_some() || t.adapter.is_some() {
         let c = (t.counter.max(0.0) as u64).min(5999);
         format!("{:02}{:02}", c / 60, c % 60)
     } else {
@@ -107,6 +109,22 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     );
     hits.add_row(sx, w.y, 7, Command::TapeFlip);
     buf.set_string(sx + 7, w.y + 1, reel(2).to_string(), hub);
+
+    // An adapter has no sides and no track count; what it has is a cable and
+    // whatever is on the other end of it.
+    if let Some(a) = &t.adapter {
+        chassis::sublegend(buf, sx, w.y + 2, "ADAPTER", theme, true);
+        let what = a.source.clone().unwrap_or_else(|| "not plugged in".into());
+        let what: String = what.chars().take(22).collect();
+        buf.set_string(
+            w.x + 2,
+            w.y + 3,
+            &what,
+            Style::default()
+                .fg(if a.live { theme.vfd } else { theme.ink_grey })
+                .bg(theme.window),
+        );
+    }
 
     // Which side is longer is worth knowing before you commit to it.
     if let Some(tape) = &t.tape {
@@ -163,16 +181,29 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     press(&mut row, 6, "APS▶", false, Command::TapeApsNext, hits);
     row.gap(1);
     press(&mut row, 6, "FLIP", t.side == Side::B, Command::TapeFlip, hits);
+    row.gap(1);
+    // The adapter is a thing you put in the slot, so it lives with the keys
+    // that move tape rather than off in a menu.
+    press(&mut row, 8, "ADAPT", t.adapter.is_some(), Command::TapeInsertAdapter, hits);
 
     // --- badge and shelf strip -------------------------------------------
     let badge_x = inner.x + inner.width.saturating_sub(24);
     chassis::badge(buf, badge_x, ky, theme);
 
-    let strip = match (t.tape.as_ref(), t.current()) {
-        (Some(tape), Some(track)) => {
+    let strip = match (t.adapter.as_ref(), t.tape.as_ref(), t.current()) {
+        (Some(a), _, _) => {
+            if !a.title.is_empty() {
+                format!("{} — {} · via the adapter", a.artist, a.title)
+            } else if let Some(src) = &a.source {
+                format!("{src} · via the adapter")
+            } else {
+                format!("adapter in — send audio to \"{}\"", crate::adapter::DESCRIPTION)
+            }
+        }
+        (_, Some(tape), Some(track)) => {
             format!("{} — {} · side {} of {}", track.artist, track.title, t.side.label(), tape.title)
         }
-        (Some(tape), None) => format!("{} · {} tracks", tape.title, tape.tracks.len()),
+        (_, Some(tape), None) => format!("{} · {} tracks", tape.title, tape.tracks.len()),
         _ => "no tape".to_string(),
     };
     let max = inner.width.saturating_sub(SPINE + 2) as usize;

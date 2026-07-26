@@ -15,15 +15,28 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 
 use crate::disc;
+use crate::playlist;
 use crate::state::{Tape, Track};
+
+/// What a row in the shelf is.
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum Kind {
+    /// A directory: loadable as a disc (its own files) or a tape (everything
+    /// below it).
+    Folder,
+    /// An M3U or PLS file: a tape someone already compiled.
+    Playlist,
+}
 
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
+    pub kind: Kind,
     /// Audio files directly inside this directory — what loading it as a disc
-    /// would give you.
+    /// would give you. Always zero for a playlist, which is not a disc.
     pub here: usize,
-    /// Audio files anywhere below it — what loading it as a tape would give.
+    /// Tracks a tape load would give: files below a folder, or lines in a
+    /// playlist.
     pub below: usize,
 }
 
@@ -104,6 +117,7 @@ impl Browser {
                     .to_string_lossy()
                     .into_owned();
                 Entry {
+                    kind: Kind::Folder,
                     here: count_here(&path),
                     below: count_below(&path),
                     name,
@@ -111,6 +125,24 @@ impl Browser {
                 }
             })
             .collect();
+
+        // Playlists sit below the folders: someone else already decided the
+        // running order, which is exactly what a compiled tape is.
+        let mut lists: Vec<PathBuf> = std::fs::read_dir(&self.cwd)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && playlist::is_playlist(p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        lists.sort();
+
+        for path in lists {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let below = playlist::read(&path).map(|e| e.len()).unwrap_or(0);
+            self.entries.push(Entry { kind: Kind::Playlist, here: 0, below, name, path });
+        }
 
         // The directory you are standing in is itself loadable when it holds
         // audio, so it gets a row at the top rather than forcing a step back.
@@ -121,6 +153,7 @@ impl Browser {
                 Entry {
                     path: self.cwd.clone(),
                     name: ". (this folder)".into(),
+                    kind: Kind::Folder,
                     here,
                     below: count_below(&self.cwd),
                 },
@@ -142,10 +175,11 @@ impl Browser {
         self.cursor = (self.cursor as i32 + delta).rem_euclid(n) as usize;
     }
 
-    /// Descend into the highlighted directory.
+    /// Descend into the highlighted directory. A playlist has nothing to
+    /// descend into, so entering one loads it.
     pub fn enter(&mut self) {
         let Some(e) = self.selected() else { return };
-        if e.path == self.cwd {
+        if e.path == self.cwd || e.kind == Kind::Playlist {
             return;
         }
         let path = e.path.clone();
@@ -166,11 +200,43 @@ impl Browser {
         }
     }
 
-    /// Compile the highlighted directory into a tape.
+    /// Compile the highlighted row into a tape, whichever kind it is.
     pub fn as_tape(&self) -> Result<Tape> {
         let Some(e) = self.selected() else { bail!("nothing selected") };
-        tape_from_dir(&e.path)
+        match e.kind {
+            Kind::Folder => tape_from_dir(&e.path),
+            Kind::Playlist => tape_from_playlist(&e.path),
+        }
     }
+}
+
+/// Compile a playlist file into a tape, in the order the file gives.
+///
+/// Unlike a folder scan this does **not** sort: a playlist's whole point is
+/// that someone already chose the running order.
+pub fn tape_from_playlist(path: &Path) -> Result<Tape> {
+    let entries = playlist::read(path)?;
+    let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+
+    let tracks: Vec<Track> = entries
+        .iter()
+        .filter_map(|e| {
+            // Metadata in the file beats the playlist's label; the label is
+            // only a fallback for a file that will not admit its own title.
+            let mut t = disc::probe_track(&e.path).ok()?;
+            if let Some(label) = &e.title
+                && t.title == e.path.file_stem().unwrap_or_default().to_string_lossy()
+            {
+                t.title = label.clone();
+            }
+            Some(t)
+        })
+        .collect();
+
+    if tracks.is_empty() {
+        bail!("nothing in {name} could be decoded");
+    }
+    Ok(Tape::from_tracks(name, path.to_path_buf(), tracks))
 }
 
 /// Gather every track below `dir` into a tape.
