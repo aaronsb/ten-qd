@@ -99,6 +99,10 @@ struct App {
     mpris: mpris::Mpris,
     /// Streams offered for plugging in, refreshed when the adapter goes in.
     streams: Vec<adapter::Stream>,
+    /// Where the loop guard should put us back, shared with its thread. It
+    /// has to be told when the operator changes output, or it would restore
+    /// whatever was remembered at start-up for the rest of the run.
+    guard_target: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl App {
@@ -163,6 +167,7 @@ impl App {
             adapter: None,
             mpris: mpris::Mpris::start(),
             streams: Vec::new(),
+            guard_target: Arc::new(std::sync::Mutex::new(mem.output.clone())),
         }
     }
 
@@ -941,6 +946,10 @@ impl App {
                                 output: Some(Some(desc.clone())),
                                 ..Default::default()
                             });
+                            // Tell the loop guard where "back" is now.
+                            if let Ok(mut g) = self.guard_target.lock() {
+                                *g = Some(desc.clone());
+                            }
                             self.status(format!("output: {desc}"));
                         }
                         Err(e) => self.status(format!("could not route output: {e}")),
@@ -1885,9 +1894,8 @@ fn main() -> Result<()> {
     // other is simply restarting while our sink is the system default, because
     // a new stream lands on the default before anything of ours can object.
     // Either way the result is a howl, so this watches rather than assuming.
-    let guard_target = Arc::new(std::sync::Mutex::new(app.stack.output.clone()));
     {
-        let want = guard_target.clone();
+        let want = app.guard_target.clone();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _ = stop;
         std::thread::Builder::new().name("ten-qd/loopguard".into()).spawn(move || {
