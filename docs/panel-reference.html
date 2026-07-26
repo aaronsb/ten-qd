@@ -1,0 +1,1208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fujitsu Ten Component Stack — panel reference</title>
+
+<!--
+================================================================================
+  FUJITSU TEN COMPONENT STACK  ·  front-panel reference implementation
+  rev 2 — reconciled against the magazine photograph, component by component
+================================================================================
+
+  WHAT CHANGED IN REV 2, AND WHY
+
+  QE-581   The equaliser is TWO BANKS, not one. The photo shows an upper row
+           of nine caps and a lower row of nine caps with the frequency legend
+           printed between them, and a boxed F beside the upper row, boxed R
+           beside the lower. Front and rear channels are independently curved.
+           That is 18 sliders. This is the biggest correction — and it maps
+           straight onto two output buses in your filter-chain.
+
+  QD-581   The deck has TWO windows, not one. The wide black window (slot,
+           hubs, counter) and a second narrow green-bordered window carrying
+           the attenuator steps (ATT / 70% / 60) and the output level column.
+           The four red boxed indicators — APS, M SCAN, REPEAT, B SKIP — are a
+           VERTICAL stack between the transport keys and the tone display,
+           not a horizontal row. The tone X sits inside the deck chassis, but
+           the BASS/TREBLE keys that drive it are over in the control head.
+
+  keys     A key is a small dark cap with a lit slot; the green legend is
+           screen-printed on the PANEL beneath it, not on the cap. Rebuilt as
+           .key > .key__cap + .key__txt so the two can be styled apart.
+
+  LT-581   TUNE is a single rocker bar with a chevron at each end, not three
+           buttons. VOLUME in the control head genuinely is four separate
+           buttons — the photo shows both patterns, they aren't the same part.
+
+  QM-571   Meters are amber dots with a solid red bar riding the top of each
+           lit column — peak indication. They are not a green-to-red ramp.
+           Green in this design is reserved for printed legends only.
+
+  ft-reel  Was collapsing to a hairline: flex children shrink. Now flex:none.
+
+--------------------------------------------------------------------------------
+  ARCHITECTURE (unchanged — this is the part that ports)
+--------------------------------------------------------------------------------
+
+  CSS layers:  1 TOKENS · 2 PRIMITIVES · 3 UNITS
+  Retheme from :root alone. No unit's CSS reaches into another unit.
+
+  Controls are one-way:
+
+      FT.send(unit, action, value)   →  bus + bridge   (a control was operated)
+      FT.apply({unit, state})        →  repaint        (the backend reports truth)
+
+  Press a button and nothing moves until the backend says so. Attach the daemon:
+
+      FT.bridge = { send: m => ws.send(JSON.stringify(m)) };
+      ws.onmessage = e => FT.apply(JSON.parse(e.data));
+
+  Backend mapping:
+    tuner  rtl_fm / SoapySDR · freq MHz · seek = scan until squelch opens
+    eq     pipewire filter-chain ×2 (front bus, rear bus), 9 bands, ±12 dB
+    amp    pw-dump peak levels → FT.apply({unit:'amp',state:{levels:[...]}})
+    fader  front/rear bus gain ratio
+    ill    a lamp colour. keep it.
+================================================================================
+-->
+
+<style>
+/* ==========================================================================
+   1. TOKENS
+   ========================================================================== */
+:root{
+  --u: clamp(6px, 1.12vw, 13px);
+
+  --chassis-1:  #131317;
+  --chassis-2:  #09090c;
+  --panel:      #16171c;
+  --seam:       #2b2d34;
+
+  --lamp:       #e8431a;
+  --lamp-hot:   #ff7238;
+  --lamp-deep:  #a32407;
+  --lamp-glow:  rgba(255, 92, 40, .38);
+
+  --ink-green:  #43ab5c;
+  --ink-red:    #ff4b22;
+  --ink-grey:   #7f838c;
+  --ink-white:  #d6d8de;
+
+  --vfd:        #ffc21f;
+  --vfd-dim:    rgba(255, 194, 31, .085);
+  --led-r:      #ff2e10;
+  --led-a:      #ffab1a;
+  --led-off:    rgba(255, 150, 40, .10);
+
+  --face-legend: "Helvetica Neue Condensed", "Liberation Sans Narrow",
+                 "DejaVu Sans Condensed", "Arial Narrow", Inter, system-ui, sans-serif;
+  --track: .11em;
+
+  --r-key: calc(var(--u) * .18);
+  --r-bay: calc(var(--u) * .35);
+}
+
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.001ms !important; animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;
+  }
+}
+
+/* ==========================================================================
+   2. CANVAS + CHASSIS
+   ========================================================================== */
+*{ box-sizing:border-box }
+body{
+  margin:0; min-height:100%;
+  background: radial-gradient(120% 90% at 50% 0%, #1a1b21 0%, #08080a 62%, #050506 100%);
+  font-family: var(--face-legend); font-stretch: condensed;
+  color: var(--ink-white);
+  display:flex; flex-direction:column; align-items:center;
+  padding: calc(var(--u)*2.4) calc(var(--u)*1.2);
+  -webkit-font-smoothing: antialiased;
+}
+.rack{ width:min(1240px,100%); display:flex; flex-direction:column; gap: calc(var(--u)*.85) }
+
+/* a chassis row: spine · main unit · side unit (the photo's vertical seam) */
+.row{
+  display:grid;
+  grid-template-columns: calc(var(--u)*5.6) minmax(0,1fr) calc(var(--u)*25);
+  gap: calc(var(--u)*.5);
+  background: linear-gradient(180deg, var(--chassis-1), var(--chassis-2));
+  border-radius: var(--r-bay);
+  padding: calc(var(--u)*.5);
+  border-top:1px solid var(--seam); border-bottom:1px solid #000;
+  box-shadow: 0 calc(var(--u)*.25) calc(var(--u)*.9) rgba(0,0,0,.7),
+              inset 0 1px 0 rgba(255,255,255,.045);
+}
+.bay{
+  background: var(--panel); border-radius: calc(var(--r-bay)*.8);
+  border:1px solid #000; min-width:0;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.05), inset 0 -1px 0 rgba(0,0,0,.6);
+  padding: calc(var(--u)*.5);
+  display:flex; flex-direction:column; gap: calc(var(--u)*.45);
+}
+.bay--spine{ padding: calc(var(--u)*.35); justify-content:space-between; align-items:stretch }
+.bay__foot{
+  display:flex; align-items:flex-end; justify-content:space-between;
+  gap: calc(var(--u)*.5); margin-top:auto;
+}
+
+/* ==========================================================================
+   3. PRIMITIVES
+   ========================================================================== */
+
+/* 3.1 lamp — the illuminated orange key ------------------------------- */
+.lamp{
+  appearance:none; border:0; cursor:pointer; font:inherit;
+  font-size: calc(var(--u)*.82); font-weight:600; letter-spacing:var(--track);
+  text-transform:uppercase; color:#2b0a02; line-height:1.05; text-align:center;
+  border-radius: calc(var(--u)*.28);
+  padding: calc(var(--u)*.45) calc(var(--u)*.35);
+  min-height: calc(var(--u)*1.9);
+  display:flex; align-items:center; justify-content:center;
+  background: linear-gradient(180deg, var(--lamp-hot) 0%, var(--lamp) 42%, var(--lamp-deep) 100%);
+  box-shadow: inset 0 1px 0 rgba(255,220,190,.55), inset 0 -2px 3px rgba(0,0,0,.35),
+              0 1px 2px rgba(0,0,0,.8), 0 0 calc(var(--u)*.9) var(--lamp-glow);
+  transition: filter .09s ease, box-shadow .09s ease, transform .06s ease;
+}
+.lamp:hover{ filter:brightness(1.13) }
+.lamp:active{ transform:translateY(1px); filter:brightness(.86) }
+.lamp[aria-pressed="true"]{
+  filter:brightness(1.28);
+  box-shadow: inset 0 1px 0 rgba(255,235,215,.75), 0 0 calc(var(--u)*1.9) rgba(255,110,50,.7);
+}
+.lamp--spine{ flex:1; width:100% }
+.lamp--sm{ font-size:calc(var(--u)*.72); min-height:calc(var(--u)*1.45) }
+
+/* 3.2 rocker — one bar, a chevron at each end (LT-581 TUNE) ----------- */
+.rocker{
+  display:flex; align-items:stretch; gap:1px;
+  border-radius: calc(var(--u)*.28); overflow:hidden;
+  box-shadow: 0 0 calc(var(--u)*.9) var(--lamp-glow);
+}
+.rocker>*{ border-radius:0; box-shadow:none; min-height:calc(var(--u)*1.7) }
+.rocker__end{ flex:0 0 22% }
+.rocker__mid{ flex:1; pointer-events:none }
+
+/* 3.3 key — dark cap with a lit slot; legend printed on the panel ----- */
+.key{
+  appearance:none; border:0; background:none; padding:0; cursor:pointer; font:inherit;
+  display:flex; flex-direction:column; align-items:center; gap: calc(var(--u)*.22);
+  min-width:0;
+}
+.key__cap{
+  width:100%; min-width:calc(var(--u)*1.9); height:calc(var(--u)*1.05);
+  border:1px solid #000; border-radius: var(--r-key);
+  background: linear-gradient(180deg,#33353d 0%, #1d1f25 55%, #0f1015 100%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.13), 0 1px 2px rgba(0,0,0,.7);
+  display:grid; place-items:center;
+  transition: filter .09s ease;
+}
+.key:hover .key__cap{ filter:brightness(1.3) }
+.key:active .key__cap{ filter:brightness(.8) }
+.key__slot{
+  width:66%; height: calc(var(--u)*.24); border-radius:1px;
+  background: linear-gradient(180deg,#9296a0,#4a4d55);
+  box-shadow: inset 0 -1px 0 rgba(0,0,0,.5);
+}
+.key[aria-pressed="true"] .key__slot, .key.is-lit .key__slot{
+  background: linear-gradient(180deg,#ffe0ae,var(--lamp-hot));
+  box-shadow: 0 0 calc(var(--u)*.75) var(--lamp-glow);
+}
+.key__txt{
+  font-size: calc(var(--u)*.66); letter-spacing:var(--track);
+  text-transform:uppercase; color:var(--ink-green); white-space:nowrap;
+}
+.key--red .key__txt{ color:var(--ink-red) }
+.key--wide .key__cap{ min-width:calc(var(--u)*3) }
+
+/* 3.4 legend — screen print, never a control -------------------------- */
+.legend{
+  font-size:calc(var(--u)*.66); letter-spacing:var(--track);
+  text-transform:uppercase; color:var(--ink-green); line-height:1.15;
+  user-select:none;
+}
+.legend--red{ color:var(--ink-red) }
+.legend--grey{ color:var(--ink-grey) }
+.legend--white{ color:var(--ink-white) }
+.legend--tiny{ font-size:calc(var(--u)*.55) }
+.legend--model{ font-size:calc(var(--u)*.6); color:#6f7480; letter-spacing:.16em }
+
+/* 3.5 boxed — legend inside a hairline rectangle; may be an indicator -- */
+.boxed{
+  display:inline-flex; align-items:center; justify-content:center; text-align:center;
+  border:1px solid currentColor; border-radius: calc(var(--u)*.14);
+  padding: calc(var(--u)*.1) calc(var(--u)*.3);
+  font-size:calc(var(--u)*.62); letter-spacing:var(--track);
+  text-transform:uppercase; color:var(--ink-green);
+  background: rgba(0,0,0,.35); line-height:1.2;
+}
+.boxed--red{ color:var(--ink-red) }
+.boxed.is-on{ color:#fff; background:var(--ink-red); border-color:var(--ink-red);
+              box-shadow:0 0 calc(var(--u)*.8) rgba(255,60,20,.55) }
+.boxed.is-on-g{ color:#06170b; background:var(--ink-green); border-color:var(--ink-green);
+                box-shadow:0 0 calc(var(--u)*.8) rgba(60,210,100,.5) }
+button.boxed{ cursor:pointer; font-family:inherit }
+button.boxed:hover{ filter:brightness(1.3) }
+
+/* 3.6 window — recessed glass over a display -------------------------- */
+.window{
+  background: linear-gradient(180deg,#000,#05060a);
+  border:1px solid #000; border-radius: calc(var(--u)*.2);
+  box-shadow: inset 0 2px calc(var(--u)*.5) rgba(0,0,0,.9),
+              inset 0 0 0 1px rgba(255,255,255,.035);
+  padding: calc(var(--u)*.4) calc(var(--u)*.5);
+}
+.window--edged{ box-shadow: inset 0 0 0 1px rgba(67,171,92,.35) }
+.window--warm{ box-shadow: inset 0 0 0 1px rgba(255,120,50,.28) }
+
+/* 3.7 ft-seg — seven-segment readout ---------------------------------- */
+ft-seg{ display:inline-flex; gap: calc(var(--dw)*.22); align-items:flex-end }
+ft-seg .dig{
+  --dw: var(--seg-w, calc(var(--u)*1.5));
+  --dh: calc(var(--dw)*1.78);
+  --t:  calc(var(--dw)*.17);
+  position:relative; width:var(--dw); height:var(--dh); flex:none;
+}
+ft-seg .s{ position:absolute; background:var(--vfd-dim); transition:background .06s linear }
+ft-seg .s.on{ background:var(--vfd); box-shadow:0 0 calc(var(--dw)*.28) rgba(255,194,31,.75) }
+ft-seg .h{ left:calc(var(--t)*.85); width:calc(var(--dw) - var(--t)*1.7); height:var(--t);
+           clip-path:polygon(0% 50%,16% 0%,84% 0%,100% 50%,84% 100%,16% 100%) }
+ft-seg .v{ width:var(--t); height:calc(var(--dh)/2 - var(--t)*.9);
+           clip-path:polygon(50% 0%,100% 14%,100% 86%,50% 100%,0% 86%,0% 14%) }
+ft-seg .a{ top:0 } ft-seg .g{ top:calc((var(--dh) - var(--t))/2) } ft-seg .d{ bottom:0 }
+ft-seg .f{ left:0; top:calc(var(--t)*.6) }  ft-seg .b{ right:0; top:calc(var(--t)*.6) }
+ft-seg .e{ left:0; bottom:calc(var(--t)*.6) } ft-seg .c{ right:0; bottom:calc(var(--t)*.6) }
+ft-seg .pt{ width:calc(var(--u)*.34); height:calc(var(--u)*.34); border-radius:1px; flex:none;
+            align-self:flex-end; margin-bottom:calc(var(--u)*.12); background:var(--vfd-dim) }
+ft-seg .pt.on{ background:var(--vfd); box-shadow:0 0 calc(var(--u)*.5) rgba(255,194,31,.8) }
+ft-seg .cl{ width:calc(var(--u)*.3); height:calc(var(--u)*1.6); flex:none; align-self:center;
+            display:flex; flex-direction:column; justify-content:space-around; align-items:center }
+ft-seg .cl i{ width:calc(var(--u)*.26); height:calc(var(--u)*.26); border-radius:1px;
+              background:var(--vfd); box-shadow:0 0 calc(var(--u)*.4) rgba(255,194,31,.7) }
+
+/* 3.8 ft-bars — LED columns. three dialects:
+       (default) amber dots · .ramp fixed amber→red by height · .peak red crest */
+ft-bars{ display:flex; gap:calc(var(--u)*.42); align-items:flex-end }
+ft-bars .col{ display:flex; flex-direction:column-reverse; gap:calc(var(--u)*.16); flex:1; min-width:0 }
+ft-bars .seg{ height:calc(var(--u)*.26); border-radius:50%; background:var(--led-off) }
+ft-bars .seg.on{ background:var(--led-a); box-shadow:0 0 calc(var(--u)*.45) rgba(255,171,26,.55) }
+ft-bars.ramp .seg{ border-radius:1px }
+ft-bars.ramp .seg.hi.on{ background:var(--led-r); box-shadow:0 0 calc(var(--u)*.5) rgba(255,46,16,.6) }
+ft-bars.peak .seg.on.top{
+  border-radius:1px; height:calc(var(--u)*.32);
+  background:var(--led-r); box-shadow:0 0 calc(var(--u)*.6) rgba(255,46,16,.75);
+}
+
+/* 3.9 ft-reel — cassette hub. flex:none or it collapses to a hairline -- */
+ft-reel{ display:block; flex:none }
+ft-reel .hub{
+  width:calc(var(--u)*2.4); height:calc(var(--u)*2.4); border-radius:50%;
+  border:1px solid #7c2416; position:relative; overflow:hidden;
+  background: radial-gradient(circle at 50% 50%, #16171c 0%, #0a0b0e 70%);
+}
+ft-reel .wedge{
+  position:absolute; inset:9%; border-radius:50%; transform-origin:50% 50%;
+  background: conic-gradient(from 0deg, var(--wedge,#fff) 0deg 58deg, transparent 58deg 360deg);
+}
+ft-reel[spinning] .wedge{ animation:spin 2.1s linear infinite }
+@keyframes spin{ to{ transform:rotate(360deg) } }
+
+/* 3.10 vslider — short, wide cap, coloured band dot ------------------- */
+.vslider{ --sw:calc(var(--u)*2); --sh:calc(var(--u)*3.6);
+          position:relative; width:100%; height:var(--sh) }
+.vslider::before{
+  content:""; position:absolute; left:50%; top:2%; bottom:2%; width:calc(var(--u)*.34);
+  transform:translateX(-50%); background:linear-gradient(180deg,#000,#05060a);
+  border-radius:2px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.07);
+}
+.vslider input{
+  appearance:none; -webkit-appearance:none; background:transparent; margin:0; position:absolute;
+  width:var(--sh); height:var(--sw);
+  left:calc((100% - var(--sh))/2); top:calc((var(--sh) - var(--sw))/2);
+  transform:rotate(-90deg); cursor:ns-resize;
+}
+.vslider input::-webkit-slider-runnable-track{ height:100%; background:transparent }
+.vslider input::-moz-range-track{ height:100%; background:transparent }
+.vslider input::-webkit-slider-thumb{
+  -webkit-appearance:none; width:calc(var(--u)*.85); height:calc(var(--u)*1.85);
+  border:1px solid #000; border-radius:calc(var(--u)*.14);
+  background:linear-gradient(180deg,#9296a0 0%,#5a5d65 46%,#232529 52%,#3c3f46 100%);
+  box-shadow:0 1px 3px rgba(0,0,0,.85), inset 0 1px 0 rgba(255,255,255,.35);
+}
+.vslider input::-moz-range-thumb{
+  width:calc(var(--u)*.85); height:calc(var(--u)*1.85);
+  border:1px solid #000; border-radius:calc(var(--u)*.14);
+  background:linear-gradient(180deg,#9296a0 0%,#5a5d65 46%,#232529 52%,#3c3f46 100%);
+  box-shadow:0 1px 3px rgba(0,0,0,.85), inset 0 1px 0 rgba(255,255,255,.35);
+}
+.vslider__dot{
+  position:absolute; left:50%; transform:translate(-50%,50%);
+  width:calc(var(--u)*.28); height:calc(var(--u)*.28); border-radius:50%;
+  pointer-events:none; transition:bottom .08s linear;
+  background:var(--led-a); box-shadow:0 0 calc(var(--u)*.5) rgba(255,171,26,.7);
+}
+.vslider--r .vslider__dot{ background:var(--led-r); box-shadow:0 0 calc(var(--u)*.5) rgba(255,46,16,.7) }
+
+/* 3.11 badge ---------------------------------------------------------- */
+.badge{ display:flex; align-items:center; gap:calc(var(--u)*.35); flex:none;
+        font-size:calc(var(--u)*.62); letter-spacing:.08em; color:#c9ccd3;
+        font-style:italic; font-weight:700 }
+.badge__mark{ width:calc(var(--u)*1.05); height:calc(var(--u)*1.05); border-radius:calc(var(--u)*.14);
+              background:var(--lamp); display:grid; place-items:center;
+              color:#fff; font-size:calc(var(--u)*.66); font-style:normal }
+
+/* 3.12 helpers -------------------------------------------------------- */
+.r{ display:flex; align-items:center; gap:calc(var(--u)*.4) }
+.r--between{ justify-content:space-between }
+.r--top{ align-items:flex-start }
+.c{ display:flex; flex-direction:column; gap:calc(var(--u)*.35) }
+.c--center{ align-items:center }
+.grow{ flex:1; min-width:0 }
+
+:where(button,input,[tabindex]):focus-visible{ outline:2px solid var(--vfd); outline-offset:2px }
+
+/* ==========================================================================
+   4. UNITS
+   ========================================================================== */
+
+/* --- 4.1 QD-581 cassette deck ---------------------------------------- */
+.u-deck{ gap:calc(var(--u)*.45) }
+.u-deck__top{ display:flex; gap:calc(var(--u)*.5); align-items:stretch }
+.u-deck__win{ flex:1; display:flex; align-items:center; gap:calc(var(--u)*.7); min-width:0 }
+.u-deck__slot{ width:calc(var(--u)*2); align-self:stretch; border-radius:2px; flex:none;
+               background:linear-gradient(90deg,#000,#0d0e12);
+               box-shadow: inset 0 0 0 1px rgba(255,255,255,.07) }
+.u-deck__ctr{ display:flex; gap:calc(var(--u)*.22) }
+.u-deck__ctr i{ width:calc(var(--u)*.6); height:calc(var(--u)*.28); border-radius:1px; background:#3a1210 }
+.u-deck__ctr i.on{ background:var(--led-r); box-shadow:0 0 calc(var(--u)*.5) var(--led-r) }
+.u-deck__att{ flex:none; display:flex; gap:calc(var(--u)*.6); align-items:stretch }
+.u-deck__mid{ display:flex; gap:calc(var(--u)*.6); align-items:stretch }
+.u-deck__fn{ flex:1; display:flex; flex-direction:column; gap:calc(var(--u)*.4); min-width:0 }
+.u-deck__keys{ display:grid; grid-template-columns:repeat(4,1fr); gap:calc(var(--u)*.5) }
+.u-deck__seesaw{
+  display:flex; align-items:center; justify-content:space-between;
+  border:1px solid #2e3138; border-radius:var(--r-key);
+  background:linear-gradient(180deg,#22242a,#0f1015);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+  padding:calc(var(--u)*.35) calc(var(--u)*.6); flex:1; cursor:pointer;
+}
+.u-deck__seesaw:hover{ filter:brightness(1.25) }
+.u-deck__ind{ display:flex; flex-direction:column; gap:calc(var(--u)*.3); flex:none; justify-content:center }
+.dolby{ display:inline-flex; align-items:center; gap:calc(var(--u)*.3);
+        border:1px solid #4a4d55; border-radius:2px; padding:calc(var(--u)*.08) calc(var(--u)*.3) }
+.dolby__dd{ font-size:calc(var(--u)*.9); letter-spacing:-.14em; color:#c9ccd3 }
+
+/* tone display — lives in the deck, driven from the control head */
+.u-deck__tone{ flex:none; width:calc(var(--u)*9); display:flex; flex-direction:column;
+               align-items:center; gap:calc(var(--u)*.15) }
+.tone-x{ width:100%; height:calc(var(--u)*4) }
+.tone-x .x{ stroke:var(--ink-green); stroke-width:1; opacity:.85 }
+.tone-x .t{ stroke:#4a4e57; stroke-width:1.4 }
+.tone-x .t.on{ stroke:var(--led-a); stroke-width:2; filter:drop-shadow(0 0 2px rgba(255,171,26,.9)) }
+
+/* --- 4.2 LT-581 tuner ------------------------------------------------ */
+.u-tuner__presets{ display:grid; grid-template-columns:repeat(3,1fr);
+                   gap:calc(var(--u)*.45); flex:0 0 30% }
+.u-tuner__win{ display:grid; grid-template-columns:auto minmax(0,1fr) auto;
+               align-items:center; gap:calc(var(--u)*.6) }
+
+/* --- 4.3 QE-581 equaliser — two banks sharing one legend strip -------- */
+.u-eq__grid{
+  display:grid; grid-template-columns:repeat(9,minmax(0,1fr));
+  gap:calc(var(--u)*.18) calc(var(--u)*.4); flex:1; align-items:center;
+}
+.u-eq__leg{ text-align:center }
+
+/* --- 4.4 QM-571 amplifier -------------------------------------------- */
+.u-amp__meters{ display:flex; gap:calc(var(--u)*.5); align-items:stretch; flex:1 }
+.u-amp__meter{ display:flex; flex-direction:column; align-items:center;
+               gap:calc(var(--u)*.3); flex:1; min-width:0 }
+.u-amp__watt{ font-size:calc(var(--u)*1.6); font-weight:800; font-style:italic;
+              color:#e3e5ea; line-height:1 }
+
+/* --- 4.5 QD-585 compact disc (original addition) --------------------- */
+.u-cd__disc{
+  width:calc(var(--u)*2.8); height:calc(var(--u)*2.8); border-radius:50%; flex:none;
+  border:1px solid #000; position:relative;
+  background: conic-gradient(from 0deg,#1b1d22,#2e313a,#1b1d22,#35383f,#1b1d22), #14151a;
+  box-shadow: inset 0 0 calc(var(--u)*.6) rgba(0,0,0,.9);
+}
+.u-cd__disc::after{ content:""; position:absolute; inset:38%; border-radius:50%;
+                    background:#0a0b0e; box-shadow: inset 0 0 0 1px rgba(255,255,255,.08) }
+.u-cd__disc[spinning]{ animation:spin 1.4s linear infinite }
+
+/* --- responsive ------------------------------------------------------ */
+@media (max-width:880px){
+  :root{ --u:9px }
+  .row{ grid-template-columns:calc(var(--u)*5) minmax(0,1fr) }
+  .bay--side{ grid-column:1 / -1 }
+  .u-deck__top,.u-deck__mid{ flex-wrap:wrap }
+  .u-deck__tone{ width:auto; flex:1 }
+}
+
+.colophon{ width:min(1240px,100%); margin-top:calc(var(--u)*1.6);
+           display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap;
+           font-size:calc(var(--u)*.7); color:#5c606b; letter-spacing:.1em; text-transform:uppercase }
+</style>
+</head>
+<body>
+
+<main class="rack">
+
+  <!-- ================================================================
+       ROW 1 · QD-581 CASSETTE DECK  |  CONTROL HEAD
+       ================================================================ -->
+  <section class="row" data-unit="deck">
+
+    <div class="bay bay--spine">
+      <button class="lamp lamp--spine" data-cmd="deck/eject">Eject</button>
+      <button class="lamp lamp--sm" data-cmd="deck/dolby" aria-pressed="true">DO</button>
+    </div>
+
+    <div class="bay u-deck">
+
+      <!-- two windows: transport display, and the attenuator/level display -->
+      <div class="u-deck__top">
+        <div class="window u-deck__win">
+          <div class="u-deck__slot"></div>
+          <div class="c" style="gap:calc(var(--u)*.15)">
+            <span class="legend legend--white">Cassette</span>
+            <span class="legend legend--white">Deck QD-581</span>
+          </div>
+          <ft-reel id="reelL" wedge="#eef0f4"></ft-reel>
+          <div class="c c--center grow" style="gap:calc(var(--u)*.3)">
+            <div class="r">
+              <span class="boxed" id="ind-rew">Rew</span>
+              <span class="boxed" id="ind-ff">FF</span>
+            </div>
+            <div class="u-deck__ctr" id="deckCounter"><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+          <ft-reel id="reelR" wedge="#ffc21f"></ft-reel>
+        </div>
+
+        <div class="window window--edged u-deck__att">
+          <div class="c" style="justify-content:space-between">
+            <span class="boxed boxed--red is-on" id="attInd">ATT</span>
+            <span class="legend legend--tiny legend--grey" style="text-align:center">ATT</span>
+            <span class="boxed" id="att70">70%</span>
+            <span class="boxed" id="att60">60%</span>
+          </div>
+          <ft-bars id="outLevel" cols="1" rows="8" class="ramp"
+                   style="width:calc(var(--u)*1.3)"></ft-bars>
+        </div>
+      </div>
+
+      <!-- function keys · indicator stack · tone display · level legend -->
+      <div class="u-deck__mid">
+
+        <div class="u-deck__fn">
+          <div class="u-deck__keys">
+            <button class="key" data-cmd="deck/bskip"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">B Skip</span></button>
+            <button class="key" data-cmd="deck/repeat" aria-pressed="false"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">Repeat</span></button>
+            <button class="key" data-cmd="deck/mscan"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">M Scan</span></button>
+            <button class="key" data-cmd="deck/aps" aria-pressed="false"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">APS</span></button>
+          </div>
+
+          <div class="r" style="align-items:stretch">
+            <div class="u-deck__seesaw">
+              <button class="legend legend--red" data-cmd="deck/rew"
+                      style="background:none;border:0;cursor:pointer;font-family:inherit">Rew</button>
+              <button class="legend legend--red" data-cmd="deck/ff"
+                      style="background:none;border:0;cursor:pointer;font-family:inherit">FF</button>
+            </div>
+            <button class="key key--red key--wide" data-cmd="deck/program" style="flex:0 0 22%">
+              <span class="key__cap"><span class="key__slot"></span></span>
+              <span class="key__txt">⏸ / Pro</span>
+            </button>
+          </div>
+
+          <div class="r">
+            <span class="dolby"><span class="dolby__dd">▷◁</span><span class="legend legend--grey">Dolby System</span></span>
+            <span class="boxed" id="tapeType">Mtl</span>
+          </div>
+        </div>
+
+        <div class="u-deck__ind">
+          <span class="boxed" id="i-aps">APS</span>
+          <span class="boxed boxed--red" id="i-mscan">M Scan</span>
+          <span class="boxed boxed--red" id="i-repeat">Repeat</span>
+          <span class="boxed boxed--red" id="i-bskip">B Skip</span>
+        </div>
+
+        <div class="u-deck__tone">
+          <span class="legend legend--grey legend--tiny">Tone +</span>
+          <svg class="tone-x" viewBox="0 0 120 48" aria-hidden="true">
+            <line class="x" x1="30" y1="6" x2="90" y2="42"/>
+            <line class="x" x1="30" y1="42" x2="90" y2="6"/>
+            <g id="bassTicks">
+              <line class="t" x1="2" y1="8"  x2="26" y2="8"/>
+              <line class="t" x1="2" y1="17" x2="26" y2="17"/>
+              <line class="t on" x1="2" y1="26" x2="26" y2="26"/>
+              <line class="t" x1="2" y1="35" x2="26" y2="35"/>
+              <line class="t" x1="2" y1="44" x2="26" y2="44"/>
+            </g>
+            <g id="trebTicks">
+              <line class="t" x1="94" y1="8"  x2="118" y2="8"/>
+              <line class="t" x1="94" y1="17" x2="118" y2="17"/>
+              <line class="t on" x1="94" y1="26" x2="118" y2="26"/>
+              <line class="t" x1="94" y1="35" x2="118" y2="35"/>
+              <line class="t" x1="94" y1="44" x2="118" y2="44"/>
+            </g>
+          </svg>
+          <div class="r" style="gap:calc(var(--u)*2)">
+            <span class="legend legend--tiny">Bass</span><span class="legend legend--tiny">Treble</span>
+          </div>
+        </div>
+
+        <div class="c c--center" style="flex:none; justify-content:flex-start">
+          <span class="legend legend--tiny legend--grey" style="text-align:center">Volume<br>Level<br>Output<br>Level</span>
+          <button class="boxed" data-cmd="ctrl/ind">Ind</button>
+        </div>
+      </div>
+
+      <div class="bay__foot">
+        <span class="legend legend--model">Cassette deck QD-581</span>
+        <span class="badge"><span class="badge__mark">干</span>Fujitsu Ten</span>
+      </div>
+    </div>
+
+    <!-- control head -->
+    <div class="bay bay--side">
+      <div class="r" style="align-items:stretch">
+        <button class="lamp" data-cmd="ctrl/att" aria-pressed="false" style="flex:0 0 22%">ATT</button>
+        <button class="lamp" data-cmd="ctrl/vol-down" style="flex:0 0 16%">∨</button>
+        <button class="lamp grow" data-cmd="ctrl/vol-mute">Volume</button>
+        <button class="lamp" data-cmd="ctrl/vol-up" style="flex:0 0 16%">∧</button>
+      </div>
+
+      <div class="r r--top" style="gap:calc(var(--u)*.9)">
+        <div class="c c--center" style="flex:none">
+          <button class="boxed boxed--red" data-cmd="ctrl/ill" id="illBtn">Green<br>Orange</button>
+          <span class="legend legend--tiny legend--grey">ILL</span>
+        </div>
+
+        <div class="c c--center grow">
+          <span class="legend">Bass</span>
+          <div class="r">
+            <button class="key" data-cmd="ctrl/bass-up"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">+</span></button>
+            <button class="key" data-cmd="ctrl/bass-down"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">−</span></button>
+          </div>
+        </div>
+
+        <div class="c c--center grow">
+          <span class="legend">Treble</span>
+          <div class="r">
+            <button class="key" data-cmd="ctrl/treble-up"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">+</span></button>
+            <button class="key" data-cmd="ctrl/treble-down"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">−</span></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="bay__foot">
+        <span class="legend legend--model">Control head</span>
+        <span class="badge"><span class="badge__mark">干</span>Fujitsu Ten</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       ROW 2 · LT-581 PLL SYNTHESISED TUNER
+       ================================================================ -->
+  <section class="row" data-unit="tuner">
+
+    <div class="bay bay--spine">
+      <button class="lamp lamp--spine" data-cmd="tuner/band">AM<br>FM</button>
+    </div>
+
+    <div class="bay">
+      <div class="r r--top" style="gap:calc(var(--u)*.8); align-items:stretch">
+
+        <div class="u-tuner__presets">
+          <button class="key" data-cmd="tuner/preset" data-value="1" aria-pressed="true"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt" style="color:var(--ink-red)">1</span></button>
+          <button class="key" data-cmd="tuner/preset" data-value="2"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt" style="color:var(--ink-red)">2</span></button>
+          <button class="key" data-cmd="tuner/preset" data-value="3"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt" style="color:var(--ink-red)">3</span></button>
+          <button class="key" data-cmd="tuner/preset" data-value="4"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt" style="color:var(--ink-red)">4</span></button>
+          <button class="key" data-cmd="tuner/preset" data-value="5"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt" style="color:var(--ink-red)">5</span></button>
+          <button class="key" data-cmd="tuner/preset" data-value="6"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt" style="color:var(--ink-red)">6</span></button>
+        </div>
+
+        <div class="c grow" style="gap:calc(var(--u)*.3)">
+          <span class="legend legend--tiny" style="color:#8c4630">PLL Synthesised Tuner LT-581</span>
+
+          <div class="window window--warm u-tuner__win grow">
+            <div class="c" style="gap:calc(var(--u)*.3)">
+              <div class="r"><span class="boxed is-on-g" id="ind-fm">FM</span><span class="legend legend--grey legend--tiny">MHz</span></div>
+              <div class="r"><span class="boxed" id="ind-am">AM</span><span class="legend legend--grey legend--tiny">kHz</span></div>
+              <span class="boxed boxed--red is-on" id="ind-stereo">Stereo</span>
+            </div>
+            <ft-seg id="freq" digits="4" dp="3"
+                    style="--seg-w:calc(var(--u)*2.2); justify-content:center"></ft-seg>
+            <div class="c c--center" style="gap:calc(var(--u)*.25)">
+              <button class="lamp lamp--sm" data-cmd="tuner/seek" style="width:calc(var(--u)*2.3)">S</button>
+              <span class="legend legend--tiny legend--grey">Seek</span>
+            </div>
+          </div>
+
+          <div class="r r--between">
+            <span class="badge"><span class="badge__mark">干</span>Fujitsu Ten</span>
+            <div class="r">
+              <button class="boxed" data-cmd="tuner/local" aria-pressed="false">Local</button>
+              <button class="boxed" data-cmd="tuner/memo">Memo</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bay bay--side">
+      <div class="r" style="align-items:stretch">
+        <div class="rocker grow">
+          <button class="lamp rocker__end" data-cmd="tuner/tune-down">∨</button>
+          <span class="lamp rocker__mid">Tune</span>
+          <button class="lamp rocker__end" data-cmd="tuner/tune-up">∧</button>
+        </div>
+        <button class="lamp" data-cmd="tuner/power" aria-pressed="true" style="flex:0 0 30%">Power</button>
+      </div>
+
+      <div class="bay__foot">
+        <span class="badge"><span class="badge__mark">干</span>Fujitsu Ten</span>
+        <div class="r" style="gap:calc(var(--u)*.7)">
+          <button class="key" data-cmd="tuner/mono"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">M</span></button>
+          <button class="key" data-cmd="tuner/lo"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">Lo</span></button>
+        </div>
+        <div class="c c--center" style="gap:calc(var(--u)*.2)">
+          <ft-bars id="rssi" cols="1" rows="6" class="ramp" style="width:calc(var(--u)*1.1)"></ft-bars>
+          <span class="legend legend--tiny legend--grey">Signal</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       ROW 3 · QE-581 GRAPHIC EQUALISER — front bank / rear bank
+       ================================================================ -->
+  <section class="row" data-unit="eq">
+
+    <div class="bay bay--spine">
+      <span class="legend legend--tiny" style="text-align:center">F</span>
+      <button class="lamp lamp--spine" data-cmd="eq/defeat" aria-pressed="false">Defeat</button>
+      <span class="legend legend--tiny" style="text-align:center">R</span>
+    </div>
+
+    <div class="bay">
+      <div class="r" style="align-items:center; gap:calc(var(--u)*.7)">
+        <div class="c c--center" style="gap:calc(var(--u)*.6); flex:none">
+          <button class="key" data-cmd="eq/source"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">S/E</span></button>
+          <button class="key" data-cmd="eq/range"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">½0</span></button>
+        </div>
+
+        <div class="u-eq__grid" id="eqGrid"><!-- 9 front · 9 legends · 9 rear --></div>
+
+        <div class="c" style="gap:calc(var(--u)*1.4); flex:none">
+          <span class="boxed boxed--red">F</span>
+          <span class="boxed boxed--red">R</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="bay bay--side">
+      <span class="legend legend--model">Graphic Equalizer QE-581</span>
+      <div class="r" style="align-items:stretch; gap:calc(var(--u)*.6)">
+        <span class="badge" style="align-self:center"><span class="badge__mark">干</span>Fujitsu Ten</span>
+        <div class="grow" style="display:grid; grid-template-columns:repeat(3,1fr); gap:calc(var(--u)*.4)">
+          <button class="key" data-cmd="eq/memory" data-value="1"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">1</span></button>
+          <button class="key" data-cmd="eq/memory" data-value="2"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">2</span></button>
+          <button class="key" data-cmd="eq/store"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">M</span></button>
+          <button class="key" data-cmd="eq/memory" data-value="3"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">3</span></button>
+          <button class="key" data-cmd="eq/memory" data-value="4"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">4</span></button>
+          <button class="key" data-cmd="eq/flat"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">TT</span></button>
+        </div>
+        <div class="c c--center" style="flex:0 0 26%; gap:calc(var(--u)*.2)">
+          <span class="legend legend--tiny">F</span>
+          <button class="lamp grow" data-cmd="eq/fader" style="width:100%">Fader</button>
+          <span class="legend legend--tiny">R</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       ROW 4 · QM-571 POWER AMPLIFIER
+       ================================================================ -->
+  <section class="row" data-unit="amp">
+
+    <div class="bay bay--spine">
+      <button class="lamp lamp--spine" data-cmd="amp/level">Level</button>
+    </div>
+
+    <div class="bay">
+      <div class="u-amp__meters" id="ampMeters"><!-- built by JS --></div>
+    </div>
+
+    <div class="bay bay--side">
+      <div class="r r--between" style="align-items:flex-start">
+        <span class="badge"><span class="badge__mark">干</span>Fujitsu Ten</span>
+        <div class="c" style="gap:calc(var(--u)*.15); align-items:flex-end">
+          <span class="u-amp__watt">25W/25W</span>
+          <span class="legend legend--model">Power Amplifier QM-571</span>
+        </div>
+      </div>
+      <div class="bay__foot" style="justify-content:flex-end">
+        <button class="lamp lamp--sm" data-cmd="amp/power" aria-pressed="true"
+                style="flex:0 0 30%">Power</button>
+        <div class="c c--center" style="gap:calc(var(--u)*.2); flex:none">
+          <ft-bars id="ampInd" cols="1" rows="1" class="ramp" style="width:calc(var(--u)*.8)"></ft-bars>
+          <span class="legend legend--tiny legend--grey">Ind</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================
+       ROW 5 · QD-585 COMPACT DISC  (not in the ad — same design grammar)
+       ================================================================ -->
+  <section class="row" data-unit="cd">
+
+    <div class="bay bay--spine">
+      <button class="lamp lamp--spine" data-cmd="cd/eject">Eject</button>
+    </div>
+
+    <div class="bay">
+      <div class="window r" style="gap:calc(var(--u)*.7)">
+        <div class="u-cd__disc" id="cdDisc"></div>
+        <div class="c" style="gap:calc(var(--u)*.15)">
+          <span class="legend legend--white">Compact Disc</span>
+          <span class="legend legend--white">Player QD-585</span>
+        </div>
+        <div class="r grow" style="justify-content:center; gap:calc(var(--u)*1.4)">
+          <div class="c c--center" style="gap:calc(var(--u)*.25)">
+            <ft-seg id="cdTrack" digits="2" style="--seg-w:calc(var(--u)*1.15)"></ft-seg>
+            <span class="legend legend--tiny legend--grey">Track</span>
+          </div>
+          <div class="c c--center" style="gap:calc(var(--u)*.25)">
+            <ft-seg id="cdTime" digits="4" colon="2" style="--seg-w:calc(var(--u)*1.15)"></ft-seg>
+            <span class="legend legend--tiny legend--grey">Elapsed</span>
+          </div>
+        </div>
+        <div class="c" style="align-items:flex-end; gap:calc(var(--u)*.25)">
+          <span class="boxed" id="ind-disc">Disc</span>
+          <span class="legend legend--tiny legend--grey">44.1 kHz</span>
+        </div>
+      </div>
+
+      <div class="u-deck__mid" style="align-items:flex-end">
+        <div class="u-deck__keys grow">
+          <button class="key key--red" data-cmd="cd/prev"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">⏮</span></button>
+          <button class="key key--red" data-cmd="cd/play"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">▶ / ⏸</span></button>
+          <button class="key key--red" data-cmd="cd/next"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">⏭</span></button>
+          <button class="key" data-cmd="cd/stop"><span class="key__cap"><span class="key__slot"></span></span><span class="key__txt">■</span></button>
+        </div>
+        <div class="u-deck__ind" style="flex-direction:row">
+          <button class="boxed" data-cmd="cd/repeat" aria-pressed="false">Repeat</button>
+          <button class="boxed" data-cmd="cd/random" aria-pressed="false">Random</button>
+          <button class="boxed" data-cmd="cd/scan">Scan</button>
+        </div>
+      </div>
+
+      <div class="bay__foot">
+        <span class="legend legend--model">Compact disc player QD-585</span>
+        <span class="badge"><span class="badge__mark">干</span>Fujitsu Ten</span>
+      </div>
+    </div>
+
+    <div class="bay bay--side">
+      <span class="legend legend--model">Now playing</span>
+      <div class="window c grow" style="gap:calc(var(--u)*.2); justify-content:center">
+        <span class="legend legend--white" id="cdTitle" style="font-size:calc(var(--u)*.95)">No disc</span>
+        <span class="legend legend--grey" id="cdArtist">Insert disc or select a source</span>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="colophon">
+  <span>QD-581 · LT-581 · QE-581 · QM-571 · QD-585</span>
+  <span>controls emit ft:command · state arrives via FT.apply()</span>
+</footer>
+
+<script>
+"use strict";
+/* ==========================================================================
+   FT — the control surface API
+   ========================================================================== */
+const FT = window.FT = {
+  bus: new EventTarget(),
+  bridge: { send(m){ console.log("[ft →]", m.unit + "/" + m.action, m.value ?? ""); } },
+
+  /* outbound: a control was operated. Changes nothing on screen. */
+  send(unit, action, value){
+    const msg = { unit, action, value, t: Date.now() };
+    FT.bus.dispatchEvent(new CustomEvent("ft:command", { detail: msg }));
+    FT.bridge.send(msg);
+  },
+
+  /* inbound: the backend reports truth. The only thing that repaints. */
+  apply(msg){
+    const u = FT.units[msg.unit];
+    if (!u) return console.warn("[ft] unknown unit", msg.unit);
+    Object.assign(u.state, msg.state);
+    u.render();
+  },
+
+  units: {}
+};
+
+/* ==========================================================================
+   CUSTOM ELEMENTS
+   ========================================================================== */
+const SEG_MAP = {
+  "0":"abcdef","1":"bc","2":"abged","3":"abgcd","4":"fgbc","5":"afgcd",
+  "6":"afgecd","7":"abc","8":"abcdefg","9":"abcdfg","-":"g"," ":"","":""
+};
+class FtSeg extends HTMLElement{
+  connectedCallback(){
+    if (this.digs) return;
+    this.n    = +(this.getAttribute("digits") || 3);
+    this.dpAt = this.hasAttribute("dp")    ? +this.getAttribute("dp")    : -1;
+    this.clAt = this.hasAttribute("colon") ? +this.getAttribute("colon") : -1;
+    this.digs = [];
+    for (let i = 0; i < this.n; i++){
+      const d = document.createElement("span");
+      d.className = "dig";
+      d.innerHTML =
+        ["a","g","d"].map(c => `<i class="s h ${c}" data-seg="${c}"></i>`).join("") +
+        ["f","b","e","c"].map(c => `<i class="s v ${c}" data-seg="${c}"></i>`).join("");
+      this.append(d); this.digs.push(d);
+      if (i + 1 === this.dpAt){
+        this.dpEl = document.createElement("i");
+        this.dpEl.className = "pt on"; this.append(this.dpEl);
+      }
+      if (i + 1 === this.clAt){
+        const c = document.createElement("span");
+        c.className = "cl"; c.innerHTML = "<i></i><i></i>"; this.append(c);
+      }
+    }
+    if (this.pending != null){ this.value = this.pending; this.pending = null; }
+  }
+  set value(v){
+    if (!this.digs){ this.pending = v; return; }
+    const s = String(v).padStart(this.n, " ").slice(-this.n);
+    this.digs.forEach((d, i) => {
+      const on = SEG_MAP[s[i]] ?? "";
+      d.querySelectorAll(".s").forEach(el =>
+        el.classList.toggle("on", on.includes(el.dataset.seg)));
+    });
+  }
+  set dot(v){ this.dpEl?.classList.toggle("on", !!v); }   /* AM has no tenths */
+}
+customElements.define("ft-seg", FtSeg);
+
+class FtBars extends HTMLElement{
+  connectedCallback(){
+    if (this.segs) return;
+    this.cols = +(this.getAttribute("cols") || 1);
+    this.rows = +(this.getAttribute("rows") || 12);
+    this.segs = [];
+    for (let c = 0; c < this.cols; c++){
+      const col = document.createElement("span"); col.className = "col";
+      const cells = [];
+      for (let r = 0; r < this.rows; r++){
+        const s = document.createElement("i");
+        s.className = "seg" + (r >= this.rows * .68 ? " hi" : "");   /* .ramp uses .hi */
+        col.append(s); cells.push(s);
+      }
+      this.append(col); this.segs.push(cells);
+    }
+  }
+  /* levels: 0..1 per column. The top ~30% of a lit column is the red crest. */
+  setLevels(levels){
+    if (!this.segs) return;
+    this.segs.forEach((cells, c) => {
+      const lit  = Math.round((levels[c] ?? 0) * this.rows);
+      const crest = lit - Math.max(1, Math.round(lit * .3));
+      cells.forEach((s, r) => {
+        const on = r < lit;
+        s.classList.toggle("on", on);
+        s.classList.toggle("top", on && r >= crest);
+      });
+    });
+  }
+}
+customElements.define("ft-bars", FtBars);
+
+class FtReel extends HTMLElement{
+  connectedCallback(){
+    if (this.firstElementChild) return;
+    this.innerHTML = `<span class="hub"><span class="wedge"></span></span>`;
+    this.querySelector(".wedge").style.setProperty("--wedge", this.getAttribute("wedge") || "#fff");
+  }
+}
+customElements.define("ft-reel", FtReel);
+
+/* ==========================================================================
+   GENERATED PARTS
+   ========================================================================== */
+const BANDS = ["60","125","250","500","1k","2k","4k","8k","16k"];
+
+/* QE-581 — front bank, legend strip, rear bank. One grid keeps them aligned. */
+(function buildEq(){
+  const grid = document.getElementById("eqGrid");
+  const make = (bank, i) => {
+    const cell = document.createElement("div");
+    cell.className = "vslider" + (bank === "R" ? " vslider--r" : "");
+    cell.innerHTML =
+      `<input type="range" min="-12" max="12" step="1" value="0"
+              data-cmd="eq/band" data-bank="${bank}" data-value="${i}"
+              aria-label="${bank === "F" ? "Front" : "Rear"} ${BANDS[i]} hertz, decibels">
+       <span class="vslider__dot"></span>`;
+    const input = cell.querySelector("input");
+    const dot   = cell.querySelector(".vslider__dot");
+    const place = () => {
+      const pct = (input.value - input.min) / (input.max - input.min);
+      dot.style.bottom = (6 + pct * 86) + "%";
+    };
+    input._place = place;
+    input.addEventListener("input", () => {
+      place();
+      FT.send("eq", "band", { bank, band: i, hz: BANDS[i], db: +input.value });
+    });
+    place();
+    return cell;
+  };
+  BANDS.forEach((_, i) => grid.append(make("F", i)));
+  BANDS.forEach(hz => {
+    const l = document.createElement("span");
+    l.className = "legend legend--tiny u-eq__leg"; l.textContent = hz;
+    grid.append(l);
+  });
+  BANDS.forEach((_, i) => grid.append(make("R", i)));
+})();
+
+/* QM-571 — nine peak-reading columns */
+(function buildMeters(){
+  const host = document.getElementById("ampMeters");
+  BANDS.forEach(hz => {
+    const m = document.createElement("div");
+    m.className = "u-amp__meter";
+    m.innerHTML = `<ft-bars cols="1" rows="16" class="peak grow" style="width:100%"></ft-bars>
+                   <span class="boxed">${hz}</span>`;
+    host.append(m);
+  });
+})();
+
+/* ==========================================================================
+   UNITS
+   ========================================================================== */
+const $  = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+
+FT.units.deck = {
+  state:{ transport:"stop", dolby:true, repeat:false, aps:false, mscan:false,
+          bskip:false, counter:0, type:"MTL" },
+  render(){
+    const s = this.state;
+    $("#reelL").toggleAttribute("spinning", s.transport === "play");
+    $("#reelR").toggleAttribute("spinning", s.transport === "play");
+    $("#ind-rew").classList.toggle("is-on", s.transport === "rew");
+    $("#ind-ff").classList.toggle("is-on",  s.transport === "ff");
+    $$("#deckCounter i").forEach((el,i) => el.classList.toggle("on", i < (s.counter % 6)));
+    $("#i-aps").classList.toggle("is-on-g", s.aps);
+    $("#i-mscan").classList.toggle("is-on", s.mscan);
+    $("#i-repeat").classList.toggle("is-on", s.repeat);
+    $("#i-bskip").classList.toggle("is-on", s.bskip);
+    $('[data-cmd="deck/repeat"]').setAttribute("aria-pressed", s.repeat);
+    $('[data-cmd="deck/aps"]').setAttribute("aria-pressed", s.aps);
+    $('[data-cmd="deck/dolby"]').setAttribute("aria-pressed", s.dolby);
+    $("#tapeType").textContent = s.type;
+  }
+};
+
+FT.units.tuner = {
+  state:{ band:"FM", freq:88.1, stereo:true, preset:1, local:false, rssi:.7 },
+  render(){
+    const s = this.state;
+    const shown = s.band === "FM" ? s.freq.toFixed(1) : String(Math.round(s.freq));
+    $("#freq").value = shown.replace(".", "");
+    $("#freq").dot   = s.band === "FM";
+    $("#ind-fm").classList.toggle("is-on-g", s.band === "FM");
+    $("#ind-am").classList.toggle("is-on-g", s.band === "AM");
+    $("#ind-stereo").classList.toggle("is-on", s.stereo && s.band === "FM");
+    $$('[data-cmd="tuner/preset"]').forEach(b =>
+      b.setAttribute("aria-pressed", +b.dataset.value === s.preset));
+    $('[data-cmd="tuner/local"]').setAttribute("aria-pressed", s.local);
+    $("#rssi").setLevels([s.rssi]);
+  }
+};
+
+FT.units.eq = {
+  state:{ defeat:false, front:new Array(9).fill(0), rear:new Array(9).fill(0) },
+  render(){
+    $('[data-cmd="eq/defeat"]').setAttribute("aria-pressed", this.state.defeat);
+    $$("#eqGrid input").forEach(input => {
+      const want = (input.dataset.bank === "F" ? this.state.front : this.state.rear)[+input.dataset.value];
+      if (+input.value !== want){ input.value = want; input._place(); }
+    });
+  }
+};
+
+FT.units.amp = {
+  state:{ power:true, levels:new Array(9).fill(0) },
+  meters:null,
+  render(){
+    this.meters ||= $$("#ampMeters ft-bars");
+    this.meters.forEach((m,i) => m.setLevels([this.state.levels[i]]));
+    $("#ampInd").setLevels([this.state.power ? 1 : 0]);
+    $('[data-cmd="amp/power"]').setAttribute("aria-pressed", this.state.power);
+  }
+};
+
+FT.units.cd = {
+  state:{ transport:"stop", track:0, seconds:0, repeat:false, random:false,
+          title:"No disc", artist:"Insert disc or select a source" },
+  render(){
+    const s = this.state;
+    $("#cdDisc").toggleAttribute("spinning", s.transport === "play");
+    $("#cdTrack").value = s.track ? String(s.track).padStart(2,"0") : "  ";
+    const mm = String(Math.floor(s.seconds/60)).padStart(2,"0");
+    const ss = String(Math.floor(s.seconds%60)).padStart(2,"0");
+    $("#cdTime").value = s.track ? mm+ss : "    ";
+    $("#ind-disc").classList.toggle("is-on-g", s.transport !== "stop");
+    $("#cdTitle").textContent  = s.title;
+    $("#cdArtist").textContent = s.artist;
+    $('[data-cmd="cd/repeat"]').setAttribute("aria-pressed", s.repeat);
+    $('[data-cmd="cd/random"]').setAttribute("aria-pressed", s.random);
+  }
+};
+
+/* control head — owns volume, attenuator, tone and lamp colour.
+   Its tone setting paints the X display over in the deck chassis. */
+FT.units.ctrl = {
+  state:{ volume:.55, att:false, bass:0, treble:0, ill:"orange" },
+  render(){
+    const s = this.state;
+    $("#outLevel").setLevels([s.att ? .18 : s.volume]);
+    $('[data-cmd="ctrl/att"]').setAttribute("aria-pressed", s.att);
+    $("#attInd").classList.toggle("is-on", s.att);
+    $("#att70").classList.toggle("is-on-g", s.att && s.volume > .35);
+    $("#att60").classList.toggle("is-on-g", s.att && s.volume <= .35);
+
+    /* ticks run +2 (top) … −2 (bottom) */
+    const paint = (id, v) => $$("#" + id + " line").forEach((l,i) =>
+      l.classList.toggle("on", i === 2 - v));
+    paint("bassTicks", s.bass);
+    paint("trebTicks", s.treble);
+
+    const green = s.ill === "green";
+    const root = document.documentElement.style;
+    root.setProperty("--lamp",      green ? "#1f9c46" : "#e8431a");
+    root.setProperty("--lamp-hot",  green ? "#43d670" : "#ff7238");
+    root.setProperty("--lamp-deep", green ? "#0c5624" : "#a32407");
+    root.setProperty("--lamp-glow", green ? "rgba(60,220,110,.38)" : "rgba(255,92,40,.38)");
+  }
+};
+
+/* ==========================================================================
+   ONE DELEGATED LISTENER — data-cmd="unit/action" is the whole contract
+   ========================================================================== */
+document.addEventListener("click", e => {
+  const btn = e.target.closest("[data-cmd]");
+  if (!btn || btn.tagName === "INPUT") return;
+  const [unit, action] = btn.dataset.cmd.split("/");
+  FT.send(unit, action, btn.dataset.value ?? null);
+});
+
+/* ==========================================================================
+   LOCAL FALLBACK — so the panel is not dead before the daemon exists.
+   DELETE THIS BLOCK once the backend is the only caller of FT.apply().
+   ========================================================================== */
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+
+FT.bus.addEventListener("ft:command", e => {
+  const { unit, action, value } = e.detail;
+  const st = FT.units[unit]?.state;
+  if (!st) return;
+
+  switch (unit + "/" + action){
+    case "deck/eject":   FT.apply({unit, state:{ transport:"stop" }}); break;
+    case "deck/rew":     FT.apply({unit, state:{ transport: st.transport==="rew"?"play":"rew" }}); break;
+    case "deck/ff":      FT.apply({unit, state:{ transport: st.transport==="ff" ?"play":"ff"  }}); break;
+    case "deck/program": FT.apply({unit, state:{ transport: st.transport==="play"?"stop":"play" }}); break;
+    case "deck/repeat":  FT.apply({unit, state:{ repeat:!st.repeat }}); break;
+    case "deck/aps":     FT.apply({unit, state:{ aps:!st.aps }}); break;
+    case "deck/mscan":   FT.apply({unit, state:{ mscan:!st.mscan }}); break;
+    case "deck/bskip":   FT.apply({unit, state:{ bskip:!st.bskip }}); break;
+    case "deck/dolby":   FT.apply({unit, state:{ dolby:!st.dolby }}); break;
+
+    case "tuner/band":      FT.apply({unit, state:{ band: st.band==="FM"?"AM":"FM",
+                                                    freq: st.band==="FM"?1010:88.1 }}); break;
+    case "tuner/tune-up":   FT.apply({unit, state:{ freq: step(st,+1) }}); break;
+    case "tuner/tune-down": FT.apply({unit, state:{ freq: step(st,-1) }}); break;
+    case "tuner/seek":      FT.apply({unit, state:{ freq: step(st,+7), rssi:.4+Math.random()*.6 }}); break;
+    case "tuner/local":     FT.apply({unit, state:{ local:!st.local }}); break;
+    case "tuner/preset":    FT.apply({unit, state:{ preset:+value,
+                              freq:[88.1,91.5,94.7,98.3,101.9,106.7][+value-1] }}); break;
+
+    case "eq/defeat": FT.apply({unit, state:{ defeat:!st.defeat }}); break;
+    case "eq/flat":   FT.apply({unit, state:{ front:new Array(9).fill(0),
+                                              rear: new Array(9).fill(0) }}); break;
+
+    case "amp/power": FT.apply({unit, state:{ power:!st.power }}); break;
+
+    case "cd/play":   FT.apply({unit, state:{ transport: st.transport==="play"?"pause":"play",
+                                              track: st.track || 1,
+                                              title: st.track ? st.title : "Track 01",
+                                              artist: st.track ? st.artist : "Unknown disc" }}); break;
+    case "cd/stop":   FT.apply({unit, state:{ transport:"stop", seconds:0 }}); break;
+    case "cd/next":   { const t = Math.min(99,(st.track||0)+1);
+                        FT.apply({unit, state:{ track:t, seconds:0,
+                          title:"Track "+String(t).padStart(2,"0") }}); break; }
+    case "cd/prev":   { const t = Math.max(1,(st.track||1)-1);
+                        FT.apply({unit, state:{ track:t, seconds:0,
+                          title:"Track "+String(t).padStart(2,"0") }}); break; }
+    case "cd/repeat": FT.apply({unit, state:{ repeat:!st.repeat }}); break;
+    case "cd/random": FT.apply({unit, state:{ random:!st.random }}); break;
+
+    case "ctrl/vol-up":     FT.apply({unit, state:{ volume: clamp(st.volume+.07,0,1), att:false }}); break;
+    case "ctrl/vol-down":   FT.apply({unit, state:{ volume: clamp(st.volume-.07,0,1) }}); break;
+    case "ctrl/vol-mute":   FT.apply({unit, state:{ att:!st.att }}); break;
+    case "ctrl/att":        FT.apply({unit, state:{ att:!st.att }}); break;
+    case "ctrl/bass-up":    FT.apply({unit, state:{ bass:   clamp(st.bass+1,-2,2) }}); break;
+    case "ctrl/bass-down":  FT.apply({unit, state:{ bass:   clamp(st.bass-1,-2,2) }}); break;
+    case "ctrl/treble-up":  FT.apply({unit, state:{ treble: clamp(st.treble+1,-2,2) }}); break;
+    case "ctrl/treble-down":FT.apply({unit, state:{ treble: clamp(st.treble-1,-2,2) }}); break;
+    case "ctrl/ill":        FT.apply({unit, state:{ ill: st.ill==="green"?"orange":"green" }}); break;
+  }
+});
+
+function step(st, n){
+  if (st.band === "FM") return Math.round((((st.freq - 87.5 + n*.2 + 20.5) % 20.5) + 87.5) * 10) / 10;
+  return 530 + ((st.freq - 530 + n*10 + 1180) % 1180);
+}
+
+/* meters idle until something is actually rolling */
+let phase = 0;
+setInterval(() => {
+  const amp  = FT.units.amp;
+  const deck = FT.units.deck.state.transport === "play";
+  const cd   = FT.units.cd.state.transport === "play";
+  const live = amp.state.power && (deck || cd);
+  phase += .35;
+  amp.state.levels = BANDS.map((_, i) =>
+    live ? Math.max(0,(Math.sin(phase + i*.9)*.3 + .45 + Math.random()*.3) * (1 - i*.05)) : 0);
+  amp.render();
+  if (cd){ FT.units.cd.state.seconds += .12; FT.units.cd.render(); }
+  if (deck){ FT.units.deck.state.counter += .04; }
+}, 120);
+
+Object.values(FT.units).forEach(u => u.render());
+console.log("%cFujitsu Ten panel ready — try FT.apply({unit:'tuner',state:{freq:101.9}})",
+            "color:#ffc21f");
+</script>
+</body>
+</html>
