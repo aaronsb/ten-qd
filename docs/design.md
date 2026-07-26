@@ -5,6 +5,24 @@ specification. It supplies the colours, the glyph vocabulary, the proportions
 of a bay, and the way a lit segment reads against an unlit one. It does not
 supply a parts list, and this build stopped treating it as one fairly early.
 
+## Why a character grid
+
+A terminal is not a compromise here, it is the medium the subject matter asks
+for. A vacuum-fluorescent display *is* a fixed grid of elements that are either
+lit or not, in one or two colours. So is a terminal.
+
+Every technique in this file follows from leaning into that rather than fighting
+it. Seven-segment digits are built from quadrant blocks because that is how the
+real thing is built — from a small number of fixed shapes, not from arbitrary
+curves. The ghost layer works because unlit-but-present is a state the medium
+can express natively. Meters are discrete dots because the ad's meters are
+discrete dots.
+
+The alternative — an HTML panel wrapped in Electron or Tauri — can draw a more
+detailed picture of a car stereo, and would be a picture. It would also cost a
+browser engine and a build pipeline to render a few hundred lit rectangles.
+This is a 5.9 MB binary that starts instantly and runs over SSH.
+
 ## Three layers
 
 The rule carried over from the HTML prototype: **retheme from the top layer

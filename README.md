@@ -21,13 +21,46 @@ What survived from the original design brief is the part worth keeping: **every
 lit thing on the panel is connected to something real.** No decorative meters,
 no indicator that is always on.
 
+## Why a terminal
+
+The first pass was an HTML page, and it worked. But shipping that as an
+application means Electron or Tauri — a browser engine, a build pipeline and a
+few hundred megabytes of runtime, to draw some lit rectangles.
+
+A character grid is the period-correct medium. Something built between the mid
+80s and the mid 90s would have had a fixed grid of cells, each either lit or
+not, and a small palette — which is *exactly* what a vacuum-fluorescent display
+is. So the constraint turns out to be generative rather than limiting:
+seven-segment digits assembled from quadrant blocks read more like a real VFD
+than a photorealistic render does, because they are made the same way. The
+[ghost segments](docs/design.md#the-ghost) are only convincing because the
+medium genuinely cannot do anything smoother.
+
+The practical version of the same argument: this is one 5.9 MB binary that
+starts instantly, uses no GPU, and works over SSH.
+
+## Building it
+
+Three system libraries beyond Rust itself — ALSA (cpal's Linux backend),
+librtlsdr (the tuner), and pkg-config to find them. `make deps` checks all of
+it and prints the install line for your package manager if anything is missing:
+
+```sh
+make deps      # check build and runtime dependencies
+make run       # build optimised and start the panel
+make help      # every target
+```
+
+Rust 1.85 or newer (edition 2024). `make check` runs clippy with warnings as
+errors, plus the tests.
+
 ## Running it
 
 ```sh
-cargo run --release                     # first album found under ~/Music
+make run                                # first album found under ~/Music
 cargo run --release -- /path/to/album   # a folder of audio files is a disc
-cargo run --release -- --screenshot     # render one frame to stdout and exit
-cargo run --release -- --radio-check    # sweep the FM band and report signal
+make screenshot                         # render one frame to stdout and exit
+make radio-check                        # sweep the FM band and report signal
 ```
 
 Wants a terminal at least **84 columns** wide and 24-bit colour, with a font
@@ -59,10 +92,9 @@ calendar cues a track. Press `?` in the app for the full key map.
 ### The radio
 
 Needs an RTL-SDR, and needs the DVB-T kernel driver out of the way — it claims
-the device on sight:
+the device on sight. `make deps` will tell you if it has:
 
 ```sh
-sudo pacman -S rtl-sdr                       # ships /usr/lib/modprobe.d/rtlsdr.conf
 sudo modprobe -r dvb_usb_rtl28xxu dvb_usb_v2 rtl2832
 rtl_test -t                                  # should name the tuner chip
 ```
