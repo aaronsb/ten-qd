@@ -125,13 +125,14 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     chassis::sublegend(buf, x, oy, "OUTPUT", theme, false);
     let name = stack.output.clone().unwrap_or_else(|| "system default".into());
     let name: String = name.chars().take(34).collect();
+    let name = format!("{name} ▸");
     buf.set_string(
         x + 8,
         oy,
         &name,
         Style::default().fg(theme.ink_white).bg(theme.chassis),
     );
-    hits.add_row(x, oy, 44, Command::NextOutput);
+    hits.add_row(x, oy, 44, Command::OutputsOpen);
 
     chassis::model_corner(buf, inner, &["CONTROL HEAD LT-581"], theme);
 }

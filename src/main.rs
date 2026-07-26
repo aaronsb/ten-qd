@@ -75,6 +75,9 @@ struct App {
     running: bool,
     hits: HitMap,
     browser: Browser,
+    /// The output picker, when open, and where its cursor sits.
+    outputs_open: bool,
+    outputs_cursor: usize,
     /// The null sink, while an adapter is inserted. Dropping it removes the
     /// sink, so the desktop never keeps a phantom audio device after we exit.
     adapter: Option<adapter::Adapter>,
@@ -130,6 +133,8 @@ impl App {
                 music_dir().unwrap_or_else(|| PathBuf::from("/")),
                 mem.browser.clone(),
             ),
+            outputs_open: false,
+            outputs_cursor: 0,
             adapter: None,
             mpris: mpris::Mpris::start(),
             streams: Vec::new(),
@@ -745,28 +750,45 @@ impl App {
                 self.publish(false);
             }
 
-            Command::NextOutput => {
-                if self.stack.outputs.is_empty() {
-                    self.stack.outputs = audio::output_devices();
-                }
-                if self.stack.outputs.is_empty() {
-                    self.status("no output devices offered");
-                    return;
-                }
-                let cur = self
+            Command::OutputsOpen => {
+                // Re-enumerate on open: devices come and go with a Bluetooth
+                // connection or a USB interface, and a stale list would offer
+                // something that is no longer there.
+                let list = audio::output_devices();
+                self.outputs_cursor = self
                     .stack
                     .output
                     .as_ref()
-                    .and_then(|o| self.stack.outputs.iter().position(|d| d == o));
-                let next = match cur {
-                    Some(i) => (i + 1) % self.stack.outputs.len(),
-                    None => 0,
-                };
-                let name = self.stack.outputs[next].clone();
+                    .and_then(|o| list.iter().position(|d| d == o))
+                    .unwrap_or(0);
+                self.stack.apply(Patch { outputs: Some(list), ..Default::default() });
+                self.outputs_open = true;
+            }
+            Command::OutputsClose => self.outputs_open = false,
+            Command::OutputsUp => {
+                let n = self.stack.outputs.len();
+                if n > 0 {
+                    self.outputs_cursor = (self.outputs_cursor + n - 1) % n;
+                }
+            }
+            Command::OutputsDown => {
+                let n = self.stack.outputs.len();
+                if n > 0 {
+                    self.outputs_cursor = (self.outputs_cursor + 1) % n;
+                }
+            }
+            Command::OutputsSelect(i) => {
+                // A click on the highlighted row chooses it; on any other row
+                // it moves the highlight there — the browser's rule.
+                if self.outputs_cursor != i {
+                    self.outputs_cursor = i;
+                    return;
+                }
+                let Some(name) = self.stack.outputs.get(i).cloned() else { return };
+                self.outputs_open = false;
                 self.stack.apply(Patch { output: Some(Some(name.clone())), ..Default::default() });
                 // Changing device means rebuilding the output stream, which
-                // this does not do live — the choice is remembered and taken
-                // on the next start. Saying so beats silently doing nothing.
+                // this does not do live. Saying so beats silently doing nothing.
                 self.status(format!("output: {name} — takes effect on restart"));
             }
 
@@ -1073,9 +1095,27 @@ impl App {
         self.dispatch(cmd);
     }
 
+    /// Keys while the output picker has focus. Modal, like the browser.
+    fn on_key_outputs(&mut self, k: KeyEvent) {
+        let cmd = match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('O') => Command::OutputsClose,
+            KeyCode::Up | KeyCode::Char('k') => Command::OutputsUp,
+            KeyCode::Down | KeyCode::Char('j') => Command::OutputsDown,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                Command::OutputsSelect(self.outputs_cursor)
+            }
+            _ => return,
+        };
+        self.dispatch(cmd);
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         if self.show_help {
             self.show_help = false;
+            return;
+        }
+        if self.outputs_open {
+            self.on_key_outputs(k);
             return;
         }
         if self.browser.open {
@@ -1172,7 +1212,7 @@ impl App {
             (KeyCode::Char('-'), _) => Some(Command::DimDown),
             (KeyCode::Char('='), _) | (KeyCode::Char('+'), _) => Some(Command::DimUp),
             (KeyCode::Char('w'), _) => Some(Command::AmpPower),
-            (KeyCode::Char('O'), _) => Some(Command::NextOutput),
+            (KeyCode::Char('O'), _) => Some(Command::OutputsOpen),
 
             // equaliser
             (KeyCode::Char('h'), _) => {
@@ -1237,9 +1277,12 @@ fn screenshot(app: &mut App, width: u16, height: u16) -> Result<()> {
     let mut hits = HitMap::new();
     term.draw(|f| {
         ui::draw(f, &app.stack, app.scroll, &mut hits);
+        let theme = ui::theme::Theme::for_stack(&app.stack);
         if app.browser.open {
-            let theme = ui::theme::Theme::for_stack(&app.stack);
             ui::overlay::draw_browser(f, &app.browser, &theme, &mut hits);
+        }
+        if app.outputs_open {
+            ui::overlay::draw_outputs(f, &app.stack, app.outputs_cursor, &theme, &mut hits);
         }
     })?;
 
@@ -1456,6 +1499,9 @@ fn main() -> Result<()> {
         if args.iter().any(|a| a == "--browser") {
             app.dispatch(Command::BrowserOpen);
         }
+        if args.iter().any(|a| a == "--outputs") {
+            app.dispatch(Command::OutputsOpen);
+        }
         if args.iter().any(|a| a == "--tuner-off") {
             app.dispatch(Command::TunerPower);
         }
@@ -1516,6 +1562,9 @@ fn run(
             let theme = ui::theme::Theme::for_stack(&app.stack);
             if app.browser.open {
                 ui::overlay::draw_browser(f, &app.browser, &theme, &mut hits);
+            }
+            if app.outputs_open {
+                ui::overlay::draw_outputs(f, &app.stack, app.outputs_cursor, &theme, &mut hits);
             }
             if app.show_help {
                 ui::overlay::draw_help(f, &theme);

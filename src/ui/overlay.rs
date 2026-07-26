@@ -11,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 
 use crate::browser::{Browser, Kind};
+use crate::state::Stack;
 use crate::state::Command;
 use crate::ui::hit::HitMap;
 use crate::ui::theme::Theme;
@@ -54,7 +55,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("r  z", "repeat · random"),
     ("v  y  a", "flip the tape · Dolby · auto-reverse"),
     ("A", "insert/eject the cassette adapter"),
-    ("1-9", "…with the adapter in: plug that stream through"),
+    ("1-9", "adapter in: plug that stream"),
     ("g  P", "tuner LOCAL · tuner power"),
     ("", ""),
     ("CONTROL HEAD", ""),
@@ -89,10 +90,13 @@ pub fn draw_help(f: &mut Frame, theme: &Theme) {
             Style::default().fg(theme.vfd).bg(theme.window).add_modifier(Modifier::BOLD)
         };
         f.buffer_mut().set_string(inner.x + 1, y, key, style);
+        // Clip to the panel rather than running off its right edge.
+        let room = inner.width.saturating_sub(15) as usize;
+        let desc: String = desc.chars().take(room).collect();
         f.buffer_mut().set_string(
             inner.x + 14,
             y,
-            desc,
+            &desc,
             Style::default().fg(theme.ink_grey).bg(theme.window),
         );
     }
@@ -193,4 +197,80 @@ pub fn draw_browser(f: &mut Frame, b: &Browser, theme: &Theme, hits: &mut HitMap
     };
     let footer: String = footer.chars().take(inner.width.saturating_sub(2) as usize).collect();
     f.buffer_mut().set_string(inner.x + 1, fy, &footer, style);
+}
+
+// ---------------------------------------------------------------------------
+// Output devices
+// ---------------------------------------------------------------------------
+
+/// The output picker, in the browser's clothes.
+///
+/// Same panel, same selection bar, same keys — because it is the same question
+/// in a different domain: pick one of these, that is where it goes. A control
+/// that opened a differently-shaped dialog would be teaching a second habit
+/// for no reason.
+pub fn draw_outputs(f: &mut Frame, stack: &Stack, cursor: usize, theme: &Theme, hits: &mut HitMap) {
+    let rows = stack.outputs.len().clamp(3, 14) as u16;
+    let area = centred(f, 66, rows + 6);
+    let inner = panel(f, area, "OUTPUT DEVICE", theme);
+    if inner.height < 4 {
+        return;
+    }
+
+    // Clipped to the panel: a caption that runs off the right edge is the
+    // same defect as the one the help box had.
+    let caption = "where the rack sends sound, not the system default";
+    let caption: String = caption.chars().take(inner.width.saturating_sub(2) as usize).collect();
+    f.buffer_mut().set_string(
+        inner.x + 1,
+        inner.y,
+        &caption,
+        Style::default().fg(theme.ink_grey).bg(theme.window),
+    );
+
+    let list_top = inner.y + 2;
+    let list_h = inner.height.saturating_sub(4);
+    let first = cursor
+        .saturating_sub(list_h.saturating_sub(1) as usize / 2)
+        .min(stack.outputs.len().saturating_sub(list_h as usize));
+
+    if stack.outputs.is_empty() {
+        f.buffer_mut().set_string(
+            inner.x + 2,
+            list_top,
+            "no output devices offered",
+            Style::default().fg(theme.ink_red).bg(theme.window),
+        );
+    }
+
+    for row in 0..list_h {
+        let idx = first + row as usize;
+        let Some(name) = stack.outputs.get(idx) else { break };
+        let y = list_top + row;
+        let selected = idx == cursor;
+        let current = stack.output.as_deref() == Some(name.as_str());
+
+        let style = if selected {
+            Style::default().fg(theme.window).bg(theme.vfd).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.ink_white).bg(theme.window)
+        };
+
+        let w = inner.width.saturating_sub(2) as usize;
+        f.buffer_mut().set_string(inner.x + 1, y, " ".repeat(w), style);
+        // A mark for the one in force, so the list says which is chosen rather
+        // than only which is highlighted.
+        f.buffer_mut().set_string(inner.x + 2, y, if current { "▪ " } else { "  " }, style);
+        let shown: String = name.chars().take(w.saturating_sub(5)).collect();
+        f.buffer_mut().set_string(inner.x + 4, y, &shown, style);
+
+        hits.add_row(inner.x + 1, y, inner.width.saturating_sub(2), Command::OutputsSelect(idx));
+    }
+
+    f.buffer_mut().set_string(
+        inner.x + 1,
+        inner.y + inner.height - 1,
+        "↑↓ move · ⏎ choose · esc close · applies on restart",
+        Style::default().fg(theme.ink_legend).bg(theme.window),
+    );
 }

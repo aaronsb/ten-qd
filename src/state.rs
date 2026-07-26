@@ -170,8 +170,13 @@ pub enum Command {
     Treble(i8),
     Fader(f32),
     Ill,
-    /// Step to the next output device the rack could drive.
-    NextOutput,
+    /// Open the output-device picker.
+    OutputsOpen,
+    OutputsClose,
+    OutputsUp,
+    OutputsDown,
+    /// Choose the n-th listed device.
+    OutputsSelect(usize),
     /// Instrument dimmer, the way the dash rheostat works: one step per press.
     DimUp,
     DimDown,
