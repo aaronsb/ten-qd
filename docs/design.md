@@ -1,11 +1,9 @@
 # The panel language
 
-![The 1986 advertisement this started from](img/fujitsu-ten-ad-1986.jpeg)
-
-The advertisement is the design language, not a specification. It supplies the
-colours, the glyph vocabulary, the proportions of a bay, and the way a lit
-segment reads against an unlit one. It does not supply a parts list, and this
-build stopped treating it as one fairly early.
+The [1986 Fujitsu Ten advertisement](the-ad.md) is the design language, not a
+specification. It supplies the colours, the glyph vocabulary, the proportions
+of a bay, and the way a lit segment reads against an unlit one. It does not
+supply a parts list, and this build stopped treating it as one fairly early.
 
 ## Three layers
 

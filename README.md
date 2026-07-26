@@ -12,7 +12,7 @@ lights off a real 19 kHz pilot.
 **It is not a faithful reproduction of a Fujitsu Ten stack**, and stopped
 trying to be fairly early on. The advertisement that started it is the design
 language — the colours, the glyph vocabulary, the way a lit segment reads
-against an unlit one — not a specification. Where authenticity and a good
+against an unlit one — not a specification ([see the ad](docs/the-ad.md)). Where authenticity and a good
 instrument disagreed, the instrument won: the amp meters run vertically so they
 line up with the equaliser bands, and the QD-585 CD player is a unit Fujitsu
 Ten never built.
@@ -79,7 +79,7 @@ measured to make the meters honest.
 | [docs/audio.md](docs/audio.md) | the signal path, the DSP, and the clock the display runs on |
 | [docs/tuner.md](docs/tuner.md) | FM demodulation on an RTL-SDR, and calibrating it against the band |
 | [docs/design.md](docs/design.md) | the panel language: glyphs, colour, and what is invented |
-| [docs/img/](docs/img/) | the rack in both illumination colours, and the 1986 ad |
+| [docs/the-ad.md](docs/the-ad.md) | the 1986 advertisement this came from, and what was taken from it |
 | [docs/panel-reference.html](docs/panel-reference.html) | the original HTML prototype this was ported from |
 
 ## Layout
