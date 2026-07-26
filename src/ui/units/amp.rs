@@ -28,7 +28,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let amp = &stack.amp;
 
     let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 5);
-    chassis::lamp(buf, lamp, "LEVEL", theme, amp.power);
+    chassis::lamp(buf, lamp, "POWER", theme, amp.power);
     hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::AmpPower);
 
     chassis::legend(buf, inner.x, inner.y, "POWER AMP", theme);
@@ -79,10 +79,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
             .bg(theme.chassis)
             .add_modifier(Modifier::BOLD),
     );
-    chassis::badge(buf, rx, inner.y + 2, theme);
 
-    let r = chassis::KeyRow::new(rx, inner.y + 4).key(buf, 8, "POWER", theme, amp.power, true);
-    hits.add(r.x, r.y, r.width, r.height, Command::AmpPower);
+    // The power switch lives on the spine with every other unit's, so this
+    // corner keeps only what it can report: whether the amplifier is passing
+    // anything. A second POWER key beside the first was two controls for one
+    // relay.
+    chassis::sublegend(buf, rx, inner.y + 4, "LEVEL", theme, false);
     chassis::sublegend(
         buf,
         rx + 10,

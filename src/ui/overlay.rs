@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 
 use crate::browser::{Browser, Kind};
-use crate::state::Stack;
+use crate::state::{Stack, Unit};
 use crate::state::Command;
 use crate::ui::hit::HitMap;
 use crate::ui::theme::Theme;
@@ -43,7 +43,7 @@ fn panel(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -> Rect {
 
 pub const HELP: &[(&str, &str)] = &[
     ("SOURCE", ""),
-    ("c  t  u", "compact disc · cassette · tuner"),
+    ("c  t  u  a", "compact disc · cassette · tuner · aux"),
     ("o", "open the disc/tape browser"),
     ("", ""),
     ("TRANSPORT", "(acts on the selected source)"),
@@ -53,10 +53,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("! @ # $ % ^", "store the current station as a preset"),
     ("e", "eject"),
     ("r  z", "repeat · random"),
-    ("v  y  a", "flip the tape · Dolby · auto-reverse"),
-    ("A", "insert/eject the cassette adapter"),
-    ("1-9", "adapter in: plug that stream"),
+    ("v  y  b", "flip the tape · Dolby · auto-reverse"),
     ("g  P", "tuner LOCAL · tuner power"),
+    ("A", "aux: pick what to send through the rack"),
+    ("1-9", "aux: plug that stream in"),
     ("", ""),
     ("CONTROL HEAD", ""),
     ("↑ ↓  m", "volume · attenuator"),
@@ -66,16 +66,33 @@ pub const HELP: &[(&str, &str)] = &[
     ("-  =", "instrument dimmer, down and up"),
     ("O", "output device the rack drives"),
     ("", ""),
+    ("THE RACK", "(a folded or removed unit still plays)"),
+    ("~", "arrange the rack — order, and what is in it"),
+    ("click POWER", "take a unit out of the signal path, or back"),
+    ("C T U X", "fold away: CD · cassette · tuner · aux"),
+    ("E W H", "fold away: equaliser · amplifier · control head"),
+    ("", ""),
     ("EQUALISER", ""),
     ("h l  j k", "select band · cut/boost"),
     ("f  d  0", "front/rear bank · defeat · flat"),
+    ("{ }", "output trim — cut/boost, ±12 dB"),
     ("", ""),
     ("click", "any control · wheel scrolls the rack"),
     ("q", "quit"),
 ];
 
+/// Width the key map needs in order to print every description in full.
+fn help_width() -> u16 {
+    let widest = HELP.iter().map(|(_, d)| d.chars().count()).max().unwrap_or(0) as u16;
+    (widest + 17).max(52)
+}
+
 pub fn draw_help(f: &mut Frame, theme: &Theme) {
-    let area = centred(f, 52, HELP.len() as u16 + 2);
+    // Sized from the table rather than pinned to a number, so a binding with a
+    // longer description widens the panel instead of being quietly beheaded.
+    // 14 is where the description column starts, plus a border and a margin
+    // either side.
+    let area = centred(f, help_width(), HELP.len() as u16 + 2);
     let inner = panel(f, area, "PANEL CONTROLS", theme);
 
     for (i, (key, desc)) in HELP.iter().enumerate() {
@@ -100,6 +117,170 @@ pub fn draw_help(f: &mut Frame, theme: &Theme) {
             Style::default().fg(theme.ink_grey).bg(theme.window),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The aux source picker
+// ---------------------------------------------------------------------------
+
+/// What is playing on this machine, and could be sent through the rack.
+///
+/// This replaced pressing a number at the cassette bay. Numbering things the
+/// operator has to count is fine when the list is the disc's own tracks and
+/// fixed; it is a poor way to choose between "Chromium" and "Spotify", which
+/// come and go while you are looking at them.
+pub fn draw_aux(
+    f: &mut Frame,
+    streams: &[crate::adapter::Stream],
+    cursor: usize,
+    theme: &Theme,
+    hits: &mut HitMap,
+) {
+    let rows = streams.len().clamp(3, 14) as u16;
+    let area = centred(f, 66, rows + 6);
+    let inner = panel(f, area, "AUX SOURCE", theme);
+    if inner.height < 4 {
+        return;
+    }
+
+    let caption = "what is playing — pick one to send through the rack";
+    let caption: String = caption.chars().take(inner.width.saturating_sub(2) as usize).collect();
+    f.buffer_mut().set_string(
+        inner.x + 1,
+        inner.y,
+        &caption,
+        Style::default().fg(theme.ink_grey).bg(theme.window),
+    );
+
+    let list_top = inner.y + 2;
+    let list_h = inner.height.saturating_sub(4);
+
+    if streams.is_empty() {
+        // Not an error: nothing is playing, which is a perfectly ordinary
+        // state and has an obvious remedy.
+        f.buffer_mut().set_string(
+            inner.x + 2,
+            list_top,
+            "nothing is playing",
+            Style::default().fg(theme.ink_grey).bg(theme.window),
+        );
+        f.buffer_mut().set_string(
+            inner.x + 2,
+            list_top + 1,
+            format!("or choose \"{}\" in the player itself", crate::adapter::DESCRIPTION),
+            Style::default().fg(theme.ink_grey).bg(theme.window).add_modifier(Modifier::DIM),
+        );
+    }
+
+    for row in 0..list_h {
+        let idx = row as usize;
+        let Some(stream) = streams.get(idx) else { break };
+        let y = list_top + row;
+        let selected = idx == cursor;
+
+        let style = if selected {
+            Style::default().fg(theme.window).bg(theme.vfd).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.ink_white).bg(theme.window)
+        };
+
+        let w = inner.width.saturating_sub(2) as usize;
+        f.buffer_mut().set_string(inner.x + 1, y, " ".repeat(w), style);
+        let label: String = stream.label().chars().take(w.saturating_sub(4)).collect();
+        f.buffer_mut().set_string(inner.x + 2, y, &label, style);
+        hits.add_row(inner.x + 1, y, inner.width.saturating_sub(2), Command::AuxSelect(idx));
+    }
+
+    f.buffer_mut().set_string(
+        inner.x + 1,
+        inner.y + inner.height - 1,
+        "↑↓ move · ⏎ choose · esc close",
+        Style::default().fg(theme.ink_legend).bg(theme.window),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The rack arranger
+// ---------------------------------------------------------------------------
+
+/// Which boxes are in the cabinet, and in what order.
+///
+/// Nothing here touches the audio: a unit taken out still plays, still answers
+/// its keys, and still lights its lamp. This is a cabinet, not a signal path —
+/// which is why the footer says "out of the rack" rather than "off".
+pub fn draw_layout(f: &mut Frame, stack: &Stack, cursor: usize, grabbed: bool, theme: &Theme) {
+    const HINT: &str = "↑↓ move · space carry · enter in/out · r reset · esc done";
+    let w = HINT.chars().count() as u16 + 4;
+    let area = centred(f, w, Unit::ALL.len() as u16 + 6);
+    let inner = panel(f, area, "ARRANGE THE RACK", theme);
+    if inner.height < 4 {
+        return;
+    }
+
+    f.buffer_mut().set_string(
+        inner.x + 1,
+        inner.y,
+        "a unit taken out still plays — it is only out of sight",
+        Style::default().fg(theme.ink_grey).bg(theme.window).add_modifier(Modifier::DIM),
+    );
+
+    for (i, u) in stack.layout.order.iter().enumerate() {
+        let y = inner.y + 2 + i as u16;
+        if y + 2 >= inner.y + inner.height {
+            break;
+        }
+        let here = i == cursor;
+        let shown = !stack.layout.is_hidden(*u);
+
+        let style = if here && grabbed {
+            Style::default().fg(theme.window).bg(theme.led_a).add_modifier(Modifier::BOLD)
+        } else if here {
+            Style::default().fg(theme.window).bg(theme.vfd).add_modifier(Modifier::BOLD)
+        } else if shown {
+            Style::default().fg(theme.ink_white).bg(theme.window)
+        } else {
+            Style::default().fg(theme.ink_grey).bg(theme.window).add_modifier(Modifier::DIM)
+        };
+
+        let row_w = inner.width.saturating_sub(2) as usize;
+        f.buffer_mut().set_string(inner.x + 1, y, " ".repeat(row_w), style);
+
+        // Carrying a unit is shown by the grip, not only by the highlight, so
+        // the mode is legible in a screenshot as well as in motion.
+        let grip = if here && grabbed { "⇕" } else if here { "▸" } else { " " };
+        f.buffer_mut().set_string(inner.x + 1, y, grip, style);
+
+        // In the rack or out of it, said the same way the rack itself says it:
+        // a lamp that is lit or a lamp that is not. Strikethrough would have
+        // been the obvious alternative and is not reliably drawn by terminals.
+        let lamp = if shown { "●" } else { "·" };
+        let lamp_style = if here {
+            style
+        } else {
+            Style::default().fg(if shown { theme.led_a } else { theme.led_off }).bg(theme.window)
+        };
+        f.buffer_mut().set_string(inner.x + 3, y, lamp, lamp_style);
+        f.buffer_mut().set_string(inner.x + 5, y, u.label(), style);
+
+        let note = if !shown {
+            "out of the rack"
+        } else if stack.layout.is_collapsed(*u) {
+            "folded"
+        } else {
+            ""
+        };
+        if !note.is_empty() {
+            let nx = inner.x + inner.width.saturating_sub(note.len() as u16 + 2);
+            f.buffer_mut().set_string(nx, y, note, style);
+        }
+    }
+
+    f.buffer_mut().set_string(
+        inner.x + 1,
+        inner.y + inner.height - 1,
+        HINT,
+        Style::default().fg(theme.ink_legend).bg(theme.window),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -273,4 +454,33 @@ pub fn draw_outputs(f: &mut Frame, stack: &Stack, cursor: usize, theme: &Theme, 
         "↑↓ move · ⏎ choose · esc close",
         Style::default().fg(theme.ink_legend).bg(theme.window),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key map is the one place a user goes when they do not know what a
+    /// control does, so a description that runs off the edge is worse there
+    /// than anywhere else on the panel.
+    #[test]
+    fn every_binding_prints_its_description_in_full() {
+        let inner = help_width() - 2;
+        let room = inner.saturating_sub(15) as usize;
+        for (key, desc) in HELP {
+            assert!(
+                desc.chars().count() <= room,
+                "\"{desc}\" needs {} of {room} columns (key {key:?})",
+                desc.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn keys_do_not_collide_with_their_descriptions() {
+        // Keys start at inner.x + 1, descriptions at inner.x + 14.
+        for (key, _) in HELP {
+            assert!(key.chars().count() < 13, "key {key:?} would reach the description");
+        }
+    }
 }

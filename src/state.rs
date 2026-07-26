@@ -50,6 +50,10 @@ pub enum SourceKind {
     Cd,
     Tape,
     Tuner,
+    /// Whatever is coming in over the cable. A source in its own right, not a
+    /// tape that is pretending — which is what it was, and what made the
+    /// deck's counter, sides and reels all mean nothing at once.
+    Aux,
 }
 
 impl SourceKind {
@@ -58,6 +62,7 @@ impl SourceKind {
             SourceKind::Cd => "CD",
             SourceKind::Tape => "TAPE",
             SourceKind::Tuner => "TUNER",
+            SourceKind::Aux => "AUX",
         }
     }
 }
@@ -114,10 +119,20 @@ pub enum Command {
     TapeEject,
     TapeDolby,
     TapeAutoReverse,
-    /// Insert the cassette adapter — create the sink and start listening.
-    TapeInsertAdapter,
-    /// Plug the n-th listed stream into the adapter.
-    TapePlugStream(usize),
+
+    // QA-581 auxiliary input — the cable, and whatever is on the end of it
+    /// Open the picker listing what is playing and could be plugged in.
+    AuxOpen,
+    AuxClose,
+    AuxUp,
+    AuxDown,
+    /// Plug the n-th listed stream in.
+    AuxSelect(usize),
+    /// Transport, sent to the plugged-in player over MPRIS.
+    AuxPlayPause,
+    AuxStop,
+    AuxNext,
+    AuxPrev,
 
     // LT-581 tuner
     TunerBand,
@@ -155,9 +170,17 @@ pub enum Command {
     // QM-571 power amplifier
     AmpPower,
 
+    /// Take a unit out of the signal path, or put it back. Not the same as
+    /// hiding it: a hidden unit still plays, a powered-down one does not.
+    UnitPower(Unit),
+
     // control head
     VolUp,
     VolDown,
+    /// The equaliser's output trim — makeup for a quiet source, or somewhere
+    /// to put the level back after boosting nine bands.
+    GainUp,
+    GainDown,
     /// Absolute volume, 0..=1. The keyboard nudges; the mouse points at a spot
     /// on the bar and means it.
     Volume(f32),
@@ -181,7 +204,75 @@ pub enum Command {
     DimUp,
     DimDown,
 
+    /// Fold a unit's faceplate down to its bar, or open it again.
+    UnitCollapse(Unit),
+
+    // Arranging the rack. None of this reaches the engine — a unit that is
+    // hidden or folded shut still plays.
+    LayoutOpen,
+    LayoutClose,
+    LayoutUp,
+    LayoutDown,
+    /// Take hold of the highlighted unit so the arrows carry it, or let go.
+    LayoutGrab,
+    /// Take the highlighted unit out of the rack, or put it back.
+    LayoutToggle,
+    /// Back to the factory arrangement: everything in, in signal order.
+    LayoutReset,
+
     Quit,
+}
+
+impl Command {
+    /// Which unit this command operates, if any.
+    ///
+    /// Drives the activity lamp on each unit's bar. It has to be exhaustive
+    /// rather than a best guess: the whole point of the lamp is that a unit
+    /// folded shut — or taken out of the rack entirely — still shows that it
+    /// heard you.
+    pub fn unit(&self) -> Option<Unit> {
+        use Command::*;
+        Some(match self {
+            CdPlayPause | CdStop | CdPrev | CdNext | CdTrack(_) | CdEject | CdRepeat
+            | CdRandom | BrowserLoadDisc => Unit::Cd,
+
+            TapePlayPause | TapeStop | TapeApsNext | TapeApsPrev | TapeRew | TapeFf
+            | TapeFlip | TapeEject | TapeDolby | TapeAutoReverse
+            | BrowserLoadTape => Unit::Tape,
+
+            TunerBand | TunerSeekUp | TunerSeekDown | TunerStepUp | TunerStepDown
+            | TunerPreset(_) | TunerStorePreset(_) | TunerLocal | TunerPower => Unit::Tuner,
+
+            Source(kind) => match kind {
+                SourceKind::Cd => Unit::Cd,
+                SourceKind::Tape => Unit::Tape,
+                SourceKind::Tuner => Unit::Tuner,
+                SourceKind::Aux => Unit::Aux,
+            },
+
+            AuxOpen | AuxClose | AuxUp | AuxDown | AuxSelect(_) | AuxPlayPause | AuxStop
+            | AuxNext | AuxPrev => Unit::Aux,
+
+            EqBand { .. } | EqSelect { .. } | EqDefeat | EqFlat => Unit::Eq,
+
+            AmpPower => Unit::Amp,
+            UnitPower(u) => *u,
+
+            VolUp | VolDown | GainUp | GainDown | Volume(_) | Att | BassUp | BassDown
+            | Bass(_) | TrebleUp | TrebleDown | Treble(_) | Fader(_) | Ill | DimUp
+            | DimDown | OutputsOpen | OutputsClose | OutputsUp | OutputsDown
+            | OutputsSelect(_) => Unit::Ctrl,
+
+            // Opening a browser, arranging the rack, or quitting is not an
+            // operation on any one box.
+            BrowserOpen | BrowserClose | BrowserUp | BrowserDown | BrowserEnter
+            | BrowserParent | BrowserSelect(_) | Quit => return None,
+
+            UnitCollapse(u) => *u,
+            LayoutOpen | LayoutClose | LayoutUp | LayoutDown | LayoutGrab | LayoutToggle
+            | LayoutReset => return None,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +308,9 @@ impl Disc {
 
 #[derive(Clone, Debug)]
 pub struct CdState {
+    /// Out of the signal path when false. Distinct from the arranger's
+    /// hidden/shown, which is only about what you are looking at.
+    pub power: bool,
     pub transport: Transport,
     /// 1-based, as printed on the display. 0 means no track cued.
     pub track: usize,
@@ -230,6 +324,7 @@ pub struct CdState {
 impl Default for CdState {
     fn default() -> Self {
         CdState {
+            power: true,
             transport: Transport::Stop,
             track: 0,
             elapsed: 0.0,
@@ -296,6 +391,7 @@ impl Tape {
 
 #[derive(Clone, Debug)]
 pub struct TapeState {
+    pub power: bool,
     pub transport: Transport,
     pub side: Side,
     /// Index into `tape.tracks`, absolute across both sides.
@@ -306,30 +402,54 @@ pub struct TapeState {
     pub dolby: bool,
     pub auto_reverse: bool,
     pub tape: Option<Tape>,
-    /// An adapter in the deck: the tape-shaped shell with a wire, carrying
-    /// whatever is plugged into the other end. There is no tape to index, so
-    /// most of the deck's readouts stop meaning anything — which is exactly
-    /// what a real adapter did to a real deck.
-    pub adapter: Option<AdapterTape>,
 }
 
 /// What is on the other end of the cable.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AdapterTape {
+pub struct AuxState {
     /// The stream plugged in, if one has been chosen.
     pub source: Option<String>,
     /// The MPRIS player driving it, if one was found.
     pub player: Option<String>,
-    /// Metadata the player reports. A real adapter had none of this.
+    /// Metadata the player reports. A cable carries none of this; MPRIS does.
     pub title: String,
     pub artist: String,
     /// Whether audio is actually arriving over the cable.
     pub live: bool,
 }
 
+impl AuxState {
+    /// Whether the thing on the other end says it is playing. A cable cannot
+    /// know this; MPRIS can, which is the one place this beats the real object.
+    pub fn playing(&self) -> bool {
+        self.player.is_some() && self.live
+    }
+}
+
+/// The auxiliary input, as the panel shows it.
+///
+/// Level lives outside [`AuxState`] for the same reason the tuner's RSSI lives
+/// outside its presets: it changes every frame, and `AuxState` is compared for
+/// equality to decide whether anything actually changed.
+#[derive(Clone, Debug)]
+pub struct Aux {
+    pub power: bool,
+    pub state: AuxState,
+    /// Peak level arriving on the cable, 0.0–1.0, measured before the
+    /// equaliser touches it.
+    pub input: f32,
+}
+
+impl Default for Aux {
+    fn default() -> Self {
+        Aux { power: true, state: AuxState::default(), input: 0.0 }
+    }
+}
+
 impl Default for TapeState {
     fn default() -> Self {
         TapeState {
+            power: true,
             transport: Transport::Stop,
             side: Side::A,
             index: 0,
@@ -337,7 +457,6 @@ impl Default for TapeState {
             dolby: true,
             auto_reverse: true,
             tape: None,
-            adapter: None,
         }
     }
 }
@@ -437,6 +556,9 @@ impl Default for AmpState {
 pub struct CtrlState {
     pub volume: f32,
     pub att: bool,
+    /// GAIN: the equaliser's output trim in whole dB, ±GAIN_LIMIT_DB. Separate
+    /// from volume so the dial keeps meaning what it meant.
+    pub gain_db: i8,
     /// Tone steps run -2 ..= +2, as on the panel's five-tick X display.
     pub bass: i8,
     pub treble: i8,
@@ -453,6 +575,7 @@ impl Default for CtrlState {
         CtrlState {
             volume: 0.55,
             att: false,
+            gain_db: 0,
             bass: 0,
             treble: 0,
             fader: 0.5,
@@ -462,23 +585,201 @@ impl Default for CtrlState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The stack itself — which units, in what order, and how tall
+// ---------------------------------------------------------------------------
+
+/// A component in the rack.
+///
+/// The stack is a stack of *separates*, so which boxes are in it, and in what
+/// order, is the operator's business rather than the program's. Hiding a unit
+/// only takes its faceplate out of the rack; its transport, its keys and its
+/// place in the signal path are untouched, exactly as pulling a box out of a
+/// hi-fi cabinet would not be an option on a real one — which is the one place
+/// this improves on the object it imitates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unit {
+    Cd,
+    Tape,
+    Tuner,
+    Aux,
+    Eq,
+    Amp,
+    Ctrl,
+}
+
+impl Unit {
+    /// Every unit, in the order signal travels through the rack. This is the
+    /// factory arrangement `r` resets to.
+    pub const ALL: [Unit; 7] = [
+        Unit::Cd,
+        Unit::Tape,
+        Unit::Tuner,
+        Unit::Aux,
+        Unit::Eq,
+        Unit::Amp,
+        Unit::Ctrl,
+    ];
+
+    pub fn index(self) -> usize {
+        Unit::ALL.iter().position(|u| *u == self).unwrap_or(0)
+    }
+
+    /// The type plate, as printed on the faceplate's bottom-right corner.
+    pub fn plate(self) -> &'static str {
+        match self {
+            Unit::Cd => "COMPACT DISC PLAYER QD-585",
+            Unit::Tape => "STEREO CASSETTE DECK QD-581",
+            Unit::Tuner => "AM/FM STEREO TUNER LT-581",
+            Unit::Aux => "AUXILIARY INPUT QA-581",
+            Unit::Eq => "GRAPHIC EQUALIZER QE-581",
+            Unit::Amp => "POWER AMPLIFIER QM-571",
+            Unit::Ctrl => "CONTROL HEAD LT-581",
+        }
+    }
+
+    /// What the layout menu calls it — short enough to scan down a column.
+    pub fn label(self) -> &'static str {
+        match self {
+            Unit::Cd => "COMPACT DISC",
+            Unit::Tape => "CASSETTE",
+            Unit::Tuner => "TUNER",
+            Unit::Aux => "AUX INPUT",
+            Unit::Eq => "GRAPHIC EQ",
+            Unit::Amp => "POWER AMP",
+            Unit::Ctrl => "CONTROL HEAD",
+        }
+    }
+
+    /// The token used in the memory file, so the layout can be edited by hand.
+    pub fn token(self) -> &'static str {
+        match self {
+            Unit::Cd => "cd",
+            Unit::Tape => "tape",
+            Unit::Tuner => "tuner",
+            Unit::Aux => "aux",
+            Unit::Eq => "eq",
+            Unit::Amp => "amp",
+            Unit::Ctrl => "ctrl",
+        }
+    }
+
+    pub fn from_token(s: &str) -> Option<Unit> {
+        Unit::ALL.into_iter().find(|u| u.token() == s)
+    }
+
+    /// The key that folds this unit away — the shifted form of whatever key
+    /// already operates it, where there is one.
+    pub fn collapse_key(self) -> char {
+        match self {
+            Unit::Cd => 'C',
+            Unit::Tape => 'T',
+            Unit::Tuner => 'U',
+            Unit::Aux => 'X',
+            Unit::Eq => 'E',
+            Unit::Amp => 'W',
+            Unit::Ctrl => 'H',
+        }
+    }
+}
+
+/// Which faceplates are in the rack, in what order, and which are folded shut.
+///
+/// Order is always a permutation of [`Unit::ALL`]; `hidden` and `collapsed` are
+/// indexed by [`Unit::index`]. Nothing here reaches the audio engine — this is
+/// entirely about what the operator is looking at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub order: [Unit; 7],
+    pub hidden: [bool; 7],
+    pub collapsed: [bool; 7],
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Layout { order: Unit::ALL, hidden: [false; 7], collapsed: [false; 7] }
+    }
+}
+
+impl Layout {
+    pub fn is_hidden(&self, u: Unit) -> bool {
+        self.hidden[u.index()]
+    }
+
+    pub fn is_collapsed(&self, u: Unit) -> bool {
+        self.collapsed[u.index()]
+    }
+
+    /// Move the unit at `from` one place up or down, carrying it with the
+    /// cursor. Returns where it ended up.
+    pub fn bubble(&mut self, from: usize, down: bool) -> usize {
+        let to = if down {
+            (from + 1).min(self.order.len() - 1)
+        } else {
+            from.saturating_sub(1)
+        };
+        self.order.swap(from, to);
+        to
+    }
+
+    /// Repair anything a hand-edited memory file got wrong: every unit appears
+    /// exactly once, whatever the file said.
+    ///
+    /// A unit the file never mentions is put back where the factory had it,
+    /// not appended. That matters when a *new* unit appears in a later
+    /// version: every saved arrangement predates it, and dropping it at the
+    /// bottom of everyone's rack would be a worse default than the order it
+    /// was designed into. This is how AUX arrived above the equaliser rather
+    /// than below the control head.
+    pub fn sanitise(&mut self) {
+        let mut seen = [false; 7];
+        let mut fixed: Vec<Unit> = Vec::with_capacity(7);
+        for u in self.order {
+            if !seen[u.index()] {
+                seen[u.index()] = true;
+                fixed.push(u);
+            }
+        }
+        for u in Unit::ALL {
+            if seen[u.index()] {
+                continue;
+            }
+            // Ahead of the first unit the factory put after it, so the new
+            // arrival lands among its neighbours however the rest was moved.
+            let at = fixed.iter().position(|p| p.index() > u.index()).unwrap_or(fixed.len());
+            fixed.insert(at, u);
+        }
+        for (slot, u) in self.order.iter_mut().zip(fixed) {
+            *slot = u;
+        }
+    }
+}
+
+
 #[derive(Clone, Debug, Default)]
 pub struct Stack {
     pub source: SourceKind,
     pub cd: CdState,
     pub tape: TapeState,
     pub tuner: TunerState,
+    pub aux: Aux,
     pub eq: EqState,
     pub amp: AmpState,
     pub ctrl: CtrlState,
     /// The output device the rack drives, by name. `None` follows the system
-    /// default, which is only safe while the default is not the adapter.
+    /// default, which is only safe while the default is not our own input.
     pub output: Option<String>,
     /// Every output device offered, for cycling.
     pub outputs: Vec<String>,
     /// Last line of the colophon — what the engine last reported. Errors land
     /// here rather than being swallowed.
     pub status: String,
+    /// Which faceplates are in the rack and how they are arranged.
+    pub layout: Layout,
+    /// Frames of activity lamp left to burn, per unit. Set when a command for
+    /// that unit is dispatched and counted down by the render loop, so an
+    /// action on a folded-away or hidden unit still shows on its bar.
+    pub blink: [u8; 7],
 }
 
 // ---------------------------------------------------------------------------
@@ -505,8 +806,13 @@ pub struct Patch {
     pub tape_counter: Option<f64>,
     pub tape_dolby: Option<bool>,
     pub tape_auto_reverse: Option<bool>,
+    pub cd_power: Option<bool>,
+    pub tape_power: Option<bool>,
+    pub aux_power: Option<bool>,
+
     pub tape: Option<Option<Tape>>,
-    pub adapter: Option<Option<AdapterTape>>,
+    pub aux: Option<AuxState>,
+    pub aux_input: Option<f32>,
 
     pub tuner_freq: Option<f64>,
     pub tuner_stereo: Option<bool>,
@@ -527,6 +833,7 @@ pub struct Patch {
 
     pub volume: Option<f32>,
     pub att: Option<bool>,
+    pub gain_db: Option<i8>,
     pub bass: Option<i8>,
     pub treble: Option<i8>,
     pub fader: Option<f32>,
@@ -585,11 +892,23 @@ impl Stack {
         if let Some(v) = p.tape_auto_reverse {
             self.tape.auto_reverse = v;
         }
+        if let Some(v) = p.cd_power {
+            self.cd.power = v;
+        }
+        if let Some(v) = p.tape_power {
+            self.tape.power = v;
+        }
+        if let Some(v) = p.aux_power {
+            self.aux.power = v;
+        }
         if let Some(v) = p.tape {
             self.tape.tape = v;
         }
-        if let Some(v) = p.adapter {
-            self.tape.adapter = v;
+        if let Some(v) = p.aux {
+            self.aux.state = v;
+        }
+        if let Some(v) = p.aux_input {
+            self.aux.input = v;
         }
 
         if let Some(v) = p.tuner_freq {
@@ -647,6 +966,10 @@ impl Stack {
         if let Some(v) = p.volume {
             self.ctrl.volume = v;
         }
+        if let Some(v) = p.gain_db {
+            let l = crate::audio::dsp::GAIN_LIMIT_DB;
+            self.ctrl.gain_db = v.clamp(-l, l);
+        }
         if let Some(v) = p.att {
             self.ctrl.att = v;
         }
@@ -688,6 +1011,102 @@ mod tests {
             artist: "a".into(),
             seconds: sec,
         }
+    }
+
+    #[test]
+    fn every_unit_has_a_distinct_token_plate_and_fold_key() {
+        for a in Unit::ALL {
+            for b in Unit::ALL {
+                if a == b {
+                    continue;
+                }
+                assert_ne!(a.token(), b.token());
+                assert_ne!(a.plate(), b.plate());
+                assert_ne!(a.collapse_key(), b.collapse_key(), "{a:?} and {b:?} share a key");
+            }
+            assert_eq!(Unit::from_token(a.token()), Some(a));
+            assert!(a.collapse_key().is_ascii_uppercase(), "fold keys are the shifted forms");
+        }
+    }
+
+    #[test]
+    fn bubbling_carries_a_unit_and_stops_at_the_ends() {
+        let mut l = Layout::default();
+        assert_eq!(l.order[0], Unit::Cd);
+
+        let at = l.bubble(0, true);
+        assert_eq!(at, 1);
+        assert_eq!(l.order[0], Unit::Tape);
+        assert_eq!(l.order[1], Unit::Cd, "the cursor keeps hold of the unit");
+
+        // The top of the rack is the top of the rack.
+        let mut l = Layout::default();
+        assert_eq!(l.bubble(0, false), 0);
+        assert_eq!(l.order, Unit::ALL, "bubbling off the end must not reorder");
+        let last = Unit::ALL.len() - 1;
+        assert_eq!(l.bubble(last, true), last);
+        assert_eq!(l.order, Unit::ALL);
+    }
+
+    #[test]
+    fn a_hand_edited_order_is_repaired_rather_than_rejected() {
+        // Every way a person can get this wrong in a text file at once:
+        // duplicates, and units left out entirely.
+        let mut l = Layout {
+            order: [
+                Unit::Ctrl,
+                Unit::Ctrl,
+                Unit::Eq,
+                Unit::Ctrl,
+                Unit::Eq,
+                Unit::Amp,
+                Unit::Eq,
+            ],
+            ..Default::default()
+        };
+        l.sanitise();
+
+        for u in Unit::ALL {
+            assert_eq!(l.order.iter().filter(|x| **x == u).count(), 1, "{u:?} appears once");
+        }
+        // What the file did say is honoured, in the order it said it.
+        let said: Vec<Unit> =
+            l.order.iter().copied().filter(|u| matches!(u, Unit::Ctrl | Unit::Eq | Unit::Amp)).collect();
+        assert_eq!(said, vec![Unit::Ctrl, Unit::Eq, Unit::Amp]);
+    }
+
+    /// Every saved arrangement predates any unit added later. Appending it
+    /// would put a brand-new bay at the bottom of everyone's rack.
+    #[test]
+    fn a_unit_the_file_never_heard_of_lands_where_the_factory_put_it() {
+        let mut l = Layout::default();
+        // A file written before AUX existed: the other six, in factory order.
+        let old = [Unit::Cd, Unit::Tape, Unit::Tuner, Unit::Eq, Unit::Amp, Unit::Ctrl];
+        for (slot, u) in l.order.iter_mut().zip(old) {
+            *slot = u;
+        }
+        l.order[6] = Unit::Ctrl; // the untouched tail, as `Memory::layout` leaves it
+        l.sanitise();
+        assert_eq!(l.order, Unit::ALL, "a missing unit belongs in its own place");
+    }
+
+    #[test]
+    fn every_command_says_which_unit_it_operates() {
+        // The activity lamp is only honest if this is exhaustive, and the
+        // compiler cannot check that a match arm returns the *right* unit.
+        assert_eq!(Command::CdEject.unit(), Some(Unit::Cd));
+        assert_eq!(Command::AuxOpen.unit(), Some(Unit::Aux));
+        assert_eq!(Command::Source(SourceKind::Aux).unit(), Some(Unit::Aux));
+        assert_eq!(Command::TunerLocal.unit(), Some(Unit::Tuner));
+        assert_eq!(Command::EqFlat.unit(), Some(Unit::Eq));
+        assert_eq!(Command::AmpPower.unit(), Some(Unit::Amp));
+        assert_eq!(Command::GainUp.unit(), Some(Unit::Ctrl));
+        assert_eq!(Command::Source(SourceKind::Tuner).unit(), Some(Unit::Tuner));
+        // Loading from the browser is an operation on the machine you load.
+        assert_eq!(Command::BrowserLoadTape.unit(), Some(Unit::Tape));
+        // Arranging the cabinet is not an operation on any one box.
+        assert_eq!(Command::LayoutOpen.unit(), None);
+        assert_eq!(Command::Quit.unit(), None);
     }
 
     #[test]

@@ -311,6 +311,20 @@ pub fn model_corner(buf: &mut Buffer, inner: Rect, lines: &[&str], theme: &Theme
         }
         model(buf, inner.x + inner.width - w, top + i as u16, line, theme);
     }
+
+    // The maker's badge sits directly above the type plate, right-aligned to
+    // the same edge. Drawing it here rather than leaving each unit to place
+    // its own is what makes the rack read as one product line — and is why the
+    // equaliser and the control head, which never placed one, now have it.
+    let bw = badge_width();
+    if top > inner.y && bw <= inner.width {
+        badge(buf, inner.x + inner.width - bw, top - 1, theme);
+    }
+}
+
+/// Width of the maker's badge, mark included.
+pub fn badge_width() -> u16 {
+    2 + glyph::BADGE_TEXT.chars().count() as u16
 }
 
 /// A model-number legend, set in the small grey face type.
@@ -389,5 +403,60 @@ pub fn ramp_bar(buf: &mut Buffer, x: u16, y: u16, width: u16, level: f32, theme:
                 .fg(if lit { theme.led_a } else { theme.led_off })
                 .bg(theme.chassis),
         );
+    }
+}
+
+/// The strip that separates one component from the next, and doubles as the
+/// unit's own control.
+///
+/// ```text
+///   ━━[-][●]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+///   ━━[+][●]━━━━━━━━━━━━━━━[AM/FM STEREO TUNER LT-581]━━━━━━━━━
+/// ```
+///
+/// `[-]` folds the faceplate away, `[+]` brings it back. The type plate only
+/// appears on the folded form, because an open bay already carries it in the
+/// corner and printing it twice would read as two units.
+///
+/// The lamp beside it is an activity light: it burns whenever the unit is the
+/// live source, and flares on any command aimed at that unit — including when
+/// the unit is folded shut or out of the rack entirely, which is the whole
+/// reason it is here.
+pub fn seam_bar(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    collapsed: bool,
+    live: bool,
+    flare: bool,
+    plate: &str,
+) {
+    let seam = Style::default().fg(theme.seam).bg(theme.chassis);
+    let w = area.width as usize;
+    buf.set_style(area, Style::default().bg(theme.chassis));
+    buf.set_string(area.x, area.y, "━".repeat(w), seam);
+
+    let ink = Style::default().fg(theme.ink_legend).bg(theme.chassis);
+    let x = area.x + 2;
+    buf.set_string(x, area.y, if collapsed { "[+]" } else { "[-]" }, ink);
+
+    // A flare wins over the steady lamp, so operating a unit that was already
+    // lit still reads as an event.
+    let (dot, colour) = match (flare, live) {
+        (true, _) => ("●", theme.led_r),
+        (false, true) => ("●", theme.led_a),
+        (false, false) => ("·", theme.led_off),
+    };
+    buf.set_string(x + 3, area.y, "[", ink);
+    buf.set_string(x + 4, area.y, dot, Style::default().fg(colour).bg(theme.chassis));
+    buf.set_string(x + 5, area.y, "]", ink);
+
+    if !collapsed {
+        return;
+    }
+    let label = format!("[{plate}]");
+    let lw = label.chars().count() as u16;
+    if area.width > lw + 12 {
+        model(buf, area.x + area.width - lw - 2, area.y, &label, theme);
     }
 }
