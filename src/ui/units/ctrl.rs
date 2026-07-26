@@ -113,7 +113,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     hits.add(r.x, r.y, r.width, r.height, Command::Att);
     row.gap(2);
 
-    for kind in [SourceKind::Cd, SourceKind::Tape, SourceKind::Tuner] {
+    for kind in [SourceKind::Cd, SourceKind::Tape, SourceKind::Tuner, SourceKind::Aux] {
         let label = kind.label();
         let r = row.key(buf, label.len() as u16 + 2, label, theme, stack.source == kind, true);
         hits.add(r.x, r.y, r.width, r.height, Command::Source(kind));

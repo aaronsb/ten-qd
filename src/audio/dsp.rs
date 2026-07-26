@@ -128,6 +128,41 @@ const TREBLE_HZ: f32 = 8_000.0;
 /// ATT key actually applies.
 const ATT_GAIN: f32 = 0.2;
 
+/// How far the equaliser's output trim swings, either side of unity.
+///
+/// Volume alone can only ever attenuate: full travel is a gain of exactly 1.0,
+/// so a quiet source — a stream mastered low, an auxiliary input fed from
+/// something polite — has no way to reach the top of the dial. Above unity
+/// this is the makeup gain that fixes that.
+///
+/// It cuts as well, because an equaliser's output trim always did: boost nine
+/// bands and the thing you need next is somewhere to put the level back, not
+/// another way to raise it. Volume is where you left it; GAIN is what matches
+/// the curve to it.
+pub const GAIN_LIMIT_DB: i8 = 12;
+
+/// Where the soft clipper starts rounding the corners, as linear amplitude
+/// (-1.94 dBFS). Below this the chain is bit-exact; above it, samples are
+/// bent toward the rail instead of being allowed to wrap.
+const CLIP_KNEE: f32 = 0.8;
+
+/// Bend the tops of anything that overshoots, rather than letting it wrap.
+///
+/// A real head unit ran out of headroom in its power amplifier and got
+/// progressively less clean about it; digital arithmetic instead wraps or
+/// produces samples the device clamps square, which sounds far worse than the
+/// thing being imitated. Below the knee this is the identity function, so
+/// nothing that was not going to clip is altered at all.
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= CLIP_KNEE {
+        return x;
+    }
+    let over = (a - CLIP_KNEE) / (1.0 - CLIP_KNEE);
+    x.signum() * (CLIP_KNEE + (1.0 - CLIP_KNEE) * over.tanh())
+}
+
 /// Everything the callback needs to know, published as one immutable snapshot.
 /// The UI thread swaps a whole new one in; the audio thread never blocks.
 #[derive(Clone, Debug)]
@@ -141,6 +176,10 @@ pub struct DspParams {
     pub treble: i8,
     pub volume: f32,
     pub att: bool,
+    /// Equaliser output trim in whole dB, ±GAIN_LIMIT_DB. Applied on top of
+    /// volume, so the dial keeps its meaning and a quiet source can still
+    /// reach the top of it.
+    pub gain_db: i8,
     pub fader: f32,
     pub power: bool,
 }
@@ -157,6 +196,7 @@ impl Default for DspParams {
             treble: 0,
             volume: 0.55,
             att: false,
+            gain_db: 0,
             fader: 0.5,
             power: true,
         }
@@ -171,7 +211,8 @@ impl DspParams {
             return 0.0;
         }
         let v = self.volume.clamp(0.0, 1.0).powf(2.2);
-        v * if self.att { ATT_GAIN } else { 1.0 }
+        let trim = 10f32.powf(self.gain_db.clamp(-GAIN_LIMIT_DB, GAIN_LIMIT_DB) as f32 / 20.0);
+        v * trim * if self.att { ATT_GAIN } else { 1.0 }
     }
 
     /// Equal-power crossfade between the two buses, so moving the fader does
@@ -229,15 +270,20 @@ impl DspChain {
     /// Adopt new parameters. Cheap when the generation has not moved, which is
     /// the common case — coefficients are only recomputed when a control moved.
     pub fn sync(&mut self, p: &DspParams) {
-        if p.generation != self.params.generation {
-            self.params = p.clone();
+        // Always take the whole snapshot; the generation decides only whether
+        // the *coefficients* need recomputing.
+        //
+        // This used to copy a hand-written list of "continuous" fields in the
+        // unchanged-generation case, which meant every new continuous control
+        // had to remember to join the list. `gain_db` did not, and the result
+        // was a trim that appeared to do nothing until some unrelated control
+        // — DEFEAT, in practice — bumped the generation, at which point it
+        // applied all at once. A list you must remember to extend is a bug
+        // waiting for the next control; copying the struct cannot forget.
+        let retune = p.generation != self.params.generation;
+        self.params = p.clone();
+        if retune {
             self.retune();
-        } else {
-            // Gain and fader are continuous, not filter state — always fresh.
-            self.params.volume = p.volume;
-            self.params.att = p.att;
-            self.params.fader = p.fader;
-            self.params.power = p.power;
         }
     }
 
@@ -281,7 +327,7 @@ impl DspChain {
                 let front = self.banks[0][ch].process(x);
                 let rear = self.banks[1][ch].process(x);
 
-                frame[ch] = (front * gf + rear * gr) * self.gain;
+                frame[ch] = soft_clip((front * gf + rear * gr) * self.gain);
             }
         }
     }
@@ -293,6 +339,114 @@ mod tests {
 
     fn rms(v: &[f32]) -> f32 {
         (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    /// Volume alone tops out at unity — that is the limitation the GAIN trim
+    /// exists to lift, so it is worth pinning down.
+    #[test]
+    fn volume_alone_cannot_exceed_unity() {
+        let p = DspParams { volume: 1.0, ..Default::default() };
+        assert!((p.out_gain() - 1.0).abs() < 1e-6, "got {}", p.out_gain());
+    }
+
+    #[test]
+    fn the_gain_trim_moves_the_decibels_it_claims() {
+        for db in [-12i8, -6, -3, 0, 3, 6, 12] {
+            let p = DspParams { volume: 1.0, gain_db: db, ..Default::default() };
+            let got = 20.0 * p.out_gain().log10();
+            assert!((got - db as f32).abs() < 0.01, "{db:+} dB asked, {got:.2} dB given");
+        }
+    }
+
+    #[test]
+    fn the_gain_trim_cannot_be_driven_past_either_stop() {
+        let hot = DspParams { volume: 1.0, gain_db: 99, ..Default::default() };
+        let cold = DspParams { volume: 1.0, gain_db: -99, ..Default::default() };
+        let max = 10f32.powf(GAIN_LIMIT_DB as f32 / 20.0);
+        let min = 10f32.powf(-GAIN_LIMIT_DB as f32 / 20.0);
+        assert!((hot.out_gain() - max).abs() < 1e-3);
+        assert!((cold.out_gain() - min).abs() < 1e-4, "the trim cuts as well as boosts");
+    }
+
+    #[test]
+    fn the_attenuator_still_wins_over_makeup_gain() {
+        // ATT is a safety control: pressing it must always drop the level,
+        // however much makeup has been dialled in.
+        let a = DspParams { volume: 1.0, gain_db: 12, att: false, ..Default::default() };
+        let b = DspParams { att: true, ..a.clone() };
+        assert!(b.out_gain() < a.out_gain() * 0.25);
+    }
+
+    /// A continuous control must take effect on its own, without waiting for
+    /// something else to trigger a retune.
+    #[test]
+    fn the_trim_applies_without_a_retune() {
+        // Quiet enough that +12 dB stays under the soft clipper's knee —
+        // otherwise this measures the clipper and reports ~9 dB, which is the
+        // clipper doing its job and the test asking the wrong question.
+        let settle = |c: &mut DspChain| {
+            // Two blocks: the one-pole gain smoothing needs a moment to reach
+            // its target, and measuring during the ramp proves nothing.
+            let mut buf = vec![0.05f32; 8192];
+            c.process(&mut buf);
+            let mut buf = vec![0.05f32; 8192];
+            c.process(&mut buf);
+            rms(&buf)
+        };
+
+        // One generation, held fixed for the whole test — nothing here is
+        // allowed to look like a filter change.
+        let base = DspParams { volume: 1.0, generation: 7, ..Default::default() };
+        let mut c = DspChain::new();
+        c.sync(&base);
+        let unity = settle(&mut c);
+
+        c.sync(&DspParams { gain_db: 12, ..base.clone() });
+        let boosted = settle(&mut c);
+        let up = 20.0 * (boosted / unity).log10();
+        assert!((up - 12.0).abs() < 0.5, "expected ~+12 dB, got {up:.2}");
+
+        c.sync(&DspParams { gain_db: -12, ..base.clone() });
+        let cut = settle(&mut c);
+        let down = 20.0 * (cut / unity).log10();
+        assert!((down + 12.0).abs() < 0.5, "expected ~-12 dB, got {down:.2}");
+    }
+
+    #[test]
+    fn the_soft_clipper_is_transparent_below_the_knee() {
+        for x in [0.0f32, 0.1, -0.5, 0.79, -0.8] {
+            assert_eq!(soft_clip(x), x, "altered a sample that was not clipping");
+        }
+    }
+
+    #[test]
+    fn the_soft_clipper_bounds_everything_above_it() {
+        for x in [1.0f32, 4.0, 40.0, -4.0, -40.0] {
+            let y = soft_clip(x);
+            assert!(y.abs() <= 1.0, "{x} escaped as {y}");
+            assert_eq!(y.signum(), x.signum(), "{x} changed sign");
+            assert!(y.abs() > CLIP_KNEE, "{x} was crushed to {y}");
+        }
+    }
+
+    /// The point of the trim, end to end: a quiet source reaches full output
+    /// with the volume dial where it already was.
+    #[test]
+    fn makeup_gain_lifts_a_quiet_source_through_the_whole_chain() {
+        let quiet = 0.05f32; // -26 dBFS
+        let run = |db: i8| {
+            let p = DspParams { volume: 1.0, gain_db: db, generation: 1, ..Default::default() };
+            let mut c = DspChain::new();
+            c.sync(&p);
+            let mut buf = vec![quiet; 8192];
+            // Let the gain smoothing settle before measuring.
+            c.process(&mut buf);
+            let mut buf = vec![quiet; 8192];
+            c.process(&mut buf);
+            rms(&buf)
+        };
+        let lifted = 20.0 * (run(12) / run(0)).log10();
+        assert!((lifted - 12.0).abs() < 0.5, "expected ~12 dB, got {lifted:.2}");
     }
 
     /// Feed a sine at a band centre and check the band's gain actually moves

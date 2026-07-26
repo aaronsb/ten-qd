@@ -33,19 +33,25 @@ use audio::radio::RadioCmd;
 use audio::{EngineCmd, EngineEvent};
 use browser::Browser;
 use memory::{Keeper, Memory};
-use state::{Bank, Command, Patch, Side, SourceKind, Stack, Transport};
+use state::{Bank, Command, Patch, Side, SourceKind, Stack, Transport, Unit};
 use ui::hit::HitMap;
 use ui::units::eq::{snap, RANGE_DB, STEP_DB};
 
 const FRAME: Duration = Duration::from_millis(33);
+
+/// How many frames a unit's activity lamp stays lit after it is operated.
+/// At 33 ms a frame this is about a sixth of a second — long enough to read as
+/// a flash, short enough not to look like a state.
+const BLINK_FRAMES: u8 = 5;
 
 const USAGE: &str = "\
 ten-qd — a terminal music player wearing an 80s car stereo
 
     ten-qd [FOLDER]        load FOLDER as a disc, or resume the last one
     ten-qd --screenshot    render one frame to stdout and exit
+                           (--aux --browser --outputs --arrange --fold=… --hide=…)
     ten-qd --radio-check   sweep the FM band and report signal per channel
-    ten-qd --adapter-check insert the cassette adapter and check the cable
+    ten-qd --aux-check     open the aux input and check the cable
     ten-qd --forget        clear the 12-volt memory (presets, tone, last disc)
     ten-qd --help          this
 
@@ -78,6 +84,14 @@ struct App {
     /// The output picker, when open, and where its cursor sits.
     outputs_open: bool,
     outputs_cursor: usize,
+    /// The aux source picker, when open, and where its cursor sits.
+    aux_open: bool,
+    aux_cursor: usize,
+    /// The rack arranger, when open. `grabbed` means the arrows are carrying
+    /// the highlighted unit rather than moving past it.
+    layout_open: bool,
+    layout_cursor: usize,
+    layout_grabbed: bool,
     /// The null sink, while an adapter is inserted. Dropping it removes the
     /// sink, so the desktop never keeps a phantom audio device after we exit.
     adapter: Option<adapter::Adapter>,
@@ -99,18 +113,23 @@ impl App {
         stack.source = mem.source_kind();
         stack.ctrl.volume = mem.volume;
         stack.ctrl.att = mem.att;
+        stack.ctrl.gain_db =
+            mem.gain_db.clamp(-audio::dsp::GAIN_LIMIT_DB, audio::dsp::GAIN_LIMIT_DB);
         stack.ctrl.bass = mem.bass;
         stack.ctrl.treble = mem.treble;
         stack.ctrl.fader = mem.fader;
         stack.ctrl.ill = mem.illumination();
         stack.ctrl.dimmer = mem.dimmer.min(ui::theme::DIM_MAX);
-        stack.amp.power = mem.amp_power;
-        stack.eq.defeat = mem.eq_defeat;
+        stack.amp.power = mem.powered(state::Unit::Amp);
+        stack.cd.power = mem.powered(state::Unit::Cd);
+        stack.tape.power = mem.powered(state::Unit::Tape);
+        stack.aux.power = mem.powered(state::Unit::Aux);
+        stack.eq.defeat = !mem.powered(state::Unit::Eq);
         stack.eq.front = mem.eq_bank(Bank::Front);
         stack.eq.rear = mem.eq_bank(Bank::Rear);
         stack.tuner.freq = mem.tuner_freq;
         stack.tuner.local = mem.tuner_local;
-        stack.tuner.power = mem.tuner_power;
+        stack.tuner.power = mem.powered(state::Unit::Tuner);
         stack.output = mem.output.clone();
         stack.outputs = adapter::sinks().into_iter().map(|s| s.description).collect();
         stack.tuner.presets = mem.presets();
@@ -118,6 +137,7 @@ impl App {
         stack.cd.random = mem.random;
         stack.tape.dolby = mem.dolby;
         stack.tape.auto_reverse = mem.auto_reverse;
+        stack.layout = mem.layout();
         App {
             stack,
             engine,
@@ -135,6 +155,11 @@ impl App {
             ),
             outputs_open: false,
             outputs_cursor: 0,
+            aux_open: false,
+            aux_cursor: 0,
+            layout_open: false,
+            layout_cursor: 0,
+            layout_grabbed: false,
             adapter: None,
             mpris: mpris::Mpris::start(),
             streams: Vec::new(),
@@ -163,6 +188,7 @@ impl App {
             treble: s.ctrl.treble,
             volume: s.ctrl.volume,
             att: s.ctrl.att,
+            gain_db: s.ctrl.gain_db,
             fader: s.ctrl.fader,
             power: s.amp.power,
         });
@@ -208,8 +234,130 @@ impl App {
     // -- command dispatch --------------------------------------------------
 
     fn dispatch(&mut self, cmd: Command) {
+        // Every command lights its unit's lamp, whether or not that unit is
+        // currently on screen. A rack you cannot see still answers.
+        if let Some(u) = cmd.unit() {
+            self.stack.blink[u.index()] = BLINK_FRAMES;
+        }
         match cmd {
             Command::Quit => self.running = false,
+
+            // Power is the signal path; the arranger's hidden/shown is only
+            // what you are looking at. A hidden unit still plays. A unit with
+            // its power off is out of the chain, which is why turning one off
+            // under the transport stops the transport rather than quietly
+            // carrying on into a box that is no longer there.
+            Command::UnitPower(u) => {
+                let mut patch = Patch::default();
+                let on = match u {
+                    Unit::Cd => {
+                        patch.cd_power = Some(!self.stack.cd.power);
+                        !self.stack.cd.power
+                    }
+                    Unit::Tape => {
+                        patch.tape_power = Some(!self.stack.tape.power);
+                        !self.stack.tape.power
+                    }
+                    Unit::Aux => {
+                        patch.aux_power = Some(!self.stack.aux.power);
+                        !self.stack.aux.power
+                    }
+                    // The equaliser's power switch *is* its bypass. Giving it
+                    // a second name would be two controls for one circuit.
+                    Unit::Eq => {
+                        self.dispatch(Command::EqDefeat);
+                        return;
+                    }
+                    Unit::Amp => {
+                        self.dispatch(Command::AmpPower);
+                        return;
+                    }
+                    Unit::Tuner => {
+                        self.dispatch(Command::TunerPower);
+                        return;
+                    }
+                    // The head is the rack. There is nothing to switch it off
+                    // with, and nothing left to press if you had.
+                    Unit::Ctrl => return,
+                };
+                self.stack.apply(patch);
+                let selected = matches!(
+                    (u, self.stack.source),
+                    (Unit::Cd, SourceKind::Cd)
+                        | (Unit::Tape, SourceKind::Tape)
+                        | (Unit::Aux, SourceKind::Aux)
+                );
+                if !on && selected {
+                    let epoch = self.new_epoch();
+                    if let Some(e) = &self.engine {
+                        e.send(EngineCmd::Stop { epoch });
+                    }
+                    self.stack.apply(Patch {
+                        transport: Some(Transport::Stop),
+                        tape_transport: Some(Transport::Stop),
+                        ..Default::default()
+                    });
+                }
+                self.status(format!(
+                    "{} {}",
+                    u.label(),
+                    if on { "in the signal path" } else { "out of the signal path" }
+                ));
+            }
+
+            Command::UnitCollapse(u) => {
+                let i = u.index();
+                self.stack.layout.collapsed[i] = !self.stack.layout.collapsed[i];
+                let what = if self.stack.layout.collapsed[i] { "folded" } else { "opened" };
+                self.status(format!("{} {what}", u.label()));
+            }
+
+            Command::LayoutOpen => {
+                self.layout_open = true;
+                self.layout_grabbed = false;
+                self.layout_cursor = 0;
+            }
+            // Escape preserves whatever is on screen — the arranging *was* the
+            // editing, so there is nothing to cancel back to.
+            Command::LayoutClose => {
+                self.layout_open = false;
+                self.layout_grabbed = false;
+            }
+            Command::LayoutUp | Command::LayoutDown => {
+                let down = matches!(cmd, Command::LayoutDown);
+                if self.layout_grabbed {
+                    self.layout_cursor = self.stack.layout.bubble(self.layout_cursor, down);
+                } else if down {
+                    self.layout_cursor = (self.layout_cursor + 1).min(Unit::ALL.len() - 1);
+                } else {
+                    self.layout_cursor = self.layout_cursor.saturating_sub(1);
+                }
+            }
+            Command::LayoutGrab => {
+                self.layout_grabbed = !self.layout_grabbed;
+                let u = self.stack.layout.order[self.layout_cursor];
+                self.status(if self.layout_grabbed {
+                    format!("{} — arrows move it, space to set it down", u.label())
+                } else {
+                    format!("{} set down", u.label())
+                });
+            }
+            Command::LayoutToggle => {
+                let u = self.stack.layout.order[self.layout_cursor];
+                let i = u.index();
+                self.stack.layout.hidden[i] = !self.stack.layout.hidden[i];
+                self.status(if self.stack.layout.hidden[i] {
+                    format!("{} out of the rack — it still plays", u.label())
+                } else {
+                    format!("{} back in the rack", u.label())
+                });
+            }
+            Command::LayoutReset => {
+                self.stack.layout = Default::default();
+                self.layout_cursor = 0;
+                self.layout_grabbed = false;
+                self.status("rack reset — every unit in, in signal order");
+            }
 
             Command::CdPlayPause => {
                 if self.stack.source != SourceKind::Cd {
@@ -341,15 +489,6 @@ impl App {
 
             // ---- cassette deck --------------------------------------------
             Command::TapePlayPause => {
-                if self.stack.tape.adapter.is_some() {
-                    // A real adapter's deck keys did nothing to the Discman.
-                    // These do, over MPRIS — and say so when there is nothing
-                    // listening rather than pretending the press landed.
-                    if !self.mpris.send(mpris::Transport::PlayPause) {
-                        self.status("nothing on the cable is listening");
-                    }
-                    return;
-                }
                 if self.stack.tape.tape.is_none() {
                     self.status("no tape loaded");
                     return;
@@ -387,10 +526,6 @@ impl App {
             }
 
             Command::TapeStop => {
-                if self.stack.tape.adapter.is_some() {
-                    self.mpris.send(mpris::Transport::Stop);
-                    return;
-                }
                 let epoch = self.new_epoch();
                 if let Some(e) = &self.engine {
                     e.send(EngineCmd::Stop { epoch });
@@ -403,19 +538,11 @@ impl App {
             }
 
             Command::TapeApsNext => {
-                if self.stack.tape.adapter.is_some() {
-                    self.mpris.send(mpris::Transport::Next);
-                    return;
-                }
                 let i = self.stack.tape.index + 1;
                 self.tape_cue(i);
             }
 
             Command::TapeApsPrev => {
-                if self.stack.tape.adapter.is_some() {
-                    self.mpris.send(mpris::Transport::Previous);
-                    return;
-                }
                 // Same three-second rule as the CD: past it, APS restarts the
                 // track rather than stepping back.
                 let cur = self.stack.tape.index;
@@ -468,91 +595,18 @@ impl App {
             }
 
             Command::TapeEject => {
-                // Dropping the adapter restores every moved stream and removes
-                // the sink.
-                self.adapter = None;
-                self.streams.clear();
-                self.mpris.prefer(None);
                 let epoch = self.new_epoch();
                 if let Some(e) = &self.engine {
                     e.send(EngineCmd::Eject { epoch });
                 }
                 self.stack.apply(Patch {
                     tape: Some(None),
-                    adapter: Some(None),
                     tape_transport: Some(Transport::Stop),
                     tape_counter: Some(0.0),
                     tape_side: Some(Side::A),
                     ..Default::default()
                 });
                 self.status("tape ejected");
-            }
-
-            // ---- the cassette adapter -------------------------------------
-            Command::TapeInsertAdapter => {
-                if self.adapter.is_some() {
-                    self.dispatch(Command::TapeEject);
-                    return;
-                }
-                match adapter::Adapter::insert() {
-                    Ok(a) => {
-                        self.adapter = Some(a);
-                        self.streams = adapter::streams().unwrap_or_default();
-                        let epoch = self.new_epoch();
-                        if let Some(e) = &self.engine {
-                            e.send(EngineCmd::LoadAdapter { epoch });
-                        }
-                        self.stack.apply(Patch {
-                            adapter: Some(Some(state::AdapterTape::default())),
-                            tape: Some(None),
-                            tape_transport: Some(Transport::Stop),
-                            ..Default::default()
-                        });
-                        if self.stack.source != SourceKind::Tape {
-                            self.select_source(SourceKind::Tape);
-                        }
-                        self.status(if self.streams.is_empty() {
-                            format!("adapter in — select \"{}\" as your player's output", adapter::DESCRIPTION)
-                        } else {
-                            format!(
-                                "adapter in — {} playing, press 1-9 to plug one in",
-                                self.streams.len()
-                            )
-                        });
-                    }
-                    Err(e) => self.status(format!("no adapter: {e}")),
-                }
-            }
-
-            Command::TapePlugStream(i) => {
-                // Re-list first: indices are the server's, and a stream that
-                // ended since the menu was drawn must not be moved by number.
-                self.streams = adapter::streams().unwrap_or_default();
-                let Some(s) = self.streams.get(i).cloned() else {
-                    self.status("no such stream");
-                    return;
-                };
-                let Some(a) = self.adapter.as_mut() else {
-                    self.status("insert the adapter first");
-                    return;
-                };
-                match a.plug(&s) {
-                    Ok(()) => {
-                        self.mpris.prefer(Some(s.app.clone()));
-                        let mut t = self.stack.tape.adapter.clone().unwrap_or_default();
-                        t.source = Some(s.label());
-                        self.stack.apply(Patch {
-                            adapter: Some(Some(t)),
-                            tape_transport: Some(Transport::Play),
-                            ..Default::default()
-                        });
-                        if let Some(e) = &self.engine {
-                            e.send(EngineCmd::Play);
-                        }
-                        self.status(format!("plugged in: {}", s.label()));
-                    }
-                    Err(e) => self.status(format!("could not plug in: {e}")),
-                }
             }
 
             Command::TapeDolby => {
@@ -566,6 +620,83 @@ impl App {
                     e.send(EngineCmd::SetAutoReverse(v));
                 }
                 self.stack.apply(Patch { tape_auto_reverse: Some(v), ..Default::default() });
+            }
+
+            // ---- auxiliary input ------------------------------------------
+            // The sink is created on demand rather than at start-up: a device
+            // that appears in everyone's audio settings the moment the program
+            // runs is a device they did not ask for.
+            Command::AuxOpen => {
+                if self.adapter.is_none() {
+                    match adapter::Adapter::insert() {
+                        Ok(a) => self.adapter = Some(a),
+                        Err(e) => {
+                            self.status(format!("no aux input: {e}"));
+                            return;
+                        }
+                    }
+                }
+                self.streams = adapter::streams().unwrap_or_default();
+                self.aux_open = true;
+                self.aux_cursor = 0;
+                self.status(if self.streams.is_empty() {
+                    format!("nothing playing — or send audio to \"{}\"", adapter::DESCRIPTION)
+                } else {
+                    format!("{} playing — pick one", self.streams.len())
+                });
+            }
+            Command::AuxClose => self.aux_open = false,
+            Command::AuxUp => self.aux_cursor = self.aux_cursor.saturating_sub(1),
+            Command::AuxDown => {
+                self.aux_cursor =
+                    (self.aux_cursor + 1).min(self.streams.len().saturating_sub(1));
+            }
+
+            Command::AuxSelect(i) => {
+                // Re-list first: indices are the server's, and a stream that
+                // ended since the menu was drawn must not be moved by number.
+                self.streams = adapter::streams().unwrap_or_default();
+                let Some(stream) = self.streams.get(i).cloned() else {
+                    self.status("no such stream");
+                    return;
+                };
+                let Some(a) = self.adapter.as_mut() else {
+                    self.status("no aux input");
+                    return;
+                };
+                match a.plug(&stream) {
+                    Ok(()) => {
+                        self.mpris.prefer(Some(stream.app.clone()));
+                        let mut t = self.stack.aux.state.clone();
+                        t.source = Some(stream.label());
+                        self.stack.apply(Patch { aux: Some(t), ..Default::default() });
+                        self.aux_open = false;
+                        if self.stack.source != SourceKind::Aux {
+                            self.select_source(SourceKind::Aux);
+                        }
+                        self.status(format!("plugged in: {}", stream.app));
+                    }
+                    Err(e) => self.status(format!("could not plug that in: {e}")),
+                }
+            }
+
+            // A real auxiliary input was a one-way cable and these keys would
+            // have done nothing. They reach the player over MPRIS instead, and
+            // say so when nothing is listening rather than pretending the
+            // press landed.
+            Command::AuxPlayPause
+            | Command::AuxStop
+            | Command::AuxNext
+            | Command::AuxPrev => {
+                let t = match cmd {
+                    Command::AuxPlayPause => mpris::Transport::PlayPause,
+                    Command::AuxStop => mpris::Transport::Stop,
+                    Command::AuxNext => mpris::Transport::Next,
+                    _ => mpris::Transport::Previous,
+                };
+                if !self.mpris.send(t) {
+                    self.status("nothing on the cable is listening");
+                }
             }
 
             // ---- tuner ------------------------------------------------------
@@ -690,6 +821,19 @@ impl App {
             Command::AmpPower => {
                 let v = !self.stack.amp.power;
                 self.stack.apply(Patch { amp_power: Some(v), ..Default::default() });
+                self.publish(false);
+            }
+
+            Command::GainUp | Command::GainDown => {
+                let d = if matches!(cmd, Command::GainUp) { 1 } else { -1 };
+                let l = audio::dsp::GAIN_LIMIT_DB;
+                let v = (self.stack.ctrl.gain_db + d).clamp(-l, l);
+                self.stack.apply(Patch { gain_db: Some(v), ..Default::default() });
+                self.status(match v {
+                    0 => "GAIN: unity".to_string(),
+                    v if v > 0 => format!("GAIN: {v:+} dB of makeup above unity"),
+                    v => format!("GAIN: {v:+} dB, trimming the curve back"),
+                });
                 self.publish(false);
             }
 
@@ -823,15 +967,35 @@ impl App {
     }
 
     /// Which transport the shared keys act on.
-    fn transport_cmd(&self, cd: Command, tape: Command, tuner: Option<Command>) -> Option<Command> {
+    fn transport_cmd(
+        &self,
+        cd: Command,
+        tape: Command,
+        tuner: Option<Command>,
+        aux: Command,
+    ) -> Option<Command> {
         match self.stack.source {
             SourceKind::Cd => Some(cd),
             SourceKind::Tape => Some(tape),
             SourceKind::Tuner => tuner,
+            SourceKind::Aux => Some(aux),
         }
     }
 
     fn select_source(&mut self, kind: SourceKind) {
+        // A unit that is out of the signal path cannot be the signal. Said
+        // plainly rather than silently ignored, because a key that appears to
+        // do nothing is worse than one that explains itself.
+        let powered = match kind {
+            SourceKind::Cd => self.stack.cd.power,
+            SourceKind::Tape => self.stack.tape.power,
+            SourceKind::Aux => self.stack.aux.power,
+            SourceKind::Tuner => self.stack.tuner.power,
+        };
+        if !powered {
+            self.status(format!("{} is switched off", kind.label()));
+            return;
+        }
         let epoch = self.new_epoch();
         if let Some(e) = &self.engine {
             e.send(EngineCmd::SelectSource { source: kind, epoch });
@@ -944,6 +1108,13 @@ impl App {
     // -- engine feedback ---------------------------------------------------
 
     fn poll_engine(&mut self) {
+        // Let the activity lamps burn down. Done here rather than in the
+        // renderer so a lamp lit by a command is timed by frames, not by how
+        // often something happens to redraw.
+        for b in &mut self.stack.blink {
+            *b = b.saturating_sub(1);
+        }
+
         let Some(engine) = &self.engine else { return };
 
         let mut incoming = Vec::new();
@@ -988,22 +1159,21 @@ impl App {
             self.current = self.marks.pop_front();
         }
 
-        // The cable reports what is on the other end of it.
-        if let Some(a) = &self.stack.tape.adapter {
+        // The cable reports what is on the other end of it. Only the aux
+        // unit's own readout moves: the deck's transport is the deck's, and
+        // letting a player's state drive it is what once had the panel reading
+        // PLAY over a stopped decoder.
+        {
+            let a = &self.stack.aux.state;
             let live = self.engine.as_ref().is_some_and(|e| e.capture.state.running());
             let np = self.mpris.now_playing();
             let mut next = a.clone();
-            next.live = live;
+            next.live = live && np.as_ref().is_some_and(|n| n.playing);
             next.player = np.as_ref().map(|n| n.player.clone());
             next.title = np.as_ref().map(|n| n.title.clone()).unwrap_or_default();
             next.artist = np.as_ref().map(|n| n.artist.clone()).unwrap_or_default();
             if next != *a {
-                let running = np.as_ref().is_some_and(|n| n.playing);
-                self.stack.apply(Patch {
-                    adapter: Some(Some(next)),
-                    tape_transport: Some(if running { Transport::Play } else { Transport::Pause }),
-                    ..Default::default()
-                });
+                self.stack.apply(Patch { aux: Some(next), ..Default::default() });
             }
         }
 
@@ -1031,7 +1201,13 @@ impl App {
             _ => None,
         };
 
-        let mut patch = Patch { amp_levels: Some(levels), ..Default::default() };
+        let mut patch = Patch {
+            amp_levels: Some(levels),
+            // Reported every frame regardless of source, so the aux bay shows
+            // a signal arriving even while the rack is playing a disc.
+            aux_input: Some(engine.capture.state.level()),
+            ..Default::default()
+        };
         if let Some(t) = tuner_patch {
             patch.tuner_freq = t.tuner_freq;
             patch.tuner_stereo = t.tuner_stereo;
@@ -1043,6 +1219,7 @@ impl App {
         if let Some((source, index, side, at_frame)) = promoted {
             let elapsed = frames.saturating_sub(at_frame) as f64 / rate;
             match source {
+                SourceKind::Aux => {}
                 SourceKind::Cd => {
                     patch.track = Some(index + 1);
                     patch.elapsed = Some(elapsed);
@@ -1122,9 +1299,46 @@ impl App {
         self.dispatch(cmd);
     }
 
+    /// Keys while the aux source picker has focus. Modal, like the browser.
+    fn on_key_aux(&mut self, k: KeyEvent) {
+        let cmd = match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => Command::AuxClose,
+            KeyCode::Up | KeyCode::Char('k') => Command::AuxUp,
+            KeyCode::Down | KeyCode::Char('j') => Command::AuxDown,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                Command::AuxSelect(self.aux_cursor)
+            }
+            _ => return,
+        };
+        self.dispatch(cmd);
+    }
+
+    /// Keys while the rack arranger has focus. Modal, and deliberately small:
+    /// move, grab, take out, reset, done.
+    fn on_key_layout(&mut self, k: KeyEvent) {
+        let cmd = match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('~') => Command::LayoutClose,
+            KeyCode::Up | KeyCode::Char('k') => Command::LayoutUp,
+            KeyCode::Down | KeyCode::Char('j') => Command::LayoutDown,
+            KeyCode::Char(' ') => Command::LayoutGrab,
+            KeyCode::Enter => Command::LayoutToggle,
+            KeyCode::Char('r') => Command::LayoutReset,
+            _ => return,
+        };
+        self.dispatch(cmd);
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
         if self.show_help {
             self.show_help = false;
+            return;
+        }
+        if self.aux_open {
+            self.on_key_aux(k);
+            return;
+        }
+        if self.layout_open {
+            self.on_key_layout(k);
             return;
         }
         if self.outputs_open {
@@ -1150,48 +1364,61 @@ impl App {
             (KeyCode::Char('c'), _) => Some(Command::Source(SourceKind::Cd)),
             (KeyCode::Char('t'), _) => Some(Command::Source(SourceKind::Tape)),
             (KeyCode::Char('u'), _) => Some(Command::Source(SourceKind::Tuner)),
+            (KeyCode::Char('a'), _) => Some(Command::Source(SourceKind::Aux)),
             (KeyCode::Char('o'), _) => Some(Command::BrowserOpen),
 
             // transport — the shared keys act on whichever source is selected
             (KeyCode::Char(' '), _) => {
-                self.transport_cmd(Command::CdPlayPause, Command::TapePlayPause, None)
+                self.transport_cmd(
+                    Command::CdPlayPause,
+                    Command::TapePlayPause,
+                    None,
+                    Command::AuxPlayPause,
+                )
             }
             (KeyCode::Char('s'), _) => {
-                self.transport_cmd(Command::CdStop, Command::TapeStop, None)
+                self.transport_cmd(Command::CdStop, Command::TapeStop, None, Command::AuxStop)
             }
             (KeyCode::Right, _) | (KeyCode::Char('n'), _) => self.transport_cmd(
                 Command::CdNext,
                 Command::TapeApsNext,
                 Some(Command::TunerSeekUp),
+                Command::AuxNext,
             ),
             (KeyCode::Left, _) | (KeyCode::Char('p'), _) => self.transport_cmd(
                 Command::CdPrev,
                 Command::TapeApsPrev,
                 Some(Command::TunerSeekDown),
+                Command::AuxPrev,
             ),
             (KeyCode::Char('['), _) => Some(Command::TunerStepDown),
             (KeyCode::Char(']'), _) => Some(Command::TunerStepUp),
             (KeyCode::Char('g'), _) => Some(Command::TunerLocal),
             (KeyCode::Char('P'), _) => Some(Command::TunerPower),
             (KeyCode::Char('e'), _) => {
-                self.transport_cmd(Command::CdEject, Command::TapeEject, None)
+                self.transport_cmd(
+                    Command::CdEject,
+                    Command::TapeEject,
+                    None,
+                    Command::AuxClose,
+                )
             }
             (KeyCode::Char('r'), _) => Some(Command::CdRepeat),
             (KeyCode::Char('z'), _) => Some(Command::CdRandom),
             (KeyCode::Char('v'), _) => Some(Command::TapeFlip),
-            (KeyCode::Char('A'), _) => Some(Command::TapeInsertAdapter),
+            (KeyCode::Char('A'), _) => Some(Command::AuxOpen),
             (KeyCode::Char('y'), _) => Some(Command::TapeDolby),
-            (KeyCode::Char('a'), _) => Some(Command::TapeAutoReverse),
+            // Auto-reverse moved off `a` when the aux input took it. `b` is
+            // the side it turns the tape over to.
+            (KeyCode::Char('b'), _) => Some(Command::TapeAutoReverse),
 
             // Digits cue a track, or recall a preset when the tuner is up.
             (KeyCode::Char(c @ '1'..='9'), _) => {
                 let n = c.to_digit(10).unwrap() as usize - 1;
                 Some(if tuner {
                     Command::TunerPreset(n)
-                } else if self.stack.tape.adapter.is_some()
-                    && self.stack.source == SourceKind::Tape
-                {
-                    Command::TapePlugStream(n)
+                } else if self.stack.source == SourceKind::Aux {
+                    Command::AuxSelect(n)
                 } else if self.stack.source == SourceKind::Tape {
                     let base = self
                         .stack
@@ -1215,6 +1442,14 @@ impl App {
             (KeyCode::Up, _) => Some(Command::VolUp),
             (KeyCode::Down, _) => Some(Command::VolDown),
             (KeyCode::Char('m'), _) => Some(Command::Att),
+            (KeyCode::Char('~'), _) => Some(Command::LayoutOpen),
+            (KeyCode::Char(c), _)
+                if Unit::ALL.iter().any(|u| u.collapse_key() == c) =>
+            {
+                Unit::ALL.iter().find(|u| u.collapse_key() == c).map(|u| Command::UnitCollapse(*u))
+            }
+            (KeyCode::Char('{'), _) => Some(Command::GainDown),
+            (KeyCode::Char('}'), _) => Some(Command::GainUp),
             (KeyCode::Char(','), _) => Some(Command::BassDown),
             (KeyCode::Char('.'), _) => Some(Command::BassUp),
             (KeyCode::Char('<'), _) => Some(Command::TrebleDown),
@@ -1297,6 +1532,18 @@ fn screenshot(app: &mut App, width: u16, height: u16) -> Result<()> {
         if app.outputs_open {
             ui::overlay::draw_outputs(f, &app.stack, app.outputs_cursor, &theme, &mut hits);
         }
+        if app.aux_open {
+            ui::overlay::draw_aux(f, &app.streams, app.aux_cursor, &theme, &mut hits);
+        }
+        if app.layout_open {
+            ui::overlay::draw_layout(
+                f,
+                &app.stack,
+                app.layout_cursor,
+                app.layout_grabbed,
+                &theme,
+            );
+        }
     })?;
 
     let buf = term.backend().buffer();
@@ -1325,6 +1572,7 @@ fn screenshot(app: &mut App, width: u16, height: u16) -> Result<()> {
 /// this proves the whole path against the actual antenna, which is the only
 /// thing that can tell you the dongle is tuned where you think it is.
 fn radio_check() -> Result<()> {
+    let _hush = Hush(silence_stderr());
     let engine = audio::start(None)?;
     let radio = &engine.radio;
 
@@ -1390,10 +1638,11 @@ fn radio_check() -> Result<()> {
 ///
 /// The unit tests cover the pactl plumbing; only this can tell you the cable
 /// is carrying sound all the way through the DSP chain to the meters.
-fn adapter_check() -> Result<()> {
+fn aux_check() -> Result<()> {
+    let _hush = Hush(silence_stderr());
     let engine = audio::start(None)?;
     let mut a = adapter::Adapter::insert()?;
-    println!("adapter in: \"{}\" ({SINK_NOTE})", adapter::DESCRIPTION, SINK_NOTE = adapter::SINK);
+    println!("aux input: \"{}\" ({SINK_NOTE})", adapter::DESCRIPTION, SINK_NOTE = adapter::SINK);
 
     let streams = adapter::streams()?;
     if streams.is_empty() {
@@ -1413,17 +1662,36 @@ fn adapter_check() -> Result<()> {
     }
     println!("\nplugged in all {} stream(s)", streams.len());
 
-    engine.send(EngineCmd::SelectSource { source: SourceKind::Tape, epoch: 1 });
-    engine.send(EngineCmd::LoadAdapter { epoch: 2 });
+    engine.send(EngineCmd::SelectSource { source: SourceKind::Aux, epoch: 1 });
     engine.send(EngineCmd::Play);
-    std::thread::sleep(Duration::from_millis(2000));
+
+    // Hold the highest level seen rather than sampling once: the meter falls
+    // between blocks, and a single read can land in a trough and libel a
+    // perfectly good cable.
+    let mut peak = 0.0f32;
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(20));
+        peak = peak.max(engine.capture.state.level());
+    }
 
     let bands = engine.meters.read();
     let lit = bands.iter().filter(|v| **v > 0.02).count();
     println!("capture running: {}", engine.capture.state.running());
+    // Two separate questions, in order: is anything on the cable, and did it
+    // survive the rack. Reporting only the second is what made a capture
+    // pointed at the wrong node look like a gain fault.
+    if peak > 0.0 {
+        println!("input peak:      {:.1} dBFS", 20.0 * peak.log10());
+    } else {
+        println!("input peak:      nothing at all");
+    }
     println!("meters: {:?}", bands.map(|v| (v * 100.0) as u32));
-    if lit == 0 {
-        println!("\nno audio reached the amplifier — the cable is not carrying.");
+
+    if peak <= 0.0 {
+        println!("\nthe cable is silent — nothing is reaching \"{}\".", adapter::DESCRIPTION);
+    } else if lit == 0 {
+        println!("\naudio is on the cable but none reached the amplifier —");
+        println!("the fault is inside the rack, not in the routing.");
     } else {
         println!("\naudio present in {lit}/9 bands — it went through the whole rack.");
     }
@@ -1436,8 +1704,8 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--radio-check") {
         return radio_check();
     }
-    if args.iter().any(|a| a == "--adapter-check") {
-        return adapter_check();
+    if args.iter().any(|a| a == "--aux-check") {
+        return aux_check();
     }
     if args.iter().any(|a| a == "--forget") {
         return match Memory::forget() {
@@ -1475,6 +1743,25 @@ fn main() -> Result<()> {
 
     let loaded = Memory::load();
 
+    // Name the sink *before* cpal creates the stream.
+    //
+    // This is the difference between correcting a feedback loop and never
+    // making one. cpal opens the ALSA default, PipeWire places that stream on
+    // the system *default sink*, and if the operator has pointed the desktop
+    // at "ten-qd aux input" — which is exactly what you do to run everything
+    // through the rack — then for as long as it takes us to notice and issue a
+    // `move-sink-input`, the rack is driving its own input. That is audible.
+    //
+    // `PULSE_SINK` is read when the stream is created, so the stream is born
+    // on the right device and there is no window at all.
+    //
+    // SAFETY: single-threaded here. The memory has been read, and nothing has
+    // been spawned yet — the engine, the MPRIS watcher and the loop guard all
+    // start below this point, so no other thread can be in `getenv`.
+    if let Some(s) = adapter::safe_output(loaded.memory.output.as_deref()) {
+        unsafe { std::env::set_var("PULSE_SINK", &s.name) };
+    }
+
     // The panel should come up even with no sound card — it says so in the
     // colophon rather than refusing to start.
     let (engine, engine_err) = match audio::start(loaded.memory.output.as_deref()) {
@@ -1503,11 +1790,11 @@ fn main() -> Result<()> {
         app.load_tape_from(&p);
     }
 
-    // Re-route to the remembered output. The stream has to exist on the graph
-    // before it can be moved, so this happens after the engine is up.
-    if let Some(want) = app.stack.output.clone()
-        && let Some(s) = adapter::sinks().into_iter().find(|s| s.description == want)
-    {
+    // Belt and braces behind `PULSE_SINK`: move the stream if it still landed
+    // somewhere we did not want. Runs unconditionally, because the case that
+    // used to be skipped — no remembered device — is exactly the case where
+    // the stream sits on the system default, which may be our own input.
+    if let Some(s) = adapter::safe_output(app.stack.output.as_deref()) {
         // The stream has to appear on the graph before it can be moved, and
         // cpal creates it asynchronously — so retry briefly rather than
         // racing it and silently keeping the default output.
@@ -1542,6 +1829,41 @@ fn main() -> Result<()> {
         if args.iter().any(|a| a == "--outputs") {
             app.dispatch(Command::OutputsOpen);
         }
+        if args.iter().any(|a| a == "--arrange") {
+            app.dispatch(Command::LayoutOpen);
+        }
+        // Folds the named units away, e.g. --fold=tuner,amp — the arranger is
+        // interactive, and a still frame needs some way to reach it.
+        // Authoritative, not additive: `--fold=eq` means the equaliser is
+        // folded and everything else is open, whatever the memory happens to
+        // hold. A screenshot flag that inherits saved state produces a
+        // different picture on every machine.
+        if let Some(list) = args.iter().find_map(|a| a.strip_prefix("--fold=")) {
+            app.stack.layout.collapsed = [false; 7];
+            for t in list.split(',') {
+                if let Some(u) = Unit::from_token(t.trim()) {
+                    app.stack.layout.collapsed[u.index()] = true;
+                }
+            }
+        }
+        if args.iter().any(|a| a == "--unfold") {
+            app.stack.layout.collapsed = [false; 7];
+            app.stack.layout.hidden = [false; 7];
+        }
+        if let Some(list) = args.iter().find_map(|a| a.strip_prefix("--hide=")) {
+            app.stack.layout.hidden = [false; 7];
+            for t in list.split(',') {
+                if let Some(u) = Unit::from_token(t.trim()) {
+                    app.stack.layout.hidden[u.index()] = true;
+                }
+            }
+        }
+        // Shows the rack switched to the auxiliary input. The input meter reads empty,
+        // because in a still frame nothing is plugged in — seeding it with a
+        // plausible level would be the one thing this panel does not do.
+        if args.iter().any(|a| a == "--aux") {
+            app.dispatch(Command::Source(SourceKind::Aux));
+        }
         if args.iter().any(|a| a == "--tuner-off") {
             app.dispatch(Command::TunerPower);
         }
@@ -1552,7 +1874,34 @@ fn main() -> Result<()> {
         app.stack.eq.rear = [6.0, 3.0, 0.0, 0.0, -3.0, -6.0, -3.0, 0.0, 3.0];
         app.publish(true);
         std::thread::sleep(Duration::from_millis(700));
-        return screenshot(&mut app, 110, ui::RACK_HEIGHT);
+        let h = ui::rack_height(&app.stack.layout);
+        return screenshot(&mut app, 110, h);
+    }
+
+    // Keep the rack's own output off its own input, continuously.
+    //
+    // Two separate things can put it there. The desktop's "send everything to
+    // ten-qd" is one, and it is a perfectly reasonable thing to click. The
+    // other is simply restarting while our sink is the system default, because
+    // a new stream lands on the default before anything of ours can object.
+    // Either way the result is a howl, so this watches rather than assuming.
+    let guard_target = Arc::new(std::sync::Mutex::new(app.stack.output.clone()));
+    {
+        let want = guard_target.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = stop;
+        std::thread::Builder::new().name("ten-qd/loopguard".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(1000));
+                if !adapter::own_output_is_looping() {
+                    continue;
+                }
+                let preferred = want.lock().ok().and_then(|g| g.clone());
+                if let Some(s) = adapter::safe_output(preferred.as_deref()) {
+                    let _ = adapter::route_own_output(&s.name);
+                }
+            }
+        })?;
     }
 
     let mut keeper = Keeper::new(&loaded);
@@ -1606,6 +1955,21 @@ fn restore_stderr(saved: Option<i32>) {
     }
 }
 
+/// Silences stderr for as long as it is held.
+///
+/// The diagnostics print a report, and librtlsdr prints `[R82XX] PLL not
+/// locked!` straight to the descriptor in the middle of it. Anything the
+/// diagnostics themselves have to say goes to stdout, so nothing readable is
+/// lost — and because this restores on drop, an early return cannot leave the
+/// terminal muted.
+struct Hush(Option<i32>);
+
+impl Drop for Hush {
+    fn drop(&mut self) {
+        restore_stderr(self.0.take());
+    }
+}
+
 fn music_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let p = PathBuf::from(home).join("Music");
@@ -1628,7 +1992,7 @@ fn run(
         }
 
         let view_h = terminal.size()?.height;
-        app.scroll = ui::clamp_scroll(app.scroll as i32, view_h);
+        app.scroll = ui::clamp_scroll(app.scroll as i32, view_h, &app.stack.layout);
 
         let mut hits = HitMap::new();
         terminal.draw(|f| {
@@ -1639,6 +2003,18 @@ fn run(
             }
             if app.outputs_open {
                 ui::overlay::draw_outputs(f, &app.stack, app.outputs_cursor, &theme, &mut hits);
+            }
+            if app.aux_open {
+                ui::overlay::draw_aux(f, &app.streams, app.aux_cursor, &theme, &mut hits);
+            }
+            if app.layout_open {
+                ui::overlay::draw_layout(
+                    f,
+                    &app.stack,
+                    app.layout_cursor,
+                    app.layout_grabbed,
+                    &theme,
+                );
             }
             if app.show_help {
                 ui::overlay::draw_help(f, &theme);

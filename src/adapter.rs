@@ -1,15 +1,14 @@
-//! The cassette adapter.
+//! The auxiliary input — which is to say, the wire.
 //!
-//! The tape-shaped thing with a headphone wire hanging off it, that you
-//! plugged into a Discman and pushed into the car's deck. The mechanism spun
-//! and believed it was playing a tape; the audio actually arrived over the
-//! cable and then went through everything downstream — the deck's playback
-//! amp, the equaliser, the fader, the power amp, the speakers.
+//! This began as a cassette adapter: the tape-shaped shell with a headphone
+//! lead, pushed into the deck so the mechanism would spin and believe it was
+//! playing. A lovely object, and the wrong interface — a deck carrying one has
+//! a counter that counts nothing and two sides that do not exist. The cable is
+//! a *source*, so now it is one, and the deck went back to being a deck.
 //!
-//! That is exactly what this does. A PipeWire null sink named
-//! `ten-qd cassette adapter` is the wire: anything that can choose an output
-//! device can plug into it, and what comes out the other side has been through
-//! the whole rack. It is the same trick EasyEffects uses for its virtual sink,
+//! The mechanism is unchanged. A PipeWire null sink named `ten-qd aux input`
+//! is the wire: anything that can choose an output device can plug into it,
+//! and what comes out the other side has been through the whole rack. It is the same trick EasyEffects uses for its virtual sink,
 //! which is worth saying plainly — the pattern is well-trodden, and the only
 //! thing invented here is what it is called.
 //!
@@ -25,13 +24,18 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-/// The sink's internal name; the monitor is this plus `.monitor`.
-pub const SINK: &str = "ten_qd_adapter";
-pub const MONITOR: &str = "ten_qd_adapter.monitor";
+/// The sink's internal name.
+///
+/// `pactl` will also list a source called `ten_qd_aux.monitor`, but that
+/// name exists only on the PulseAudio side — there is no PipeWire node by it,
+/// and asking `pw-record` to target it silently records a microphone instead.
+/// Capture targets this name and taps the monitor ports; see
+/// [`crate::audio::capture`].
+pub const SINK: &str = "ten_qd_aux";
 /// What the rest of the desktop calls it in device pickers.
-pub const DESCRIPTION: &str = "ten-qd cassette adapter";
+pub const DESCRIPTION: &str = "ten-qd aux input";
 
-/// A playback stream on the system — a candidate to plug into the adapter.
+/// A playback stream on the system — a candidate to plug into the aux input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stream {
     pub index: u32,
@@ -57,7 +61,7 @@ fn pactl(args: &[&str]) -> Result<String> {
     let out = Command::new("pactl")
         .args(args)
         .output()
-        .context("pactl not found — the adapter needs PipeWire or PulseAudio")?;
+        .context("pactl not found — the aux input needs PipeWire or PulseAudio")?;
     if !out.status.success() {
         bail!("pactl {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -66,7 +70,7 @@ fn pactl(args: &[&str]) -> Result<String> {
 
 /// Every playback stream currently on the system, whichever sink it is on.
 ///
-/// Listing does not require the adapter to exist — you want to see what is
+/// Listing does not require the sink to exist — you want to see what is
 /// playing *before* deciding to plug it in.
 pub fn streams() -> Result<Vec<Stream>> {
     // Two names to exclude, not one. The running executable's name covers a
@@ -141,7 +145,7 @@ pub fn sinks() -> Vec<Sink> {
         .iter()
         .filter_map(|s| {
             let name = s.get("name")?.as_str()?.to_string();
-            // Never offer our own adapter as an output: that is the loop.
+            // Never offer our own input as an output: that is the loop.
             if name == SINK {
                 return None;
             }
@@ -160,7 +164,7 @@ pub fn sinks() -> Vec<Sink> {
 /// Moving our own sink-input is how the rack holds an output independent of
 /// the system default, and it takes effect immediately — no stream rebuild,
 /// no restart. It is the same `move-sink-input` used to plug a stream into
-/// the adapter, pointed the other way.
+/// a stream in, pointed the other way.
 pub fn route_own_output(sink: &str) -> Result<()> {
     let exe = std::env::current_exe()
         .ok()
@@ -184,6 +188,72 @@ pub fn route_own_output(sink: &str) -> Result<()> {
     let Some(index) = mine else { bail!("our own output stream is not on the graph yet") };
     pactl(&["move-sink-input", &index.to_string(), sink])?;
     Ok(())
+}
+
+/// The sink the desktop currently sends everything to, by internal name.
+pub fn default_sink() -> Option<String> {
+    let out = Command::new("pactl").args(["get-default-sink"]).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Somewhere safe for the rack's own output to land.
+///
+/// In order: the remembered device, the system default, then anything at all —
+/// and never our own input sink at any of those steps. `preferred` is a
+/// description, because that is what the picker shows and what the memory
+/// stores; the name is what PipeWire wants.
+pub fn safe_output(preferred: Option<&str>) -> Option<Sink> {
+    // `sinks()` already refuses to list our own, so anything it returns is
+    // safe by construction. The default has to be checked by hand.
+    let all = sinks();
+    if let Some(want) = preferred
+        && let Some(s) = all.iter().find(|s| s.description == want)
+    {
+        return Some(s.clone());
+    }
+    if let Some(d) = default_sink()
+        && let Some(s) = all.iter().find(|s| s.name == d)
+    {
+        return Some(s.clone());
+    }
+    all.into_iter().next()
+}
+
+/// Is the rack's own output sitting on the rack's own input?
+///
+/// The desktop can put it there at any moment — "move all applications to
+/// ten-qd" in the system settings does exactly that, and it is a reasonable
+/// thing to click. Nothing about our own configuration prevents it, so the
+/// only honest answer is to keep checking.
+pub fn own_output_is_looping() -> bool {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let pkg = env!("CARGO_PKG_NAME");
+
+    let Ok(json) = pactl(&["-f", "json", "list", "sink-inputs"]) else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else { return false };
+    let Some(items) = v.as_array() else { return false };
+
+    // The sink index our own sink carries, if it is loaded at all.
+    let Ok(sj) = pactl(&["-f", "json", "list", "sinks"]) else { return false };
+    let Ok(sv) = serde_json::from_str::<serde_json::Value>(&sj) else { return false };
+    let ours = sv.as_array().and_then(|a| {
+        a.iter()
+            .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(SINK))
+            .and_then(|s| s.get("index"))
+            .and_then(|i| i.as_u64())
+    });
+    let Some(ours) = ours else { return false };
+
+    items.iter().any(|s| {
+        let Some(props) = s.get("properties") else { return false };
+        let get = |k: &str| props.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let identity = format!("{} {}", get("node.name"), get("application.name"));
+        let mine = identity.contains(pkg) || (!exe.is_empty() && identity.contains(&exe));
+        mine && s.get("sink").and_then(|x| x.as_u64()) == Some(ours)
+    })
 }
 
 /// A loaded null sink, and a memory of every stream moved onto it.
@@ -314,6 +384,27 @@ mod tests {
     /// The self-exclusion is the one filter that must not be got wrong, so it
     /// is asserted against the live system: whatever else is playing, this
     /// process's own output stream is never offered as something to plug in.
+    /// The rack's own input must never be offered as its output. That is the
+    /// one choice in the picker that makes a feedback loop, and the guard is
+    /// what keeps the watchdog's fallback safe by construction.
+    #[test]
+    fn the_output_picker_never_offers_our_own_input() {
+        assert!(
+            !sinks().iter().any(|s| s.name == SINK),
+            "our own sink was offered as somewhere to send sound"
+        );
+    }
+
+    /// Whatever it settles on, it is never the loop.
+    #[test]
+    fn a_safe_output_is_never_our_own_input() {
+        for want in [None, Some(DESCRIPTION), Some("no such device")] {
+            if let Some(s) = safe_output(want) {
+                assert_ne!(s.name, SINK, "asked for {want:?} and got the loop");
+            }
+        }
+    }
+
     #[test]
     fn our_own_output_is_never_a_candidate() {
         let Ok(list) = streams() else { return };

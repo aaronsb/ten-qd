@@ -14,7 +14,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use super::{BAND_TRACK, BAND_W, BAND_X, MARKER_X, SPINE};
-use crate::state::{Bank, Command, Stack, BAND_LABELS};
+use crate::state::{Bank, Command, Stack, Unit, BAND_LABELS};
 use crate::ui::hit::HitMap;
 use crate::ui::chassis;
 use crate::ui::theme::Theme;
@@ -38,13 +38,31 @@ pub fn snap(db: f32) -> f32 {
     (db / STEP_DB).round() * STEP_DB
 }
 
+/// The spine lamp: what it says, and whether it burns.
+///
+/// It used to read DEFEAT and light when the curve was *bypassed*, which made
+/// it the only lamp on the rack that lit to report something switched off —
+/// every other one (EJECT, POWER, SELECT, LEVEL, AM/FM) burns when its unit
+/// has something or is doing something. A panel where one lamp means the
+/// opposite of the rest is a panel you have to read twice.
+///
+/// So it reports the curve being *in circuit*, and it is labelled POWER like
+/// every other unit's, because for an equaliser those are the same switch:
+/// bypassing the curve is what turning one off means. Giving it a second name
+/// would be two controls for one circuit. DEFEAT survives as the word for the
+/// state, on the readout row, in red, at the moment it is actually true.
+fn spine_lamp(defeat: bool) -> (&'static str, bool) {
+    ("POWER", !defeat)
+}
+
 pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &mut HitMap) {
     let inner = chassis::bay(buf, area, theme);
     let eq = &stack.eq;
 
     let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 5);
-    chassis::lamp(buf, lamp, "DEFEAT", theme, eq.defeat);
-    hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::EqDefeat);
+    let (label, lit) = spine_lamp(eq.defeat);
+    chassis::lamp(buf, lamp, label, theme, lit);
+    hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::UnitPower(Unit::Eq));
 
     chassis::legend(buf, inner.x, inner.y, "GRAPHIC EQ", theme);
 
@@ -115,7 +133,47 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         );
     }
 
+    gain(buf, inner, stack.ctrl.gain_db, theme, hits);
     chassis::model_corner(buf, inner, &["GRAPHIC EQUALIZER QE-581"], theme);
+}
+
+/// The equaliser's output trim.
+///
+/// It lives here rather than on the control head because it is the equaliser's
+/// own level: boost nine bands and the next thing you need is somewhere to put
+/// the level back. Volume attenuates and stops at unity; this swings both ways
+/// around it, which is what lets a quiet source reach the top of the dial at
+/// all.
+///
+/// Wearing the same key caps as every other operable control on the rack. It
+/// spent a version as a text field with a click target, which read as a
+/// readout — and a readout is precisely what it is not.
+fn gain(buf: &mut Buffer, inner: Rect, db: i8, theme: &Theme, hits: &mut HitMap) {
+    const W: u16 = 26;
+    if inner.width < BAND_X + 46 + W {
+        return;
+    }
+    let x = inner.x + inner.width - W;
+    let y = inner.y + 1;
+
+    chassis::sublegend(buf, x, y, "GAIN", theme, false);
+    buf.set_string(
+        x + 6,
+        y,
+        format!("{db:>+3} dB"),
+        Style::default()
+            .fg(if db == 0 { theme.ink_grey } else { theme.led_a })
+            .bg(theme.chassis)
+            .add_modifier(if db == 0 { Modifier::DIM } else { Modifier::BOLD }),
+    );
+
+    let mut row = chassis::KeyRow::new(x, y + 1);
+    let r = row.key(buf, 6, "CUT", theme, db < 0, true);
+    hits.add(r.x, r.y, r.width, r.height, Command::GainDown);
+    let r = row.key(buf, 6, "BOOST", theme, db > 0, true);
+    hits.add(r.x, r.y, r.width, r.height, Command::GainUp);
+
+    chassis::sublegend(buf, x, y + 4, "OUTPUT TRIM", theme, false);
 }
 
 /// The F / R bank marker. Clicking it switches the bank the cursor is on.
@@ -216,6 +274,103 @@ fn bank(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Renders the bay and reads the cells back. The trim moved here from the
+    /// control head, and a control that silently fails to draw is worse than
+    /// one that is missing — you go looking for the key binding instead.
+    fn render(gain_db: i8) -> String {
+        use crate::state::Stack;
+
+        let mut stack = Stack::default();
+        stack.ctrl.gain_db = gain_db;
+        render_stack(&stack)
+    }
+
+    fn render_stack(stack: &crate::state::Stack) -> String {
+        use crate::ui::hit::HitMap;
+        use crate::ui::theme::Theme;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let area = Rect::new(0, 0, 110, crate::ui::H_EQ);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::for_stack(stack);
+        let mut hits = HitMap::new();
+        draw(&mut buf, area, stack, &theme, &mut hits);
+
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every lamp on the rack burns when its unit has something or is doing
+    /// something. This one used to be the exception.
+    #[test]
+    fn the_spine_lamp_burns_when_the_curve_is_in_circuit() {
+        assert_eq!(spine_lamp(false), ("POWER", true), "a live curve lights the lamp");
+        assert!(!spine_lamp(true).1, "a bypassed curve must go dark");
+    }
+
+    #[test]
+    fn the_bypass_warning_still_says_defeat() {
+        // The lamp changed; the word for the state did not. DEFEAT appears on
+        // the readout row, in red, only while it is true.
+        let mut stack = crate::state::Stack::default();
+        stack.eq.defeat = true;
+        assert!(render_stack(&stack).contains("DEFEAT"), "bypass must still announce itself");
+        stack.eq.defeat = false;
+        let out = render_stack(&stack);
+        assert!(!out.contains("CURVE BYPASSED"), "an engaged curve must not cry bypass");
+    }
+
+    #[test]
+    fn the_output_trim_is_drawn_on_the_equaliser() {
+        let out = render(0);
+        assert!(out.contains("GAIN"), "no GAIN legend:\n{out}");
+        assert!(out.contains("CUT"), "no CUT key:\n{out}");
+        assert!(out.contains("BOOST"), "no BOOST key:\n{out}");
+        assert!(out.contains("+0 dB"), "no readout:\n{out}");
+    }
+
+    #[test]
+    fn the_output_trim_reads_both_ways_around_unity() {
+        assert!(render(8).contains("+8 dB"), "boost must read as boost");
+        assert!(render(-8).contains("-8 dB"), "the trim cuts too, and must say so");
+    }
+
+    #[test]
+    fn the_trim_is_clickable_where_it_is_drawn() {
+        use crate::state::Stack;
+        use crate::ui::hit::HitMap;
+        use crate::ui::theme::Theme;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let stack = Stack::default();
+        let area = Rect::new(0, 0, 110, crate::ui::H_EQ);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::for_stack(&stack);
+        let mut hits = HitMap::new();
+        draw(&mut buf, area, &stack, &theme, &mut hits);
+
+        let mut down = false;
+        let mut up = false;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                match hits.hit(x, y) {
+                    Some(Command::GainDown) => down = true,
+                    Some(Command::GainUp) => up = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(down && up, "both trim keys must be clickable, not just drawn");
+    }
 
     #[test]
     fn detents_span_the_range_top_to_bottom() {

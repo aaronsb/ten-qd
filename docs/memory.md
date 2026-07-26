@@ -44,12 +44,27 @@ browser = "/home/you/Music"
 | | |
 |---|---|
 | tuner | last station, the six presets, LOCAL |
-| equaliser | both nine-band curves, DEFEAT |
+| equaliser | both nine-band curves, the output trim |
 | control head | volume, ATT, bass, treble, fader, illumination colour |
-| amplifier | power |
+| every unit | whether it is in the signal path, as one `powered_off` list |
 | transports | repeat, random, Dolby, auto-reverse |
 | loaded media | the disc in the tray and the tape in the deck, by path |
 | browser | the folder you were last looking in |
+| the rack | which units are in it, in what order, and which are folded shut |
+
+The last of those is three lists of unit tokens — `cd`, `tape`, `tuner`, `eq`,
+`amp`, `ctrl` — kept flat so the file stays worth editing by hand:
+
+```toml
+layout_order = ["tuner", "cd", "tape", "eq", "amp", "ctrl"]
+layout_hidden = ["amp"]
+layout_collapsed = ["cd"]
+```
+
+It is read defensively, because a hand-edited file is a file someone can get
+wrong: unknown tokens are ignored, a unit named twice is placed once, and
+anything left out is appended in factory order. A malformed arrangement costs
+you the arrangement, never the ability to start.
 
 ## What does not
 

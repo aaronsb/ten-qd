@@ -14,7 +14,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
 use super::SPINE;
-use crate::state::{Command, Stack, Transport};
+use crate::state::{Command, Unit, Stack, Transport};
 use crate::ui::hit::HitMap;
 use crate::ui::chassis;
 use crate::ui::glyph::{self, transport as tr};
@@ -25,10 +25,16 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let cd = &stack.cd;
     let running = cd.transport != Transport::Stop;
 
-    // --- spine: EJECT ----------------------------------------------------
+    // --- spine: POWER ----------------------------------------------------
+    // Every unit wears its power switch in the same place, so the left column
+    // of the whole rack reads as one row of switches. What the unit *does*
+    // lives on the right — as a lamp where there is room for one, as a key cap
+    // where there is not.
     let lamp = Rect::new(inner.x, inner.y, SPINE, 5);
-    chassis::lamp(buf, lamp, "EJECT", theme, cd.disc.is_some());
-    hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::CdEject);
+    chassis::lamp(buf, lamp, "POWER", theme, cd.power);
+    hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::UnitPower(Unit::Cd));
+
+
 
     // --- display window --------------------------------------------------
     let win_area = Rect::new(
@@ -141,10 +147,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     row.gap(2);
     press(&mut row, 6, "RPT", cd.repeat, Command::CdRepeat, hits);
     press(&mut row, 6, "RND", cd.random, Command::CdRandom, hits);
+    row.gap(2);
+    // EJECT wears a key cap rather than a spine lamp: the spine belongs to
+    // POWER now, and this window is far too crowded to give ten columns to a
+    // second lamp — the music calendar would lose its last two tracks.
+    press(&mut row, 8, "EJECT", cd.disc.is_some(), Command::CdEject, hits);
 
-    // --- badge, model, and the shelf strip -------------------------------
-    let badge_x = inner.x + inner.width.saturating_sub(24);
-    chassis::badge(buf, badge_x, ky, theme);
 
     // The one place text is allowed: printed below the panel, not on it.
     let strip = match (cd.disc.as_ref(), cd.current()) {

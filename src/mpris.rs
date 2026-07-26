@@ -1,7 +1,7 @@
 //! Reaching over to hit next on the Discman.
 //!
-//! A real cassette adapter was a one-way cable. The deck's transport keys did
-//! nothing to the thing on the other end — you reached over to the passenger
+//! A real auxiliary input was a one-way cable. Its keys — if it had any — did
+//! nothing to the thing on the other end; you reached over to the passenger
 //! seat and pressed the button yourself. This is the one place the build
 //! improves on the object it is imitating, and it improves on it using the
 //! interface that already exists rather than one of ours.
@@ -41,7 +41,7 @@ pub enum Transport {
 pub struct Mpris {
     now: Arc<Mutex<Option<NowPlaying>>>,
     /// The application name to prefer when several players are running —
-    /// normally whatever is plugged into the adapter.
+    /// normally whatever is plugged into the aux input.
     prefer: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
 }
@@ -81,7 +81,7 @@ impl Mpris {
 
     /// Tell the watcher which player to prefer. Several can be running at
     /// once — a browser and Spotify — and the right one is whichever is
-    /// plugged into the adapter.
+    /// plugged into the aux input.
     pub fn prefer(&self, app: Option<String>) {
         if let Ok(mut g) = self.prefer.lock() {
             *g = app;

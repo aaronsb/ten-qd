@@ -20,7 +20,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::Frame;
 
-use crate::state::{Command, Stack};
+use crate::state::{Command, Layout, SourceKind, Stack, Unit};
 use theme::Theme;
 
 /// Natural height of each bay, in rows. These are fixed: the panels have the
@@ -28,13 +28,42 @@ use theme::Theme;
 pub const H_CD: u16 = 12;
 pub const H_TAPE: u16 = 12;
 pub const H_TUNER: u16 = 12;
+pub const H_AUX: u16 = 12;
 pub const H_EQ: u16 = 15;
 pub const H_AMP: u16 = 10;
 pub const H_CTRL: u16 = 12;
 pub const H_COLOPHON: u16 = 2;
 
-pub const RACK_HEIGHT: u16 =
-    H_CD + H_TAPE + H_TUNER + H_EQ + H_AMP + H_CTRL + H_COLOPHON;
+/// The height a unit occupies with its faceplate open.
+pub fn natural_height(u: Unit) -> u16 {
+    match u {
+        Unit::Cd => H_CD,
+        Unit::Tape => H_TAPE,
+        Unit::Tuner => H_TUNER,
+        Unit::Aux => H_AUX,
+        Unit::Eq => H_EQ,
+        Unit::Amp => H_AMP,
+        Unit::Ctrl => H_CTRL,
+    }
+}
+
+/// What a unit occupies as the rack is currently arranged: nothing when it has
+/// been taken out, one row for its bar when folded, its full face otherwise.
+pub fn unit_height(u: Unit, layout: &Layout) -> u16 {
+    if layout.is_hidden(u) {
+        0
+    } else if layout.is_collapsed(u) {
+        1
+    } else {
+        natural_height(u)
+    }
+}
+
+/// The rack's height as arranged. No longer a constant: folding a unit away
+/// genuinely makes the stack shorter, which is the point.
+pub fn rack_height(layout: &Layout) -> u16 {
+    layout.order.iter().map(|u| unit_height(*u, layout)).sum::<u16>() + H_COLOPHON
+}
 /// Below this the panels start losing their legends; we say so rather than
 /// rendering something misleading.
 pub const MIN_WIDTH: u16 = 84;
@@ -63,7 +92,8 @@ pub fn draw(f: &mut Frame, stack: &Stack, scroll: u16, hits: &mut hit::HitMap) {
     }
 
     // Draw at full height off-screen, then window into it.
-    let full = Rect::new(0, 0, view.width, RACK_HEIGHT);
+    let height = rack_height(&stack.layout);
+    let full = Rect::new(0, 0, view.width, height);
     let mut rack = Buffer::empty(full);
     rack.set_style(full, Style::default().bg(theme.chassis_deep));
 
@@ -74,29 +104,69 @@ pub fn draw(f: &mut Frame, stack: &Stack, scroll: u16, hits: &mut hit::HitMap) {
         r
     };
 
-    // Sources first, then the processing chain, then the control head — which
-    // is also the order signal travels through the rack.
-    units::cd::draw(&mut rack, row(&mut y, H_CD), stack, &theme, hits);
-    units::tape::draw(&mut rack, row(&mut y, H_TAPE), stack, &theme, hits);
-    units::tuner::draw(&mut rack, row(&mut y, H_TUNER), stack, &theme, hits);
-    units::eq::draw(&mut rack, row(&mut y, H_EQ), stack, &theme, hits);
-    units::amp::draw(&mut rack, row(&mut y, H_AMP), stack, &theme, hits);
-    units::ctrl::draw(&mut rack, row(&mut y, H_CTRL), stack, &theme, hits);
+    // Factory order is sources, then the processing chain, then the control
+    // head — which is also the order signal travels through the rack. The
+    // operator may have rearranged it; that is a cabinet, not a signal path.
+    for u in stack.layout.order {
+        let h = unit_height(u, &stack.layout);
+        if h == 0 {
+            continue;
+        }
+        let area = row(&mut y, h);
+        if h > 1 {
+            match u {
+                Unit::Cd => units::cd::draw(&mut rack, area, stack, &theme, hits),
+                Unit::Tape => units::tape::draw(&mut rack, area, stack, &theme, hits),
+                Unit::Tuner => units::tuner::draw(&mut rack, area, stack, &theme, hits),
+                Unit::Aux => units::aux_in::draw(&mut rack, area, stack, &theme, hits),
+                Unit::Eq => units::eq::draw(&mut rack, area, stack, &theme, hits),
+                Unit::Amp => units::amp::draw(&mut rack, area, stack, &theme, hits),
+                Unit::Ctrl => units::ctrl::draw(&mut rack, area, stack, &theme, hits),
+            }
+        }
+        // The bar goes on last either way: for an open bay it replaces the
+        // plain top seam the unit just drew, so the fold control sits in the
+        // same place whether the face below it is there or not.
+        let bar = Rect::new(area.x, area.y, area.width, 1);
+        chassis::seam_bar(
+            &mut rack,
+            bar,
+            &theme,
+            h == 1,
+            is_live(u, stack),
+            stack.blink[u.index()] > 0,
+            u.plate(),
+        );
+        hits.add(bar.x + 2, bar.y, 3, 1, Command::UnitCollapse(u));
+    }
     colophon(&mut rack, row(&mut y, H_COLOPHON), stack, &theme, hits);
 
-    let scroll = scroll.min(RACK_HEIGHT.saturating_sub(view.height));
-    blit(f.buffer_mut(), view, &rack, scroll);
+    let scroll = scroll.min(height.saturating_sub(view.height));
+    blit(f.buffer_mut(), view, &rack, scroll, height);
     hits.translate(scroll);
 }
 
+/// Whether a unit's lamp burns steadily — it is doing something right now.
+fn is_live(u: Unit, stack: &Stack) -> bool {
+    match u {
+        Unit::Cd => stack.source == SourceKind::Cd && stack.cd.transport.is_running(),
+        Unit::Tape => stack.source == SourceKind::Tape && stack.tape.transport.is_running(),
+        Unit::Tuner => stack.source == SourceKind::Tuner && stack.tuner.power,
+        Unit::Aux => stack.aux.state.live,
+        Unit::Eq => !stack.eq.defeat,
+        Unit::Amp => stack.amp.power,
+        Unit::Ctrl => true,
+    }
+}
+
 /// Copy the visible slice of the rack into the frame.
-fn blit(dst: &mut Buffer, view: Rect, src: &Buffer, scroll: u16) {
-    let max_scroll = RACK_HEIGHT.saturating_sub(view.height);
+fn blit(dst: &mut Buffer, view: Rect, src: &Buffer, scroll: u16, height: u16) {
+    let max_scroll = height.saturating_sub(view.height);
     let scroll = scroll.min(max_scroll);
 
     for vy in 0..view.height {
         let sy = vy + scroll;
-        if sy >= RACK_HEIGHT {
+        if sy >= height {
             break;
         }
         for vx in 0..view.width.min(src.area.width) {
@@ -111,8 +181,8 @@ fn blit(dst: &mut Buffer, view: Rect, src: &Buffer, scroll: u16) {
 }
 
 /// Clamp a scroll offset to what the rack and viewport allow.
-pub fn clamp_scroll(scroll: i32, view_height: u16) -> u16 {
-    let max = RACK_HEIGHT.saturating_sub(view_height) as i32;
+pub fn clamp_scroll(scroll: i32, view_height: u16, layout: &Layout) -> u16 {
+    let max = rack_height(layout).saturating_sub(view_height) as i32;
     scroll.clamp(0, max.max(0)) as u16
 }
 
@@ -149,4 +219,39 @@ fn colophon(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     hits.add_row(x + 4 + bar_w / 2, y, bar_w / 2 + 1, Command::DimUp);
 
     buf.set_string(area.width.saturating_sub(tail.len() as u16 + 2), y, tail, grey);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folding_a_unit_makes_the_rack_shorter() {
+        let mut l = Layout::default();
+        let full = rack_height(&l);
+
+        l.collapsed[Unit::Tuner.index()] = true;
+        let folded = rack_height(&l);
+        assert_eq!(full - folded, natural_height(Unit::Tuner) - 1, "a folded unit keeps its bar");
+
+        l.hidden[Unit::Tuner.index()] = true;
+        assert_eq!(rack_height(&l), full - natural_height(Unit::Tuner), "gone is gone");
+    }
+
+    #[test]
+    fn reordering_does_not_change_the_height() {
+        let mut l = Layout::default();
+        let before = rack_height(&l);
+        l.order.swap(0, 5);
+        assert_eq!(rack_height(&l), before);
+    }
+
+    #[test]
+    fn an_empty_rack_is_still_a_rack() {
+        // Every unit out. The colophon stays, so there is always something to
+        // draw and the scroll clamp never divides by a zero-height rack.
+        let l = Layout { hidden: [true; 7], ..Default::default() };
+        assert_eq!(rack_height(&l), H_COLOPHON);
+        assert_eq!(clamp_scroll(99, 10, &l), 0);
+    }
 }

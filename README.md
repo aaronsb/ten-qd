@@ -2,7 +2,7 @@
 
 A terminal music player wearing an 80s car stereo.
 
-![The rack, tuned to 103.7 in stereo](docs/img/rack.png)
+![The whole rack: seven units, a disc in the tray, the tuner locked on 89.1](docs/img/overview.png)
 
 It plays FLAC, MP3, AAC, Vorbis and WAV; it compiles folders into two-sided
 tapes; and it receives broadcast FM off an RTL-SDR. The equaliser is eighteen
@@ -32,7 +32,7 @@ modern concepts — it is a set of concepts that were already correct.
 |---|---|
 | a folder of audio files | a disc, and its file order is the table of contents |
 | an M3U playlist | a compiled tape, split into two sides by running time |
-| Spotify, YouTube Music, Apple Music | a **cassette adapter** — the dummy tape with a wire |
+| Spotify, YouTube Music, Apple Music | the **AUX** input — a wire from the thing in your pocket |
 | a PipeWire null sink | the wire itself |
 | MPRIS over D-Bus | reaching over to hit next on the Discman |
 | a settings file in `~/.local/state` | the **12-volt memory**, on the battery feed |
@@ -40,9 +40,11 @@ modern concepts — it is a set of concepts that were already correct.
 | a dark-mode toggle | the dash rheostat on the instrument lighting |
 | a system-wide EQ like EasyEffects | the QE-581, second bay from the bottom |
 
+![A disc playing, the equaliser curved, the amplifier's meters moving](docs/img/rack-cd.png)
+
 The last two rows are the ones that changed the build. The dimmer became a
 luminance scale on the token layer because a dash dimmer is *exactly* that.
-And the adapter is EasyEffects' virtual-sink trick with a better name for the
+And AUX is EasyEffects' virtual-sink trick with a better name for the
 cable — which means the rack is a general audio processor: anything that can
 choose an output device gets the equaliser, the tone controls, the fader and
 the meters. Discord will offer it as an output. That is not a side effect, it
@@ -114,17 +116,25 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `!` … `^` | store the current station as a preset (kept between runs) |
 | `[` `]` `g` `P` | tune down/up · LOCAL · tuner power |
 | `e` `r` `z` | eject · repeat · random |
-| `v` `y` `a` | flip the tape · Dolby · auto-reverse |
-| `A` | insert / eject the cassette adapter |
-| `1`–`9` | …with the adapter in: plug that stream through the rack |
+| `v` `y` `b` | flip the tape · Dolby · auto-reverse |
+| `a`  `A` | select AUX · pick what to send through it |
+| `1`–`9` | …on AUX: plug that stream through the rack |
 | `↑` `↓` `m` | volume · attenuator |
 | `,` `.` / `<` `>` | bass · treble |
 | `;` `'` | fader rear/front |
 | `h` `l` / `j` `k` | select equaliser band · cut/boost |
 | `f` `d` `0` | front/rear bank · defeat · flat |
+| `{` `}` | equaliser output trim, ±12 dB — cut the curve back, or make up a quiet source |
 | `i` `w` | illumination colour · amplifier power |
 | `-` `=` | instrument dimmer, down and up |
 | `O` | pick the output device the rack drives |
+| `~` | arrange the rack — reorder units, take them out, put them back |
+| click `POWER` | take a unit out of the signal path, or put it back |
+| `C` `T` `U` `X` `E` `W` `H` | fold a unit away: CD, cassette, tuner, aux, EQ, amp, control head |
+
+`?` shows the same thing without leaving the panel:
+
+![The key map, over the rack](docs/img/rack-keys.png)
 
 ### The radio
 

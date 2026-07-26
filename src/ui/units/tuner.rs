@@ -29,17 +29,20 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
 
     chassis::legend(buf, inner.x, inner.y, "TUNER", theme);
     let lamp = Rect::new(inner.x, inner.y + 1, SPINE, 5);
-    chassis::lamp(buf, lamp, "AM/FM", theme, live);
-    hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::TunerBand);
+    chassis::lamp(buf, lamp, "POWER", theme, t.power);
+    hits.add(lamp.x, lamp.y, lamp.width, lamp.height, Command::TunerPower);
 
-    // --- power ------------------------------------------------------------
-    // Its own switch, on the right where the advertisement puts it. The
-    // display window makes room for it rather than running under it.
+    // --- band ------------------------------------------------------------
+    // On the right, where the advertisement puts the second key. The display
+    // window makes room for it rather than running under it.
     const POWER_W: u16 = 10;
     let px = inner.x + inner.width.saturating_sub(POWER_W);
     let plamp = Rect::new(px, inner.y + 1, POWER_W, 5);
-    chassis::lamp(buf, plamp, "POWER", theme, t.power);
-    hits.add(plamp.x, plamp.y, plamp.width, plamp.height, Command::TunerPower);
+    // Always lit: the band selector is a control that is simply there. (AM is
+    // not implemented — an RTL-SDR will not receive it — and the panel says so
+    // in the shelf strip rather than by darkening a key that still works.)
+    chassis::lamp(buf, plamp, "AM/FM", theme, true);
+    hits.add(plamp.x, plamp.y, plamp.width, plamp.height, Command::TunerBand);
 
     // --- window -----------------------------------------------------------
     let win = Rect::new(
@@ -137,8 +140,6 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         hits.add(r.x, r.y, r.width, r.height, Command::TunerPreset(i));
     }
 
-    let badge_x = inner.x + inner.width.saturating_sub(POWER_W + 16);
-    chassis::badge(buf, badge_x, ky, theme);
 
     // The shelf strip: what is tuned, in words rather than numerals.
     let strip = if !t.power {
