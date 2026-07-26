@@ -41,49 +41,55 @@ fn panel(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -> Rect {
 // Key map
 // ---------------------------------------------------------------------------
 
-pub const HELP: &[(&str, &str)] = &[
-    ("SOURCE", ""),
-    ("c  t  u  a", "compact disc · cassette · tuner · aux"),
-    ("o", "open the disc/tape browser"),
-    ("", ""),
-    ("TRANSPORT", "(acts on the selected source)"),
-    ("SPACE  s", "play/pause · stop"),
-    ("← → / p n", "previous · next   (tuner: seek)"),
-    ("1-9", "cue track   (tuner: recall preset)"),
-    ("! @ # $ % ^", "store the current station as a preset"),
-    ("e", "eject"),
-    ("r  z", "repeat · random"),
-    ("v  y  b", "flip the tape · Dolby · auto-reverse"),
-    ("g  P", "tuner LOCAL · tuner power"),
-    ("A", "aux: pick what to send through the rack"),
-    ("1-9", "aux: plug that stream in"),
-    ("", ""),
-    ("CONTROL HEAD", ""),
-    ("↑ ↓  m", "volume · attenuator"),
-    (", .  / < >", "bass · treble"),
-    ("; '", "fader rear/front"),
-    ("i  w", "illumination colour · amplifier power"),
-    ("-  =", "instrument dimmer, down and up"),
-    ("O", "output device the rack drives"),
-    ("", ""),
-    ("THE RACK", "(a folded or removed unit still plays)"),
-    ("~", "arrange the rack — order, and what is in it"),
-    ("click POWER", "take a unit out of the signal path, or back"),
-    ("C T U X", "fold away: CD · cassette · tuner · aux"),
-    ("E W H", "fold away: equaliser · amplifier · control head"),
-    ("", ""),
-    ("EQUALISER", ""),
-    ("h l  j k", "select band · cut/boost"),
-    ("f  d  0", "front/rear bank · defeat · flat"),
-    ("{ }", "output trim — cut/boost, ±12 dB"),
-    ("", ""),
-    ("click", "any control · wheel scrolls the rack"),
-    ("q", "quit"),
+/// The key map. The third field marks a section heading.
+///
+/// Explicit, because it used to be inferred from the description being empty —
+/// which quietly demoted the two headings that carry a parenthetical, so
+/// TRANSPORT and THE RACK were painted as bindings while the other three were
+/// not. A heading is a fact about the row, not something to deduce from it.
+pub const HELP: &[(&str, &str, bool)] = &[
+    ("SOURCE", "", true),
+    ("c  t  u  a", "compact disc · cassette · tuner · aux", false),
+    ("o", "open the disc/tape browser", false),
+    ("", "", false),
+    ("TRANSPORT", "(acts on the selected source)", true),
+    ("SPACE  s", "play/pause · stop", false),
+    ("← → / p n", "previous · next   (tuner: seek)", false),
+    ("1-9", "cue track   (tuner: recall preset)", false),
+    ("! @ # $ % ^", "store the current station as a preset", false),
+    ("e", "eject", false),
+    ("r  z", "repeat · random", false),
+    ("v  y  b", "flip the tape · Dolby · auto-reverse", false),
+    ("g  P", "tuner LOCAL · tuner power", false),
+    ("A", "aux: pick what to send through the rack", false),
+    ("1-9", "aux: plug that stream in", false),
+    ("", "", false),
+    ("CONTROL HEAD", "", true),
+    ("↑ ↓  m", "volume · attenuator", false),
+    (", .  / < >", "bass · treble", false),
+    ("; '", "fader rear/front", false),
+    ("i  w", "illumination colour · amplifier power", false),
+    ("-  =", "instrument dimmer, down and up", false),
+    ("O", "output device the rack drives", false),
+    ("", "", false),
+    ("THE RACK", "(a folded or removed unit still plays)", true),
+    ("~", "arrange the rack — order, and what is in it", false),
+    ("click POWER", "take a unit out of the signal path, or back", false),
+    ("C T U X", "fold away: CD · cassette · tuner · aux", false),
+    ("E W H", "fold away: equaliser · amplifier · control head", false),
+    ("", "", false),
+    ("EQUALISER", "", true),
+    ("h l  j k", "select band · cut/boost", false),
+    ("f  d  0", "front/rear bank · defeat · flat", false),
+    ("{ }", "output trim — cut/boost, ±12 dB", false),
+    ("", "", false),
+    ("click", "any control · wheel scrolls the rack", false),
+    ("q", "quit", false),
 ];
 
 /// Width the key map needs in order to print every description in full.
 fn help_width() -> u16 {
-    let widest = HELP.iter().map(|(_, d)| d.chars().count()).max().unwrap_or(0) as u16;
+    let widest = HELP.iter().map(|(_, d, _)| d.chars().count()).max().unwrap_or(0) as u16;
     (widest + 17).max(52)
 }
 
@@ -95,13 +101,12 @@ pub fn draw_help(f: &mut Frame, theme: &Theme) {
     let area = centred(f, help_width(), HELP.len() as u16 + 2);
     let inner = panel(f, area, "PANEL CONTROLS", theme);
 
-    for (i, (key, desc)) in HELP.iter().enumerate() {
+    for (i, (key, desc, heading)) in HELP.iter().enumerate() {
         let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
         }
-        // A row with no description is a section heading, not a binding.
-        let style = if desc.is_empty() && !key.is_empty() {
+        let style = if *heading {
             Style::default().fg(theme.ink_legend).bg(theme.window).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.vfd).bg(theme.window).add_modifier(Modifier::BOLD)
@@ -467,7 +472,7 @@ mod tests {
     fn every_binding_prints_its_description_in_full() {
         let inner = help_width() - 2;
         let room = inner.saturating_sub(15) as usize;
-        for (key, desc) in HELP {
+        for (key, desc, _) in HELP {
             assert!(
                 desc.chars().count() <= room,
                 "\"{desc}\" needs {} of {room} columns (key {key:?})",
@@ -476,10 +481,31 @@ mod tests {
         }
     }
 
+    /// Every heading is painted alike. This was inferred from the description
+    /// being empty, which silently demoted the two headings that carry a
+    /// parenthetical — TRANSPORT and THE RACK read as bindings.
+    #[test]
+    fn every_section_heading_is_marked_as_one() {
+        let heads: Vec<&str> = HELP.iter().filter(|(_, _, h)| *h).map(|(k, _, _)| *k).collect();
+        assert_eq!(
+            heads,
+            vec!["SOURCE", "TRANSPORT", "CONTROL HEAD", "THE RACK", "EQUALISER"],
+            "a heading was missed, or a binding was mistaken for one"
+        );
+        // And nothing that answers a keypress is dressed as a heading.
+        for (key, desc, heading) in HELP {
+            if *heading {
+                assert!(!key.is_empty(), "a heading needs a name");
+            } else if !key.is_empty() {
+                assert!(!desc.is_empty(), "a binding must say what it does: {key:?}");
+            }
+        }
+    }
+
     #[test]
     fn keys_do_not_collide_with_their_descriptions() {
         // Keys start at inner.x + 1, descriptions at inner.x + 14.
-        for (key, _) in HELP {
+        for (key, _, _) in HELP {
             assert!(key.chars().count() < 13, "key {key:?} would reach the description");
         }
     }
