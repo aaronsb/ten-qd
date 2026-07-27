@@ -120,6 +120,12 @@ writes WAV tapped *before* the equaliser, so the volume can be anywhere and the
 curve you set for your headphones is not baked into the file. See
 [docs/recording.md](docs/recording.md).
 
+![The deck four seconds into a take, recording Spotify through the aux input](docs/img/rack-record.png)
+
+The COUNTER counts the take while one is being made, and the tape the rest of
+the time. It agrees with the length beside REC because both are the same
+measurement: seconds the writer has actually committed to the file.
+
 Wants a terminal at least **84 columns** wide and 24-bit colour, with a font
 that has good block-element coverage — any Nerd Font will do. The rack is 87
 rows tall and scrolls with PgUp/PgDn or the wheel.
