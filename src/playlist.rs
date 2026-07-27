@@ -16,6 +16,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+/// What a playlist turned out to hold.
+pub struct Loaded {
+    pub entries: Vec<Entry>,
+    /// Lines naming something the deck cannot cue — a station, or a service
+    /// URI out of the listening log. Reported rather than silently dropped: a
+    /// tape cut from a week of Spotify and mpv loads with half its tracks
+    /// missing, and "12 tracks" with no further comment is how that becomes
+    /// invisible.
+    pub remote: usize,
+}
+
 /// One line of a playlist, before the file it names has been opened.
 pub struct Entry {
     pub path: PathBuf,
@@ -34,7 +45,7 @@ pub fn is_playlist(p: &Path) -> bool {
 /// Read a playlist into entries. Anything with a URI scheme other than `file`
 /// is skipped: this is a cassette deck, and a line pointing at `http://` is a
 /// station while `spotify:track:…` is a song the deck has no way to reach.
-pub fn read(path: &Path) -> Result<Vec<Entry>> {
+pub fn read(path: &Path) -> Result<Loaded> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read {}", path.display()))?;
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -64,7 +75,7 @@ pub fn read(path: &Path) -> Result<Vec<Entry>> {
         }
         bail!("{} lists nothing playable", path.display());
     }
-    Ok(entries)
+    Ok(Loaded { entries, remote })
 }
 
 /// The URI scheme a line starts with, if it starts with one at all.
@@ -72,8 +83,11 @@ pub fn read(path: &Path) -> Result<Vec<Entry>> {
 /// Needed because not every URI has a `//` after the colon: a tape cut out of
 /// the listening log carries `spotify:track:…`, and treating that as a
 /// relative path would have the deck looking for a file of that name in the
-/// playlist's own folder. A filename containing a colon — "Artist: Title.flac"
-/// — is not a scheme, because a space is not a scheme character.
+/// playlist's own folder.
+///
+/// Syntax alone cannot finish the job — `Autechre:Gantz Graf.flac` is a
+/// perfectly good scheme by these rules and a perfectly good filename by any
+/// ripper's — so this only reports the shape, and `resolve` decides.
 fn scheme(raw: &str) -> Option<&str> {
     let (head, _) = raw.split_once(':')?;
     let ok = !head.is_empty()
@@ -90,11 +104,18 @@ fn resolve(raw: &str, dir: &Path) -> Option<PathBuf> {
     // A stream URL or a service URI is not a track. `file://` is, once
     // unwrapped.
     if let Some(s) = scheme(raw) {
-        if !s.eq_ignore_ascii_case("file") {
+        let rest = &raw[s.len() + 1..];
+        if s.eq_ignore_ascii_case("file") {
+            return Some(PathBuf::from(percent_decode(rest.strip_prefix("//").unwrap_or(rest))));
+        }
+        // `scheme://…` is a URI beyond argument. Without the slashes it is
+        // genuinely ambiguous: `spotify:track:…` is a service URI, and
+        // `Autechre:Gantz Graf.flac` is a file, named by a ripper that had no
+        // opinion about URI syntax. The extension settles it, because the deck
+        // cues audio files and no service URI ends in one.
+        if rest.starts_with("//") || !crate::disc::is_audio(Path::new(raw)) {
             return None;
         }
-        let rest = &raw[s.len() + 1..];
-        return Some(PathBuf::from(percent_decode(rest.strip_prefix("//").unwrap_or(rest))));
     }
     let p = PathBuf::from(raw);
     Some(if p.is_absolute() { p } else { dir.join(p) })
@@ -246,16 +267,33 @@ mod tests {
         assert_eq!(remote, 2);
     }
 
-    /// …while a filename that merely contains a colon still resolves, because
-    /// a space is not a scheme character.
+    /// …while a filename that merely contains a colon still resolves.
+    ///
+    /// `Artist:Title.ext` is a common ripper convention, and by URI syntax
+    /// alone `Autechre:` is a perfectly good scheme. The extension is what
+    /// settles it, because the deck cues audio files and no service URI ends
+    /// in one.
     #[test]
     fn a_colon_in_a_filename_is_not_a_scheme() {
-        let e = parse_m3u("Boards of Canada: Cold Earth.flac\n", Path::new("/m")).0;
-        assert_eq!(e[0].path, PathBuf::from("/m/Boards of Canada: Cold Earth.flac"));
-        assert!(scheme("Boards of Canada: Cold Earth.flac").is_none());
-        assert_eq!(scheme("spotify:track:aaa"), Some("spotify"));
-        assert_eq!(scheme("http://x/y"), Some("http"));
-        assert!(scheme("a.flac").is_none(), "no colon at all is not a scheme");
+        for name in [
+            "Boards of Canada: Cold Earth.flac",
+            "Autechre:Gantz Graf.flac",
+            "Autechre:GantzGraf.flac",
+            "Amber-Autechre:01.mp3",
+        ] {
+            let e = parse_m3u(&format!("{name}\n"), Path::new("/m")).0;
+            assert_eq!(e.len(), 1, "{name} was turned away as a URI");
+            assert_eq!(e[0].path, PathBuf::from(format!("/m/{name}")));
+        }
+    }
+
+    /// The other half: a stream whose URL happens to end in an audio
+    /// extension is still a stream, because `//` settles it first.
+    #[test]
+    fn a_stream_that_looks_like_a_file_is_still_a_stream() {
+        let (e, remote) = parse_m3u("http://stream.example/live.mp3\n", Path::new("/m"));
+        assert!(e.is_empty(), "got {:?}", e.iter().map(|x| &x.path).collect::<Vec<_>>());
+        assert_eq!(remote, 1);
     }
 
     /// The message an operator gets when they hand the deck a tape cut out of
@@ -269,7 +307,7 @@ mod tests {
 
         let why = match read(&file) {
             Err(e) => e.to_string(),
-            Ok(e) => panic!("claimed {} playable track(s) out of service URIs", e.len()),
+            Ok(l) => panic!("claimed {} playable track(s) out of service URIs", l.entries.len()),
         };
         std::fs::remove_dir_all(&dir).ok();
         assert!(why.contains("2 stream(s) or service URI(s)"), "{why}");

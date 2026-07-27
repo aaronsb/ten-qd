@@ -46,6 +46,21 @@ use crate::mpris::NowPlaying;
 /// through an album at four seconds a track is not twelve plays.
 const MIN_PLAY: Duration = Duration::from_secs(5);
 
+/// The most one poll may credit.
+///
+/// Time is credited in arrears — whatever ran since the last look ran under the
+/// metadata we already held — which quietly assumes the looks keep coming. They
+/// do not: suspend the machine at 22:00 with Spotify playing and the next poll
+/// arrives ten hours later, holding a `playing` flag from last night. Without a
+/// ceiling that becomes a ten-hour play, written once into a file that is never
+/// rewritten and carried into the `#EXTINF` of every tape cut from that month.
+///
+/// A gap this long is the machine not looking, not you listening. Comfortably
+/// above the 500 ms bus poll and the 33 ms frame, so ordinary scheduling jitter
+/// still counts in full. A forward clock step and a long stall are the same
+/// event from here and get the same treatment.
+const MAX_CREDIT: Duration = Duration::from_secs(5);
+
 /// One line of the log: something that played, and for how long.
 ///
 /// Read back as well as written, and the file is hand-editable — so every
@@ -132,14 +147,24 @@ struct Open {
 impl Open {
     fn advance(&mut self, now: SystemTime) {
         if self.playing {
-            self.played += now.duration_since(self.seen).unwrap_or(Duration::ZERO);
+            let gap = now.duration_since(self.seen).unwrap_or(Duration::ZERO);
+            self.played += gap.min(MAX_CREDIT);
         }
         self.seen = now;
     }
 
+    /// Whether this has run long enough to be a play rather than a skip.
+    ///
+    /// The one predicate. Both the panel's count and the decision to write ask
+    /// it, because a readout that used a different rule from the writer would
+    /// be claiming pending entries that never arrive.
+    fn counts(&self) -> bool {
+        self.played >= MIN_PLAY
+    }
+
     /// The finished entry, if it ran long enough to have been a play.
     fn finish(&self) -> Option<Entry> {
-        (self.played >= MIN_PLAY).then(|| Entry { seconds: self.played.as_secs(), ..self.entry.clone() })
+        self.counts().then(|| Entry { seconds: self.played.as_secs(), ..self.entry.clone() })
     }
 }
 
@@ -164,11 +189,20 @@ impl Watcher {
         &self.session
     }
 
-    /// What is being followed right now — one line per player with an entry
-    /// open. The panel shows this, and it must be exactly what would be
-    /// written if everything stopped at this instant.
+    /// What is being followed right now — one line per player whose entry
+    /// would be written if everything stopped at this instant.
+    ///
+    /// Filtered by the same `counts()` the writer uses, not by "has an entry
+    /// open". The difference is not cosmetic: pause two seconds into a track
+    /// and walk away, and the unfiltered version leaves the panel claiming one
+    /// pending entry for the rest of the session, for a play that is never
+    /// written. A new track therefore takes five seconds to appear here, which
+    /// is the honest cost of the count meaning what it says.
     pub fn following(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.open.iter().map(|o| (o.entry.player.as_str(), o.entry.title.as_str()))
+        self.open
+            .iter()
+            .filter(|o| o.counts())
+            .map(|o| (o.entry.player.as_str(), o.entry.title.as_str()))
     }
 
     /// Fold one poll of the bus into the log, returning whatever just closed.
@@ -189,6 +223,15 @@ impl Watcher {
                 o.playing = s.playing;
                 true
             }
+            // A player still there but saying nothing is not a track change.
+            // `snapshot()` reports every field empty from a single failed
+            // metadata call, and a whole-bus error empties the list — so
+            // without this a D-Bus hiccup halfway through a 200-second track
+            // splits it into two hundred-second plays, doubling its play count
+            // and halving the length every tape cut from it inherits. `blank`
+            // already refuses to *open* an entry on no information; refusing
+            // to close one on the same evidence is the other half of that.
+            Some(s) if blank(s) => true,
             _ => {
                 done.extend(o.finish());
                 false
@@ -311,8 +354,25 @@ impl Log {
 mod tests {
     use super::*;
 
-    fn at(secs: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(secs)
+    /// Milliseconds since the epoch, so a test can poll at the rate the panel
+    /// actually polls at rather than in improbable one-shot jumps.
+    fn at(ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    /// Look at the bus every 500 ms from `from` to `to`, the way the loop does.
+    ///
+    /// Time is credited per poll and capped per poll, so the number of looks is
+    /// part of the arithmetic — a test that jumped straight from 0 to 200 s
+    /// would be measuring something the program never does.
+    fn ticks(w: &mut Watcher, seen: &[NowPlaying], from: u64, to: u64) -> Vec<Entry> {
+        let mut done = Vec::new();
+        let mut t = from;
+        while t <= to {
+            done.extend(w.observe(seen, at(t)));
+            t += 500;
+        }
+        done
     }
 
     fn np(bus: &str, title: &str, playing: bool) -> NowPlaying {
@@ -327,29 +387,35 @@ mod tests {
         }
     }
 
+    /// A snapshot of a player that is there but saying nothing — what a single
+    /// failed `get_metadata()` produces.
+    fn mute(bus: &str) -> NowPlaying {
+        NowPlaying { bus: bus.into(), player: bus.into(), playing: true, ..Default::default() }
+    }
+
     #[test]
     fn a_timestamp_is_rfc3339_in_utc() {
         assert_eq!(stamp(at(0)), "1970-01-01T00:00:00Z");
-        assert_eq!(stamp(at(1_774_562_156)), "2026-03-26T21:55:56Z");
+        assert_eq!(stamp(at(1_774_562_156_000)), "2026-03-26T21:55:56Z");
     }
 
     #[test]
     fn leap_days_land_where_they_should() {
         // 2024-02-29, a leap year; and 2100-03-01, which is not one.
-        assert_eq!(stamp(at(1_709_164_800)), "2024-02-29T00:00:00Z");
-        assert_eq!(stamp(at(4_107_542_400)), "2100-03-01T00:00:00Z");
+        assert_eq!(stamp(at(1_709_164_800_000)), "2024-02-29T00:00:00Z");
+        assert_eq!(stamp(at(4_107_542_400_000)), "2100-03-01T00:00:00Z");
     }
 
     #[test]
     fn a_session_is_named_for_when_it_started() {
-        assert_eq!(session_id(at(1_774_562_156)), "20260326-215556");
+        assert_eq!(session_id(at(1_774_562_156_000)), "20260326-215556");
     }
 
     #[test]
     fn a_track_closes_when_the_metadata_changes() {
         let mut w = Watcher::new("s".into());
-        assert!(w.observe(&[np("spotify", "Reach for the Dead", true)], at(0)).is_empty());
-        let done = w.observe(&[np("spotify", "Cold Earth", true)], at(200));
+        assert!(ticks(&mut w, &[np("spotify", "Reach for the Dead", true)], 0, 199_500).is_empty());
+        let done = w.observe(&[np("spotify", "Cold Earth", true)], at(200_000));
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].title, "Reach for the Dead");
         assert_eq!(done[0].seconds, 200, "the duration is what was played");
@@ -359,8 +425,8 @@ mod tests {
     #[test]
     fn a_player_leaving_closes_what_it_had_open() {
         let mut w = Watcher::new("s".into());
-        w.observe(&[np("spotify", "Cold Earth", true)], at(0));
-        let done = w.observe(&[], at(60));
+        ticks(&mut w, &[np("spotify", "Cold Earth", true)], 0, 59_500);
+        let done = w.observe(&[], at(60_000));
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].seconds, 60);
     }
@@ -368,20 +434,39 @@ mod tests {
     #[test]
     fn a_skip_is_not_a_play() {
         let mut w = Watcher::new("s".into());
-        w.observe(&[np("spotify", "a", true)], at(0));
-        let done = w.observe(&[np("spotify", "b", true)], at(2));
+        ticks(&mut w, &[np("spotify", "a", true)], 0, 1_500);
+        let done = w.observe(&[np("spotify", "b", true)], at(2_000));
         assert!(done.is_empty(), "two seconds is scrubbing, not listening");
     }
 
     #[test]
     fn paused_time_is_not_played_time() {
         let mut w = Watcher::new("s".into());
-        w.observe(&[np("spotify", "a", true)], at(0));
-        w.observe(&[np("spotify", "a", false)], at(10));
-        w.observe(&[np("spotify", "a", false)], at(600));
-        w.observe(&[np("spotify", "a", true)], at(610));
-        let done = w.observe(&[], at(620));
+        ticks(&mut w, &[np("spotify", "a", true)], 0, 10_000);
+        ticks(&mut w, &[np("spotify", "a", false)], 10_500, 600_000);
+        ticks(&mut w, &[np("spotify", "a", true)], 600_500, 610_000);
+        let done = w.close(at(610_500));
         assert_eq!(done[0].seconds, 20, "ten seconds either side of a long pause");
+    }
+
+    /// The one that corrupts the archive rather than one line of it.
+    ///
+    /// Time is credited in arrears using the flag from the *previous* poll,
+    /// which assumes the polls keep coming. Suspend the machine and they stop:
+    /// the next look holds a `playing` from last night and a gap of hours.
+    #[test]
+    fn a_suspended_machine_is_not_ten_hours_of_listening() {
+        let mut w = Watcher::new("s".into());
+        ticks(&mut w, &[np("spotify", "Cold Earth", true)], 0, 30_000);
+        // The lid closes. Ten hours later the first poll arrives, still
+        // holding last night's flag, and the player has since paused.
+        w.observe(&[np("spotify", "Cold Earth", false)], at(36_030_000));
+        let done = w.close(at(36_030_500));
+        assert!(
+            done[0].seconds <= 35,
+            "credited {}s across a suspend — that lands in a file that is never rewritten",
+            done[0].seconds
+        );
     }
 
     #[test]
@@ -389,16 +474,48 @@ mod tests {
         let mut w = Watcher::new("s".into());
         w.observe(&[np("spotify", "a", false)], at(0));
         assert_eq!(w.following().count(), 0);
-        w.observe(&[np("spotify", "a", true)], at(10));
+        ticks(&mut w, &[np("spotify", "a", true)], 500, 10_000);
         assert_eq!(w.following().count(), 1);
+    }
+
+    /// `following` is a claim about what would be written. It used to count
+    /// every open entry, including those too short to be written at all —
+    /// so pausing two seconds into a track left the panel reporting a pending
+    /// entry for the rest of the session, for a play that never arrived.
+    #[test]
+    fn the_panel_only_counts_what_would_actually_be_written() {
+        let mut w = Watcher::new("s".into());
+        ticks(&mut w, &[np("spotify", "a", true)], 0, 2_000);
+        assert_eq!(w.following().count(), 0, "two seconds in, nothing would be written");
+
+        // Pause there and walk away. The entry stays open and stays unwritable.
+        ticks(&mut w, &[np("spotify", "a", false)], 2_500, 3_600_000);
+        assert_eq!(w.following().count(), 0, "and the panel must not keep claiming it");
+        assert!(w.close(at(3_600_500)).is_empty(), "nothing was ever going to be written");
+    }
+
+    /// A single failed `get_metadata()` reports every field empty. Treating
+    /// that as a track change split one play into two — doubling its play
+    /// count and halving the length every tape cut from it inherits.
+    #[test]
+    fn a_momentary_silence_from_a_player_is_not_a_new_track() {
+        let mut w = Watcher::new("s".into());
+        ticks(&mut w, &[np("spotify", "Cold Earth", true)], 0, 100_000);
+        let done = ticks(&mut w, &[mute("spotify")], 100_500, 101_000);
+        assert!(done.is_empty(), "a hiccup is not the end of a track");
+
+        ticks(&mut w, &[np("spotify", "Cold Earth", true)], 101_500, 200_000);
+        let done = w.close(at(200_500));
+        assert_eq!(done.len(), 1, "one play, not two");
+        assert_eq!(done[0].seconds, 200);
     }
 
     #[test]
     fn two_players_are_logged_side_by_side() {
         let mut w = Watcher::new("s".into());
-        w.observe(&[np("spotify", "a", true), np("chromium", "b", true)], at(0));
+        ticks(&mut w, &[np("spotify", "a", true), np("chromium", "b", true)], 0, 100_000);
         assert_eq!(w.following().count(), 2);
-        let done = w.observe(&[np("spotify", "a", true)], at(100));
+        let done = w.observe(&[np("spotify", "a", true)], at(100_500));
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].player, "chromium");
     }
@@ -406,21 +523,18 @@ mod tests {
     #[test]
     fn a_player_with_nothing_to_say_gets_no_entry() {
         let mut w = Watcher::new("s".into());
-        let mut n = np("mpv", "", true);
-        n.artist = String::new();
-        n.album = String::new();
-        w.observe(&[n], at(0));
+        ticks(&mut w, &[mute("mpv")], 0, 10_000);
         assert_eq!(w.following().count(), 0);
     }
 
     #[test]
     fn closing_the_session_writes_what_was_still_running() {
         let mut w = Watcher::new("s".into());
-        w.observe(&[np("spotify", "a", true)], at(0));
-        let done = w.close(at(90));
+        ticks(&mut w, &[np("spotify", "a", true)], 0, 90_000);
+        let done = w.close(at(90_000));
         assert_eq!(done[0].seconds, 90);
         assert_eq!(w.following().count(), 0);
-        assert!(w.close(at(100)).is_empty(), "closing twice must not duplicate");
+        assert!(w.close(at(100_000)).is_empty(), "closing twice must not duplicate");
     }
 
     /// Append-only survives a crash only if the wreckage stays on one line.

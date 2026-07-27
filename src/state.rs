@@ -426,6 +426,14 @@ pub struct RecState {
     /// Players currently being followed. Anything counted here has an entry
     /// that will be written when it ends.
     pub following: u8,
+    /// An append has failed since REC was last switched on.
+    ///
+    /// Latched rather than transient, because the status line that reports the
+    /// failure scrolls away in seconds and the REC lamp does not. Without this
+    /// the lamp burns steadily over a log taking no writes at all — a full
+    /// disk, a permission change — which is the display wishing rather than
+    /// reading. Cleared by switching REC off and on.
+    pub failed: bool,
 }
 
 /// What is on the other end of the cable.

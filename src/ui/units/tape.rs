@@ -79,24 +79,32 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         Style::default().fg(theme.ink_white).bg(theme.window),
     );
 
+    // Where the counter sits. Computed before anything else on its row, since
+    // it is right-aligned and everything to its left has to know where it ends.
+    let cw = glyph::seven_seg_width("8888");
+    let right_col = 12u16;
+    let cx = w.x + w.width.saturating_sub(right_col + cw + 2);
+
     // --- what is being written down ---------------------------------------
     // REC is a switch; this lamp is a readout. A deck with its power off is
-    // not appending to anything, so the switch can be left where it was and
-    // the lamp still tells the truth.
-    let rec = t.power && t.rec.on;
+    // not appending to anything, and neither is one whose last write failed,
+    // so the switch can be left where it was and the lamp still tells the
+    // truth.
+    let rec = t.power && t.rec.on && !t.rec.failed;
     chassis::boxed(buf, w.x + 2, w.y + 3, "REC", theme, rec, true);
-    if rec {
+
+    // The counts share a row with COUNTER, which is right-aligned and moves
+    // with the bay's width. Drawn only where they fit, because a readout
+    // overprinting another readout produces a third that says neither.
+    let counts = format!("{:03} LOG · {}", t.rec.wrote.min(999), t.rec.following);
+    let room = cx.saturating_sub(w.x + 9) as usize;
+    if rec && counts.chars().count() <= room {
         // Both counts are of things that already happened: entries on disk,
-        // and players with an entry open that will be written when they end.
-        let following = t.rec.following;
-        chassis::sublegend(
-            buf,
-            w.x + 8,
-            w.y + 3,
-            &format!("{:03} LOG · {following}", t.rec.wrote.min(999)),
-            theme,
-            true,
-        );
+        // and players whose entry has run long enough that it will be written.
+        chassis::sublegend(buf, w.x + 8, w.y + 3, &counts, theme, true);
+    }
+    if t.rec.failed && t.power {
+        chassis::boxed(buf, w.x + 8, w.y + 3, "NO LOG", theme, true, true);
     }
 
     // --- the counter ------------------------------------------------------
@@ -111,9 +119,6 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         "    ".to_string()
     };
 
-    let cw = glyph::seven_seg_width("8888");
-    let right_col = 12u16;
-    let cx = w.x + w.width.saturating_sub(right_col + cw + 2);
     chassis::vfd(buf, cx, w.y, &counter, theme);
     chassis::sublegend(buf, cx, w.y + 3, "COUNTER", theme, true);
 
@@ -246,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_recording_deck_reports_what_it_has_written() {
-        let panel = render(RecState { on: true, wrote: 12, following: 2 }, true);
+        let panel = render(RecState { on: true, wrote: 12, following: 2, ..Default::default() }, true);
         assert!(panel.contains("012 LOG · 2"), "{panel}");
     }
 
@@ -255,7 +260,7 @@ mod tests {
     /// nothing, so it must not say it is recording.
     #[test]
     fn a_deck_with_no_power_does_not_claim_to_be_recording() {
-        let panel = render(RecState { on: true, wrote: 12, following: 2 }, false);
+        let panel = render(RecState { on: true, wrote: 12, following: 2, ..Default::default() }, false);
         assert!(!panel.contains("LOG ·"), "a dead deck counted entries: {panel}");
         assert!(!panel.contains("listening log"), "a dead deck claimed to record: {panel}");
     }
@@ -266,6 +271,43 @@ mod tests {
     fn the_strip_says_the_recording_is_not_going_to_tape() {
         let panel = render(RecState { on: true, ..Default::default() }, true);
         assert!(panel.contains("REC to the listening log, not to tape"), "{panel}");
+    }
+
+    /// The status line reporting an unwritable log scrolls away in seconds;
+    /// the REC lamp does not. A lamp burning over a log taking no writes is
+    /// the display wishing.
+    #[test]
+    fn a_log_that_cannot_be_written_puts_the_rec_lamp_out() {
+        let panel = render(
+            RecState { on: true, wrote: 12, following: 2, failed: true },
+            true,
+        );
+        assert!(!panel.contains("LOG ·"), "a failed log kept counting: {panel}");
+        assert!(panel.contains("NO LOG"), "and must say so where the lamp was: {panel}");
+        assert!(!panel.contains("listening log"), "{panel}");
+    }
+
+    /// The counts share a row with COUNTER, which is right-aligned. In a
+    /// narrow terminal they used to overprint into `012COUNTER2`.
+    #[test]
+    fn the_counts_give_way_rather_than_overprint_the_counter() {
+        let rec = RecState { on: true, wrote: 12, following: 2, ..Default::default() };
+        let mut drawn = 0;
+        for width in 50..=120u16 {
+            let mut stack = Stack::default();
+            stack.tape.rec = rec.clone();
+            let area = Rect::new(0, 0, width, 12);
+            let mut buf = Buffer::empty(area);
+            let theme = Theme::for_stack(&stack);
+            draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+            let text: String = (0..area.width).map(|x| buf[(x, 5)].symbol()).collect();
+            if text.contains("LOG") {
+                drawn += 1;
+                assert!(text.contains("COUNTER"), "at {width}: counter lost to LOG: {text}");
+                assert!(text.contains("012 LOG · 2"), "at {width}: {text}");
+            }
+        }
+        assert!(drawn > 0, "the counts were never drawn — this test proves nothing");
     }
 
     #[test]

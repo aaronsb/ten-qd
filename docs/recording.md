@@ -74,12 +74,17 @@ is kept in the 12-volt memory — always-append only gathers a week of listening
 if it survives the key coming out. There is no mode selector yet because there
 is only one mode; AUDIO will need one.
 
-REC is a switch, and the lamp beside it is a readout. Take the deck out of the
-signal path and nothing is appended, so the lamp goes dark while the switch
-stays where you left it — pull the power and put it back and the log picks up.
+REC is a switch, and the lamp beside it is a readout. It lights only while
+entries can actually be appended — take the deck out of the signal path, or let
+a write fail, and the lamp goes dark (`NO LOG` for the second case) while the
+switch stays where you left it. Pull the power and put it back and the log
+picks up.
+
 The window reports two counts, both of things that already happened: entries
-committed to disk, and players with an entry open that will be written when
-they end.
+committed to disk, and players whose entry has already run long enough that it
+*will* be written. The second is filtered by the same five-second rule the
+writer uses, which costs a new track five seconds before it appears and buys
+the count meaning exactly what it says.
 
 ### The log, and what is cut from it
 
@@ -157,11 +162,21 @@ way, with however long it actually ran. Players are keyed by bus name, because
 two Chromium windows both call themselves the same thing and one of them
 starting a second video is not the first one changing track.
 
-Two rules keep the log from filling with things nobody listened to. Time is
+Three rules keep the log from filling with things nobody listened to. Time is
 only credited while a player reports itself playing, so a track left paused
 overnight records the minute you heard rather than the eight hours it sat
-there. And anything under five seconds is dropped: scrubbing through an album
-is not twelve plays.
+there. Anything under five seconds is dropped: scrubbing through an album is
+not twelve plays. And no single poll may credit more than a few seconds —
+because time is credited in arrears, and closing the lid at 22:00 with Spotify
+playing otherwise makes the first poll of the morning book a ten-hour listen
+into a file that is never rewritten.
+
+Two silences are also read as silences rather than as events. A player still
+present but reporting no metadata — one failed D-Bus call — is not a track
+change, or a hiccup would split one play into two, doubling its count and
+halving the length every tape cut from it inherits. And a bus that cannot be
+reached at all is not a bus with nothing on it, so an outage holds the open
+entries rather than closing every one of them.
 
 So TRACK writes down the order and nothing else. It costs no disk and
 duplicates no content, and the tape cut out of it later loads straight back

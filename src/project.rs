@@ -39,12 +39,27 @@ pub enum Pick {
 }
 
 impl Pick {
-    pub fn parse(s: &str) -> Pick {
-        match s.trim() {
+    /// Parse a selector, or say why it is not one.
+    ///
+    /// A selector with no digits in it cannot be rejected quietly: reducing
+    /// `--export=july` to an empty prefix would match every session, so a typo
+    /// would hand back the entire history under a header that declines to say
+    /// what it is. Widening silently is the worst of the available failures.
+    pub fn parse(s: &str) -> Result<Pick, String> {
+        Ok(match s.trim() {
             "" | "all" => Pick::All,
             "last" => Pick::Last,
-            other => Pick::Prefix(digits(other)),
-        }
+            other => {
+                let d = digits(other);
+                if d.is_empty() {
+                    return Err(format!(
+                        "'{other}' selects nothing — use a date (2026-07), a session id, \
+                         'last', or 'all'. 'ten-qd --log' lists what is there"
+                    ));
+                }
+                Pick::Prefix(d)
+            }
+        })
     }
 
     fn describe(&self) -> String {
@@ -226,6 +241,16 @@ pub fn cut(entries: &[Entry], rank: bool) -> Vec<Cut> {
     cuts
 }
 
+/// Flatten anything that would break the one-record-per-line format.
+///
+/// A browser tab's title is arbitrary text and reaches the log intact, because
+/// JSON escapes a newline rather than refusing it. Interpolated raw into an
+/// `#EXTINF` it would split the line, and the tail would read back as a path —
+/// a track named after half a title, pointing at nothing.
+fn oneline(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().into()
+}
+
 /// Render an M3U.
 ///
 /// Only tracks with a location get an `#EXTINF` and a path. The rest are
@@ -242,9 +267,9 @@ pub fn m3u(cuts: &[Cut], what: &Pick) -> String {
 
     for c in cuts {
         let label = if c.artist.is_empty() {
-            c.title.clone()
+            oneline(&c.title)
         } else {
-            format!("{} - {}", c.artist, c.title)
+            format!("{} - {}", oneline(&c.artist), oneline(&c.title))
         };
         if c.uri.is_empty() {
             out.push_str(&format!("# no location · {} play(s) · {label}\n", c.plays));
@@ -298,11 +323,23 @@ mod tests {
 
     #[test]
     fn a_selector_ignores_whatever_punctuation_was_typed() {
-        assert_eq!(Pick::parse("2026-07"), Pick::Prefix("202607".into()));
-        assert_eq!(Pick::parse("202607"), Pick::Prefix("202607".into()));
-        assert_eq!(Pick::parse("20260726-100000"), Pick::Prefix("20260726100000".into()));
-        assert_eq!(Pick::parse(""), Pick::All);
-        assert_eq!(Pick::parse(" last "), Pick::Last);
+        let p = |s: &str| Pick::parse(s).expect("a selector");
+        assert_eq!(p("2026-07"), Pick::Prefix("202607".into()));
+        assert_eq!(p("202607"), Pick::Prefix("202607".into()));
+        assert_eq!(p("20260726-100000"), Pick::Prefix("20260726100000".into()));
+        assert_eq!(p(""), Pick::All);
+        assert_eq!(p(" last "), Pick::Last);
+    }
+
+    /// A selector reducing to no digits used to match every session, so
+    /// `--export=july` quietly handed back the entire history.
+    #[test]
+    fn a_selector_with_no_digits_is_refused_rather_than_widened() {
+        for bad in ["july", "foo", "--rank", "last week"] {
+            let why = Pick::parse(bad).expect_err(bad);
+            assert!(why.contains(bad), "the message must name what was typed: {why}");
+            assert!(why.contains("--log"), "and where to look instead: {why}");
+        }
     }
 
     #[test]
@@ -370,6 +407,26 @@ mod tests {
             "an EXTINF with no path would label the next track: {text}"
         );
         assert!(text.contains("#PLAYLIST:ten-qd · everything · 2 tracks"), "{text}");
+    }
+
+    /// A browser tab's title is arbitrary text and reaches the log intact,
+    /// because JSON escapes a newline rather than refusing it. Interpolated
+    /// raw it would split the `#EXTINF` and the tail would read back as a path.
+    #[test]
+    fn a_title_cannot_break_the_line_it_is_written_on() {
+        let entries = vec![e(
+            "s",
+            "2026-07-26T10:00:00Z",
+            "BoC\nspotify:track:evil",
+            "Cold\tEarth",
+            "spotify:a",
+            100,
+        )];
+        let text = m3u(&cut(&entries, false), &Pick::All);
+        let extinf: Vec<&str> = text.lines().filter(|l| l.starts_with("#EXTINF:")).collect();
+        assert_eq!(extinf.len(), 1, "{text}");
+        assert_eq!(extinf[0], "#EXTINF:100,BoC spotify:track:evil - Cold Earth");
+        assert_eq!(text.lines().count(), 4, "header, playlist, extinf, location: {text}");
     }
 
     #[test]
