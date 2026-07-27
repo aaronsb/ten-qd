@@ -309,7 +309,12 @@ mod tests {
                 let theme = Theme::for_stack(&stack);
                 draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
                 let text: String = (0..area.width).map(|x| buf[(x, 5)].symbol()).collect();
-                let shown = if failed { "NO LOG" } else { "012 LOG · 2" };
+                // The closing rule, not just the word: `NO LOG` is six
+                // characters inside an eight-cell box, so it survives a cell
+                // of overprint and `contains("NO LOG")` would stay green over
+                // a visibly garbled row. The rule is the cell COUNTER eats
+                // first, which makes it the thing worth asserting.
+                let shown = if failed { "NO LOG▕" } else { "012 LOG · 2" };
                 if text.contains("LOG") {
                     drawn += 1;
                     assert!(text.contains("COUNTER"), "at {width} ({failed}): {text}");

@@ -333,6 +333,14 @@ mod tests {
         assert_eq!(e[0].path, PathBuf::from("/music/Ficsit Inc..flac"));
     }
 
+    /// The rarer slashless form is relative, and resolves against the playlist
+    /// like any other relative line rather than against the process's cwd.
+    #[test]
+    fn a_file_url_without_slashes_is_relative_to_the_playlist() {
+        let e = parse_m3u("file:a.flac\n", Path::new("/m")).0;
+        assert_eq!(e[0].path, PathBuf::from("/m/a.flac"));
+    }
+
     #[test]
     fn pls_orders_by_index_not_by_line() {
         let e = parse_pls(

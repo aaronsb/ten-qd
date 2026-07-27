@@ -509,10 +509,18 @@ mod tests {
     #[test]
     fn a_paused_player_starts_nothing() {
         let mut w = Watcher::new("s".into());
-        w.observe(&[np("spotify", "a", false)], at(0));
+        ticks(&mut w, &[np("spotify", "a", false)], 0, 10_000);
         assert_eq!(w.following().count(), 0);
-        ticks(&mut w, &[np("spotify", "a", true)], 500, 10_000);
+        ticks(&mut w, &[np("spotify", "a", true)], 10_500, 20_000);
         assert_eq!(w.following().count(), 1);
+
+        // The counts are not enough on their own: `following` filters by the
+        // five-second rule, so an entry opened too early reports zero anyway
+        // and the guard could be removed without either count moving. What
+        // does move is the entry's own stamp and duration.
+        let done = w.close(at(20_000));
+        assert_eq!(done[0].at, "1970-01-01T00:00:10Z", "stamped when it began playing");
+        assert_eq!(done[0].seconds, 9, "and carrying only the part that played");
     }
 
     /// `following` is a claim about what would be written. It used to count
@@ -576,7 +584,11 @@ mod tests {
         ticks(&mut w, &[np("mpv", "Cold Earth", true)], 0, 100_000);
         let done = ticks(&mut w, &[mute("mpv", true)], 100_500, 200_000);
         assert_eq!(done.len(), 1, "a silence this long is not a hiccup");
-        assert!(done[0].seconds <= 116, "got {}s", done[0].seconds);
+        // The exact figure, because a bound would also pass for an entry that
+        // was never held at all — which is what the whole arm exists to do.
+        // 100 s played, then held across the grace and closed at the first
+        // poll past it, accruing 0.5 s a poll because it still claims to play.
+        assert_eq!(done[0].seconds, 116, "held for the grace period and no longer");
         assert_eq!(w.following().count(), 0);
     }
 
