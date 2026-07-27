@@ -278,7 +278,10 @@ pub fn m3u(cuts: &[Cut], what: &Pick) -> String {
         if c.plays > 1 {
             out.push_str(&format!("#PLAYS:{}\n", c.plays));
         }
-        out.push_str(&format!("#EXTINF:{},{label}\n{}\n", c.seconds, c.uri));
+        // The location gets the same treatment as the label, for the same
+        // reason: `uri` is whatever the player put in `xesam:url`, and a
+        // control character in it would split this line too.
+        out.push_str(&format!("#EXTINF:{},{label}\n{}\n", c.seconds, oneline(&c.uri)));
     }
     out
 }

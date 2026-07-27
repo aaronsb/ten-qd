@@ -238,7 +238,12 @@ pub fn tape_from_playlist(path: &Path) -> Result<(Tape, usize)> {
     if tracks.is_empty() {
         bail!("nothing in {name} could be decoded");
     }
-    Ok((Tape::from_tracks(name, path.to_path_buf(), tracks), loaded.remote))
+    // Everything the deck could not cue, not only the lines `resolve` turned
+    // away: a file that has since been moved, or one in a codec symphonia does
+    // not carry, fails silently in the probe above and is just as absent from
+    // the tape as a `spotify:` line is.
+    let dropped = loaded.entries.len() - tracks.len() + loaded.remote;
+    Ok((Tape::from_tracks(name, path.to_path_buf(), tracks), dropped))
 }
 
 /// Gather every track below `dir` into a tape.

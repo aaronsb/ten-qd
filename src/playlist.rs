@@ -106,7 +106,10 @@ fn resolve(raw: &str, dir: &Path) -> Option<PathBuf> {
     if let Some(s) = scheme(raw) {
         let rest = &raw[s.len() + 1..];
         if s.eq_ignore_ascii_case("file") {
-            return Some(PathBuf::from(percent_decode(rest.strip_prefix("//").unwrap_or(rest))));
+            // `file://…` is absolute; the rarer `file:a.flac` is relative and
+            // resolves against the playlist like any other relative line.
+            let p = PathBuf::from(percent_decode(rest.strip_prefix("//").unwrap_or(rest)));
+            return Some(if p.is_absolute() { p } else { dir.join(p) });
         }
         // `scheme://…` is a URI beyond argument. Without the slashes it is
         // genuinely ambiguous: `spotify:track:…` is a service URI, and

@@ -103,7 +103,10 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         // and players whose entry has run long enough that it will be written.
         chassis::sublegend(buf, w.x + 8, w.y + 3, &counts, theme, true);
     }
-    if t.rec.failed && t.power {
+    // Same room test — `glyph::boxed` adds a rule either side, so this is
+    // eight cells, and a fault warning overprinting COUNTER would be one more
+    // readout that says neither thing.
+    if t.rec.failed && t.power && room >= 8 {
         chassis::boxed(buf, w.x + 8, w.y + 3, "NO LOG", theme, true, true);
     }
 
@@ -291,23 +294,30 @@ mod tests {
     /// narrow terminal they used to overprint into `012COUNTER2`.
     #[test]
     fn the_counts_give_way_rather_than_overprint_the_counter() {
-        let rec = RecState { on: true, wrote: 12, following: 2, ..Default::default() };
-        let mut drawn = 0;
-        for width in 50..=120u16 {
-            let mut stack = Stack::default();
-            stack.tape.rec = rec.clone();
-            let area = Rect::new(0, 0, width, 12);
-            let mut buf = Buffer::empty(area);
-            let theme = Theme::for_stack(&stack);
-            draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
-            let text: String = (0..area.width).map(|x| buf[(x, 5)].symbol()).collect();
-            if text.contains("LOG") {
-                drawn += 1;
-                assert!(text.contains("COUNTER"), "at {width}: counter lost to LOG: {text}");
-                assert!(text.contains("012 LOG · 2"), "at {width}: {text}");
+        // Both readouts that share the row with COUNTER: the running counts,
+        // and the NO LOG warning that replaces them. The warning was the one
+        // that still overprinted, and a sweep that only set `failed: false`
+        // could never have seen it.
+        for failed in [false, true] {
+            let rec = RecState { on: true, wrote: 12, following: 2, failed };
+            let mut drawn = 0;
+            for width in 50..=120u16 {
+                let mut stack = Stack::default();
+                stack.tape.rec = rec.clone();
+                let area = Rect::new(0, 0, width, 12);
+                let mut buf = Buffer::empty(area);
+                let theme = Theme::for_stack(&stack);
+                draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+                let text: String = (0..area.width).map(|x| buf[(x, 5)].symbol()).collect();
+                let shown = if failed { "NO LOG" } else { "012 LOG · 2" };
+                if text.contains("LOG") {
+                    drawn += 1;
+                    assert!(text.contains("COUNTER"), "at {width} ({failed}): {text}");
+                    assert!(text.contains(shown), "at {width} ({failed}): {text}");
+                }
             }
+            assert!(drawn > 0, "nothing drawn for failed={failed} — this proves nothing");
         }
-        assert!(drawn > 0, "the counts were never drawn — this test proves nothing");
     }
 
     #[test]

@@ -727,13 +727,22 @@ impl App {
                 }
                 let mut rec = self.stack.tape.rec.clone();
                 rec.on = on;
-                // Switching on clears a previous failure: this is the operator
-                // saying "try again", and a latch nothing can reset would
-                // outlive the fault it was reporting.
-                rec.failed = false;
+                // Switching *on* clears a previous failure: that is the
+                // operator saying "try again". Switching off must not, because
+                // `rec_stop` above has just tried to flush and may have failed
+                // doing it — clearing here would hide the loss of the tail at
+                // the one moment it mattered.
+                if on {
+                    rec.failed = false;
+                }
                 let wrote = rec.wrote;
                 self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
 
+                // A flush that failed on the way out keeps its own message: it
+                // says the tail was lost, which a tidy count would paper over.
+                if !on && self.stack.tape.rec.failed {
+                    return;
+                }
                 self.status(match (on, self.stack.tape.power) {
                     // The session name is here because it is what selects a
                     // run back out of the log later — the tape you will cut.
@@ -1317,14 +1326,21 @@ impl App {
                 None => failed = Some("no HOME — the log has nowhere to live".into()),
             }
         }
-        if let Some(why) = failed {
-            // Latched, not just announced. The status line scrolls away within
-            // seconds and the REC lamp does not, so a lamp burning over a log
-            // that has stopped taking writes is exactly the display wishing
-            // rather than reading. Cleared only by switching REC off and on.
+        // Latched, not just announced. The status line scrolls away within
+        // seconds and the REC lamp does not, so a lamp burning over a log that
+        // has stopped taking writes is the display wishing rather than reading.
+        //
+        // It has to clear itself, though. The latch is there to outlive the
+        // *message*, not the fault: a disk that filled and was emptied again
+        // would otherwise show NO LOG over a log being written to perfectly
+        // well for the rest of the session, which is the same lie inverted.
+        let settled = failed.is_none() && n > 0;
+        if failed.is_some() || (settled && self.stack.tape.rec.failed) {
             let mut rec = self.stack.tape.rec.clone();
-            rec.failed = true;
+            rec.failed = failed.is_some();
             self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+        }
+        if let Some(why) = failed {
             self.status(why);
         }
         n

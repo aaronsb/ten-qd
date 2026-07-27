@@ -61,6 +61,14 @@ const MIN_PLAY: Duration = Duration::from_secs(5);
 /// event from here and get the same treatment.
 const MAX_CREDIT: Duration = Duration::from_secs(5);
 
+/// How long a player may say nothing before its open entry is closed.
+///
+/// A failed metadata call is momentary and holding through it keeps one play
+/// whole. A player that clears its metadata and stays cleared is a different
+/// thing, and holding for that would credit its time to whichever track was
+/// named last. This is where the code stops calling a silence momentary.
+const BLANK_GRACE: Duration = Duration::from_secs(15);
+
 /// One line of the log: something that played, and for how long.
 ///
 /// Read back as well as written, and the file is hand-editable — so every
@@ -142,6 +150,9 @@ struct Open {
     /// The last poll, so time can be credited in arrears.
     seen: SystemTime,
     playing: bool,
+    /// When this player last went quiet about what it is playing, if it has.
+    /// Cleared the moment it says something again.
+    blank_since: Option<SystemTime>,
 }
 
 impl Open {
@@ -221,17 +232,40 @@ impl Watcher {
         self.open.retain_mut(|o| match seen.iter().find(|s| s.bus == o.bus) {
             Some(s) if same_track(s, &o.entry) => {
                 o.playing = s.playing;
+                o.blank_since = None;
                 true
             }
             // A player still there but saying nothing is not a track change.
             // `snapshot()` reports every field empty from a single failed
-            // metadata call, and a whole-bus error empties the list — so
-            // without this a D-Bus hiccup halfway through a 200-second track
-            // splits it into two hundred-second plays, doubling its play count
-            // and halving the length every tape cut from it inherits. `blank`
-            // already refuses to *open* an entry on no information; refusing
-            // to close one on the same evidence is the other half of that.
-            Some(s) if blank(s) => true,
+            // metadata call, so without this a D-Bus hiccup halfway through a
+            // 200-second track splits it into two hundred-second plays,
+            // doubling its play count and halving the length every tape cut
+            // from it inherits. `blank` already refuses to *open* an entry on
+            // no information; refusing to close one on the same evidence is
+            // the other half of that.
+            //
+            // Two things this must not do. It must not keep the old `playing`
+            // flag — a player that clears its metadata at the moment it stops
+            // would then accrue at real time for as long as the terminal
+            // stayed open, writing an hour-long play of whatever was last
+            // named. And it must not hold for ever: a hiccup is momentary by
+            // definition, and past the grace period the honest reading is that
+            // whatever is on the other end is no longer the track we opened.
+            Some(s) if blank(s) => {
+                o.playing = s.playing;
+                if o.blank_since.is_none() {
+                    o.blank_since = Some(now);
+                }
+                let waited = o
+                    .blank_since
+                    .and_then(|t| now.duration_since(t).ok())
+                    .unwrap_or(Duration::ZERO);
+                if waited > BLANK_GRACE {
+                    done.extend(o.finish());
+                    return false;
+                }
+                true
+            }
             _ => {
                 done.extend(o.finish());
                 false
@@ -259,6 +293,7 @@ impl Watcher {
                     played: Duration::ZERO,
                     seen: now,
                     playing: true,
+                    blank_since: None,
                 };
                 self.open.push(o);
             }
@@ -270,12 +305,13 @@ impl Watcher {
     /// The rack is being switched off. Everything still running closes here,
     /// with however long it actually ran — a session that ends mid-track
     /// should still record the part you heard.
-    pub fn close(&mut self, now: SystemTime) -> Vec<Entry> {
-        let mut done = Vec::new();
-        for o in &mut self.open {
-            o.advance(now);
-            done.extend(o.finish());
-        }
+    pub fn close(&mut self, _now: SystemTime) -> Vec<Entry> {
+        // Deliberately does not credit the time since the last poll. On a
+        // clean exit that is one frame and worth nothing; after an outage or a
+        // suspend it is time nobody observed, and crediting it could push an
+        // entry the panel had just reported as *not* pending over the
+        // five-second line and write it. What was observed is what is written.
+        let done: Vec<Entry> = self.open.iter().filter_map(Open::finish).collect();
         self.open.clear();
         done
     }
@@ -388,9 +424,11 @@ mod tests {
     }
 
     /// A snapshot of a player that is there but saying nothing — what a single
-    /// failed `get_metadata()` produces.
-    fn mute(bus: &str) -> NowPlaying {
-        NowPlaying { bus: bus.into(), player: bus.into(), playing: true, ..Default::default() }
+    /// failed `get_metadata()` produces. `playing` matters: a player that
+    /// clears its metadata *because it stopped* reports false, and that is the
+    /// case that used to accrue time for ever.
+    fn mute(bus: &str, playing: bool) -> NowPlaying {
+        NowPlaying { bus: bus.into(), player: bus.into(), playing, ..Default::default() }
     }
 
     #[test]
@@ -462,10 +500,9 @@ mod tests {
         // holding last night's flag, and the player has since paused.
         w.observe(&[np("spotify", "Cold Earth", false)], at(36_030_000));
         let done = w.close(at(36_030_500));
-        assert!(
-            done[0].seconds <= 35,
-            "credited {}s across a suspend — that lands in a file that is never rewritten",
-            done[0].seconds
+        assert_eq!(
+            done[0].seconds, 35,
+            "credited across a suspend, into a file that is never rewritten"
         );
     }
 
@@ -501,13 +538,46 @@ mod tests {
     fn a_momentary_silence_from_a_player_is_not_a_new_track() {
         let mut w = Watcher::new("s".into());
         ticks(&mut w, &[np("spotify", "Cold Earth", true)], 0, 100_000);
-        let done = ticks(&mut w, &[mute("spotify")], 100_500, 101_000);
+        let done = ticks(&mut w, &[mute("spotify", true)], 100_500, 101_000);
         assert!(done.is_empty(), "a hiccup is not the end of a track");
 
         ticks(&mut w, &[np("spotify", "Cold Earth", true)], 101_500, 200_000);
         let done = w.close(at(200_500));
         assert_eq!(done.len(), 1, "one play, not two");
         assert_eq!(done[0].seconds, 200);
+    }
+
+    /// The hold added for the hiccup above must not become a licence to accrue
+    /// time on a stale flag. mpv reaching the end of its playlist keeps the bus
+    /// object, sets Stopped and clears the metadata — and the entry used to go
+    /// on counting at real time for as long as the terminal stayed open,
+    /// writing an hour-long play of whatever was named last.
+    #[test]
+    fn a_player_that_goes_quiet_because_it_stopped_accrues_nothing() {
+        let mut w = Watcher::new("s".into());
+        ticks(&mut w, &[np("mpv", "Cold Earth", true)], 0, 100_000);
+        // Blank *and* stopped, well inside the grace period so the hold is
+        // still in force — this measures the flag, not the timeout. Holding
+        // the old `playing` here would bank ten seconds nobody listened to.
+        ticks(&mut w, &[mute("mpv", false)], 100_500, 110_000);
+        let done = w.close(at(110_000));
+        assert_eq!(
+            done[0].seconds, 100,
+            "credited a player that had stopped, on a flag from before it stopped"
+        );
+    }
+
+    /// …and the hold is bounded even while the player still claims to play,
+    /// because past the grace period nothing supports the claim that what is
+    /// running is still the track we opened.
+    #[test]
+    fn a_silence_that_is_not_momentary_closes_the_entry() {
+        let mut w = Watcher::new("s".into());
+        ticks(&mut w, &[np("mpv", "Cold Earth", true)], 0, 100_000);
+        let done = ticks(&mut w, &[mute("mpv", true)], 100_500, 200_000);
+        assert_eq!(done.len(), 1, "a silence this long is not a hiccup");
+        assert!(done[0].seconds <= 116, "got {}s", done[0].seconds);
+        assert_eq!(w.following().count(), 0);
     }
 
     #[test]
@@ -523,7 +593,7 @@ mod tests {
     #[test]
     fn a_player_with_nothing_to_say_gets_no_entry() {
         let mut w = Watcher::new("s".into());
-        ticks(&mut w, &[mute("mpv")], 0, 10_000);
+        ticks(&mut w, &[mute("mpv", true)], 0, 10_000);
         assert_eq!(w.following().count(), 0);
     }
 

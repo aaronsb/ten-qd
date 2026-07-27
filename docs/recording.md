@@ -77,7 +77,9 @@ is only one mode; AUDIO will need one.
 REC is a switch, and the lamp beside it is a readout. It lights only while
 entries can actually be appended — take the deck out of the signal path, or let
 a write fail, and the lamp goes dark (`NO LOG` for the second case) while the
-switch stays where you left it. Pull the power and put it back and the log
+switch stays where you left it. The fault clears itself when writes succeed
+again: the latch is there to outlive the status line, which scrolls away, not
+to outlive the fault. Pull the power and put it back and the log
 picks up.
 
 The window reports two counts, both of things that already happened: entries
@@ -177,6 +179,14 @@ change, or a hiccup would split one play into two, doubling its count and
 halving the length every tape cut from it inherits. And a bus that cannot be
 reached at all is not a bus with nothing on it, so an outage holds the open
 entries rather than closing every one of them.
+
+Holding is bounded in both directions, because a hold is a guess and a guess
+should not outlive its evidence. A player that goes quiet is still believed
+about whether it is *playing*, so one that clears its metadata at the moment it
+stops accrues nothing — otherwise an idle mpv would bank an hour against
+whatever track was named last. And the hold expires after fifteen seconds:
+past that, nothing supports the claim that what is running is still the track
+the entry was opened for.
 
 So TRACK writes down the order and nothing else. It costs no disk and
 duplicates no content, and the tape cut out of it later loads straight back
