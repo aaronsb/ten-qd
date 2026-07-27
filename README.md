@@ -119,7 +119,7 @@ set for your headphones is not baked into the file. See
 [docs/recording.md](docs/recording.md).
 
 Wants a terminal at least **84 columns** wide and 24-bit colour, with a font
-that has good block-element coverage — any Nerd Font will do. The rack is 70
+that has good block-element coverage — any Nerd Font will do. The rack is 87
 rows tall and scrolls with PgUp/PgDn or the wheel.
 
 **Every control is clickable.** Sliders take a click anywhere along their
@@ -168,7 +168,7 @@ sudo modprobe -r dvb_usb_rtl28xxu dvb_usb_v2 rtl2832
 rtl_test -t                                  # should name the tuner chip
 ```
 
-Without one the panel says so and the other two sources are unaffected. See
+Without one the panel says so and the other three sources are unaffected. See
 [docs/tuner.md](docs/tuner.md) for how the demodulator works and what had to be
 measured to make the meters honest.
 
