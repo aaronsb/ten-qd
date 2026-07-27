@@ -113,10 +113,18 @@ The point is a week of YouTube Music in a tab and Spotify in the afternoon
 coming out as one list you hold, in a format any player can open.
 
 In **AUDIO** mode `R` arms the deck — meters live, nothing written — so the
-record level can be set against real signal, and again to roll. It writes WAV
-tapped *before* the equaliser, so the volume can be anywhere and the curve you
-set for your headphones is not baked into the file. See
+record level can be set against real signal, and again to roll. After that `R`
+pauses and resumes, and `s` ends the take: a pause leaves the file open and the
+COUNTER standing, so one take is one file however many times you stop for. It
+writes WAV tapped *before* the equaliser, so the volume can be anywhere and the
+curve you set for your headphones is not baked into the file. See
 [docs/recording.md](docs/recording.md).
+
+![The deck four seconds into a take, recording Spotify through the aux input](docs/img/rack-record.png)
+
+The COUNTER counts the take while one is being made, and the tape the rest of
+the time. It agrees with the length beside REC because both are the same
+measurement: seconds the writer has actually committed to the file.
 
 Wants a terminal at least **84 columns** wide and 24-bit colour, with a font
 that has good block-element coverage — any Nerd Font will do. The rack is 87
@@ -137,7 +145,8 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `[` `]` `g` `P` | tune down/up · LOCAL · tuner power |
 | `e` `r` `z` | eject · repeat · random |
 | `v` `y` `b` | flip the tape · Dolby · auto-reverse |
-| `M` `R` | record mode: TRACK a list · AUDIO the signal — then arm and roll |
+| `M` `R` | record mode: TRACK a list · AUDIO the signal — then arm, roll, pause |
+| `s` | AUDIO: ends the take — one file across every pause |
 | `( )` | record level, ±12 dB — its own stage, upstream of volume and GAIN |
 | `a`  `A` | select AUX · pick what to send through it |
 | `1`–`9` | …on AUX: plug that stream through the rack |

@@ -292,11 +292,22 @@ tap, so it could not serve — and the two are drawn nothing alike, because two
 controls that look the same is how people reach for the wrong one. The meter
 reads *after* the level, so what it shows is what the file is getting.
 
-**REC PAUSE is the preview.** *Settled:* `R` walks idle → armed → running →
-idle. Armed runs the meters with the tape stationary, which is the only way to
+**REC PAUSE is the preview, and a real pause.** *Settled:* `R` walks idle →
+armed → running → armed → running, and never to idle; `s` — STOP — ends the
+take. Armed runs the meters with the tape stationary, which is the only way to
 set a level against real signal before committing to it. Arming offers the
 writer nothing at all: audio leaking into the ring while armed would surface
 later, prepended to the next take.
+
+A take therefore begins when the deck *leaves* idle rather than when it starts
+rolling, and armed and running differ only in whether the tap is pushing. So a
+pause leaves the file open and the count standing, and resuming writes on into
+the same file — a splice, exactly as a deck's pause is. Resetting on the way
+into running instead meant every resume opened a new file and zeroed the
+counter, which is a stop wearing a pause's name. It also means the record key
+cannot end a take by being pressed one more time than intended: closing a file
+and patching its header is the one thing here that cannot be undone, so it
+belongs on a key of its own.
 
 **A track's duration is what you played, not what it was.** *Settled:* the log
 counts wall-clock seconds while the player says it is playing, rather than
@@ -321,10 +332,24 @@ mean something. None of this needs inventing:
 
 | | |
 |---|---|
-| **COUNTER** | counts real elapsed tape, which is what it has always been for |
+| **COUNTER** | counts the take while one is being made, and the tape the rest of the time |
 | **SIDE A/B** | splits a recording the way `Tape::from_tracks` already splits a folder |
 | **MTL · DOLBY** | stop being lamps and become properties of what is being written |
 | **the input meter** | is a record-level meter already |
+
+The counter is the one piece that had to change to mean something. A deck's was
+four digits of tape revolutions — a number with no unit, useful only against
+itself, and reset by hand when you turned the tape over. What it now measures is
+a recording, and a recording's length is a fact about the world rather than
+about a spool, so it reads `HH:MM:SS` and counts seconds. It shows the take
+while one is being made, because that is the number worth having: a take is
+something being made, and its length is the only way to judge it while it is
+happening. AUDIO's reading is seconds the writer committed to a file — so it
+holds across a pause, and holds through a dropout, because time that never
+reached the disk is not in the file. TRACK's is time the log was genuinely
+live. Neither is predicted, and with no tape and nothing being recorded there is
+nothing to count, so the display goes dark rather than showing a number that
+means nothing.
 
 And the loop closes: record from aux or the tuner, get a tape, put it in the
 deck. The rack starts feeding itself.

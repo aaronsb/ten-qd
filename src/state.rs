@@ -116,12 +116,17 @@ impl Arm {
             Arm::Running => "REC",
         }
     }
-    /// The order the REC key walks: arm, roll, stop.
+    /// The order the REC key walks: arm, roll, pause, roll, pause…
+    ///
+    /// It never reaches `Idle`, because on a deck REC and PAUSE are one motion
+    /// and STOP is a different key. Ending a take is the one decision here that
+    /// cannot be undone — the file is closed and the header patched — so it is
+    /// not something the record key should land on while being tapped.
     pub fn next(self) -> Self {
         match self {
             Arm::Idle => Arm::Armed,
             Arm::Armed => Arm::Running,
-            Arm::Running => Arm::Idle,
+            Arm::Running => Arm::Armed,
         }
     }
     /// Whether the meters are live. Armed meters without writing, which is the
@@ -509,8 +514,19 @@ pub struct RecState {
     /// written, not what arrived.
     pub input: f32,
     /// Seconds committed to the current take, and its size on disk.
+    ///
+    /// A take spans a pause — REC PAUSE gates the tap and leaves the file open
+    /// — so this holds while paused and resumes climbing, rather than starting
+    /// over. Only STOP ends a take, and only then does this return to zero.
     pub take_seconds: f64,
     pub take_bytes: u64,
+    /// How long TRACK mode has been logging, in seconds.
+    ///
+    /// TRACK's counterpart to `take_seconds`, and deliberately not the same
+    /// field: one is measured by the writer from frames that reached a file,
+    /// the other is wall clock since the switch moved. They mean different
+    /// things and a single field would let the panel report one as the other.
+    pub log_seconds: f64,
     /// The writer could not keep up and the take has a hole in it.
     pub dropped: bool,
     /// An append has failed since REC was last switched on.
@@ -1127,6 +1143,28 @@ impl Stack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ending a take closes the file and patches the header, and there is no
+    /// undoing it. So the record key must not be able to land on it: it walks
+    /// between armed and running for ever, and STOP is the way out. A walk that
+    /// reaches `Idle` means a second press of REC — the one an operator makes
+    /// to pause — silently ends the recording instead.
+    #[test]
+    fn the_record_key_never_walks_to_a_stop() {
+        assert_eq!(Arm::Idle.next(), Arm::Armed, "the first press arms");
+        assert_eq!(Arm::Armed.next(), Arm::Running, "the second rolls");
+        assert_eq!(Arm::Running.next(), Arm::Armed, "the third pauses — it does not stop");
+
+        // Walked, not just checked one step at a time: whichever state it
+        // starts from, tapping REC can never arrive at Idle.
+        for start in [Arm::Idle, Arm::Armed, Arm::Running] {
+            let mut at = start;
+            for press in 0..8 {
+                at = at.next();
+                assert_ne!(at, Arm::Idle, "press {press} from {start:?} ended the take");
+            }
+        }
+    }
 
     fn track(sec: f64) -> Track {
         Track {

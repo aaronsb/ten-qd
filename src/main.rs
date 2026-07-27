@@ -35,7 +35,9 @@ use audio::radio::RadioCmd;
 use audio::{EngineCmd, EngineEvent};
 use browser::Browser;
 use memory::{Keeper, Memory};
-use state::{Arm, Bank, Command, Patch, RecMode, Side, SourceKind, Stack, Transport, Unit};
+use state::{
+    Arm, Bank, Command, Patch, RecMode, RecState, Side, SourceKind, Stack, Transport, Unit,
+};
 use ui::hit::HitMap;
 use ui::units::eq::{snap, RANGE_DB, STEP_DB};
 
@@ -114,6 +116,14 @@ struct App {
     /// than not writing it: the operator would be told entries were saved and
     /// then be unable to find one of them.
     log: Option<listen::Log>,
+    /// When the log was last seen to be live, for the counter.
+    ///
+    /// Time is accumulated between ticks rather than measured from a start
+    /// instant, so the counter credits only the time the log was genuinely
+    /// being appended to. A deck switched off mid-session holds where it was
+    /// and carries on when the power comes back, which is what the file shows.
+    /// `None` while not logging, so the first tick after a gap credits nothing.
+    log_tick: Option<std::time::Instant>,
     /// Streams offered for plugging in, refreshed when the adapter goes in.
     streams: Vec<adapter::Stream>,
     /// Where the loop guard should put us back, shared with its thread. It
@@ -191,6 +201,7 @@ impl App {
             mpris: mpris::Mpris::start(),
             watcher: listen::Watcher::new(listen::session_id(started)),
             log: listen::Log::path().map(listen::Log::at),
+            log_tick: None,
             streams: Vec::new(),
             guard_target: Arc::new(std::sync::Mutex::new(mem.output.clone())),
         }
@@ -623,6 +634,18 @@ impl App {
             }
 
             Command::TapeStop => {
+                // On a deck, STOP is what ends a take — REC and PAUSE are one
+                // motion between them. This is the only way back to Idle, so it
+                // has to come before the transport.
+                //
+                // And it does *only* this: a deck recording while a tape plays
+                // would, on the real thing, stop both, but ending a take cannot
+                // be undone and stopping playback can. One press, one thing;
+                // press it again to stop the tape.
+                if Self::stop_ends_take(&self.stack.tape.rec) {
+                    self.audio_rec(Arm::Idle);
+                    return;
+                }
                 let epoch = self.new_epoch();
                 if let Some(e) = &self.engine
                     && self.stack.source == SourceKind::Tape
@@ -790,6 +813,11 @@ impl App {
                 }
                 let mut rec = self.stack.tape.rec.clone();
                 rec.on = on;
+                // The counter belongs to the session, so both edges of the
+                // switch clear it: switching off ends the run, and switching on
+                // starts a new one that must not inherit the last one's time.
+                rec.log_seconds = 0.0;
+                self.log_tick = None;
                 // Switching *on* clears a previous failure: that is the
                 // operator saying "try again". Switching off must not, because
                 // `rec_stop` above has just tried to flush and may have failed
@@ -1331,8 +1359,10 @@ impl App {
     fn poll_log(&mut self) {
         self.poll_take();
         if !self.recording() {
+            self.log_tick = None;
             return;
         }
+        self.credit_log_time();
         // A bus that did not answer is not a bus with nothing on it. Feeding
         // the watcher an empty list here would close every open entry, and the
         // outage clearing would open fresh ones — one track logged as two.
@@ -1352,6 +1382,70 @@ impl App {
         }
     }
 
+    /// Advance TRACK mode's counter by the time since the last tick.
+    ///
+    /// Only ever called from the logging path, so what it measures is time the
+    /// log was live — not time since the switch moved. The panel is patched on
+    /// the whole second, because that is all the counter can show and a patch
+    /// per frame would be sixty writes announcing nothing.
+    fn credit_log_time(&mut self) {
+        // A latched write failure stops the clock, and clears the tick so the
+        // outage itself is not credited when it recovers. `recording()` does
+        // not read the latch but the counter does — so without this the
+        // display went dark on a fault and came back having advanced across
+        // the whole outage, which is the opposite of what the field claims to
+        // hold. Clearing the tick alone would skip one frame, not the outage.
+        if self.stack.tape.rec.failed {
+            self.log_tick = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let dt = match self.log_tick.replace(now) {
+            Some(last) => now.duration_since(last).as_secs_f64(),
+            // First tick of a session, or the first after an outage: there is
+            // no interval to credit yet, and inventing one back-dates the log.
+            None => return,
+        };
+        let was = self.stack.tape.rec.log_seconds;
+        let (is, moved) = credit(was, dt);
+        if moved {
+            let rec = RecState { log_seconds: is, ..self.stack.tape.rec.clone() };
+            self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+        } else {
+            // Still written back. The remainder is most of the arithmetic:
+            // sixty frames a second each add a sixtieth, and dropping the ones
+            // that do not move the display would mean the whole second is
+            // never reached and the counter sits at zero for ever.
+            self.stack.tape.rec.log_seconds = is;
+        }
+    }
+
+    /// Whether a take just ended, and so has a report worth printing.
+    ///
+    /// Asked of the take, not of the arm it was parked on. This read
+    /// `arm == Running` while stopping was something the record key did; once a
+    /// take rested in `Armed` between pauses and STOP became its only exit, the
+    /// ordinary way to end one was from `Armed`, and the end-of-take report —
+    /// the only place a take's path is ever printed, and the only lasting word
+    /// that the writer dropped samples — went silently unreachable.
+    ///
+    /// `secs > 0.0` rather than `arm != Idle`: arming and stopping without ever
+    /// rolling ends nothing, and "take: 00:00 · 0 B" is a worse answer than
+    /// "REC off".
+    fn ends_a_take(want: Arm, secs: f64) -> bool {
+        want == Arm::Idle && secs > 0.0
+    }
+
+    /// Whether STOP ends a take rather than stopping the transport.
+    ///
+    /// Its own function so it can be asserted on: `Arm::next` no longer walks
+    /// to `Idle`, so this predicate is the only thing that ends a take from the
+    /// keyboard. If it drifts, a take becomes unstoppable short of cutting the
+    /// deck's power or changing mode — at roughly 660 MB an hour.
+    fn stop_ends_take(rec: &RecState) -> bool {
+        rec.mode == RecMode::Audio && rec.arm != Arm::Idle
+    }
+
     /// Whether the log is genuinely being appended to. REC is a switch
     /// position; a deck with its power off is not writing anything down, and
     /// the lamp reads this rather than the switch.
@@ -1363,6 +1457,8 @@ impl App {
     }
 
     /// Read the recorder back onto the panel, every frame.
+    ///
+    /// (See [`credit`] below for the session-clock arithmetic this pairs with.)
     ///
     /// Everything here is measured by the writer thread or the callback —
     /// frames that reached the file, bytes on disk, the peak after the level
@@ -1419,12 +1515,6 @@ impl App {
             return;
         }
 
-        // Read the take before ending it. These are the only report the
-        // operator gets — length, size, where the file is, and whether the
-        // writer kept up — and reading them after the reset always produced
-        // zero, so the message existed and could never be reached.
-        let ending = self.stack.tape.rec.arm == Arm::Running && want == Arm::Idle;
-
         if want == Arm::Idle {
             // Waits for the header to be patched, so `file` names something
             // finished rather than something still being written.
@@ -1442,6 +1532,8 @@ impl App {
         let got = engine.record.arm();
         let file = engine.record.file();
         let failed = engine.record.failed();
+
+        let ending = Self::ends_a_take(want, secs);
 
         let mut rec = self.stack.tape.rec.clone();
         rec.arm = got;
@@ -1461,8 +1553,20 @@ impl App {
             return;
         }
         self.status(match got {
+            // Two different pauses, told apart by the take rather than by
+            // remembering which way we came: arming zeroes the count, so
+            // anything above zero is a take being held. Before rolling there is
+            // a level to set; mid-take the useful thing to say is how to get
+            // out, because REC no longer walks to a stop.
+            Arm::Armed if secs > 0.0 => format!(
+                "REC PAUSE — take held at {:02}:{:02}. REC resumes the same file, STOP ends it",
+                secs as u64 / 60,
+                secs as u64 % 60,
+            ),
             Arm::Armed => "REC PAUSE — meters live, nothing written. Set the level".into(),
-            Arm::Running => "REC — writing pre-EQ, so volume does not touch it".into(),
+            Arm::Running => {
+                "REC — writing pre-EQ, so volume does not touch it · STOP ends the take".into()
+            }
             Arm::Idle if ending => format!(
                 "take: {:02}:{:02} · {}{}{}",
                 secs as u64 / 60,
@@ -2603,6 +2707,19 @@ fn panel(
     Ok(())
 }
 
+/// Add `dt` to a session clock, and say whether the display moved.
+///
+/// Separated out because the interesting half is the part that changes
+/// nothing on screen. The counter shows whole seconds, so at sixty frames a
+/// second fifty-nine of every sixty updates are invisible — and each is a
+/// sixtieth of the second that eventually shows. Discard them as redundant and
+/// the total never reaches one, so the counter reads `00:00:00` for ever while
+/// the log runs all afternoon.
+fn credit(prev: f64, dt: f64) -> (f64, bool) {
+    let now = prev + dt;
+    (now, now as u64 != prev as u64)
+}
+
 /// Run the panel, and close the listening log however it ends.
 ///
 /// The loop propagates terminal errors with `?`, so a flush placed after it
@@ -2647,5 +2764,61 @@ mod tests {
         );
         assert_eq!(tape_line(&tape, 0), "tape: mix · 2 tracks");
         assert_eq!(tape_line(&tape, 3), "tape: mix · 2 tracks · 3 the deck cannot cue");
+    }
+
+    /// The counter shows whole seconds and the panel is patched only when one
+    /// turns over — so the frames that change nothing on screen are still
+    /// carrying almost all of the arithmetic. Dropping them looks like removing
+    /// a redundant branch and stops the clock dead.
+    #[test]
+    fn a_session_clock_keeps_the_fractions_that_show_nothing() {
+        let frame = 1.0 / 60.0;
+        let (mut at, mut ticks) = (0.0, 0);
+        for _ in 0..60 {
+            let (next, moved) = credit(at, frame);
+            at = next;
+            ticks += i32::from(moved);
+        }
+        assert!((at - 1.0).abs() < 1e-9, "a second of frames must sum to a second: {at}");
+        assert_eq!(ticks, 1, "and must announce it exactly once");
+
+        // The whole second is the only thing that moves the display.
+        assert_eq!(credit(0.4, 0.1), (0.5, false));
+        assert!(credit(0.95, 0.1).1, "crossing 1.0 shows");
+    }
+
+    /// The end-of-take report is the only place a take's path is ever printed,
+    /// and the only lasting word that the writer dropped samples. Pausing
+    /// before stopping is now the ordinary way to end a take, so a predicate
+    /// that only recognises a stop from `Running` loses the report exactly when
+    /// it is normal to want it.
+    #[test]
+    fn a_take_ended_from_a_pause_is_still_a_take_that_ended() {
+        assert!(App::ends_a_take(Arm::Idle, 154.0), "stopped from a pause, 154s written");
+        assert!(App::ends_a_take(Arm::Idle, 0.5), "and a short one is still one");
+
+        // Armed and stopped without ever rolling: no file, nothing to report.
+        assert!(!App::ends_a_take(Arm::Idle, 0.0), "arming and stopping ends nothing");
+        // Not going to Idle at all is not an ending, however long the take.
+        assert!(!App::ends_a_take(Arm::Armed, 154.0), "a pause is not an end");
+        assert!(!App::ends_a_take(Arm::Running, 154.0), "nor is resuming");
+    }
+
+    /// `Arm::next` no longer walks to `Idle`, so this predicate is the only
+    /// thing that ends a take from the keyboard. It covers the decision, not
+    /// the dispatch — but the decision is the part that drifts.
+    #[test]
+    fn stop_ends_a_take_whenever_one_is_open_and_never_otherwise() {
+        let audio = |arm| RecState { mode: RecMode::Audio, arm, ..Default::default() };
+        assert!(App::stop_ends_take(&audio(Arm::Running)), "a rolling take must be stoppable");
+        assert!(App::stop_ends_take(&audio(Arm::Armed)), "and so must a paused one");
+        assert!(!App::stop_ends_take(&audio(Arm::Idle)), "with no take, STOP is the transport's");
+
+        // TRACK shares the button but not the machine: its REC is a switch,
+        // and STOP must reach the tape rather than the log.
+        for arm in [Arm::Idle, Arm::Armed, Arm::Running] {
+            let track = RecState { mode: RecMode::Track, arm, ..Default::default() };
+            assert!(!App::stop_ends_take(&track), "TRACK has no take to end: {arm:?}");
+        }
     }
 }
