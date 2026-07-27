@@ -100,9 +100,6 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let armed = audio && t.power && !t.rec.failed && t.rec.arm == Arm::Armed;
 
     chassis::boxed(buf, w.x + 2, w.y + 3, "REC", theme, rec, true);
-    // The mode is always legible, lit or not: which machine the button drives
-    // is not something to work out from what the counts happen to say.
-    chassis::sublegend(buf, w.x + 2, w.y + 2, t.rec.mode.label(), theme, true);
 
     // Everything on this row shares it with COUNTER, which is right-aligned
     // and moves with the bay's width. Drawn only where it fits, because a
@@ -118,7 +115,10 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         // a fact about now.
         let s = t.rec.take_seconds as u64;
         match (if rec || armed { t.rec.arm } else { Arm::Idle }, t.rec.dropped && rec) {
-            (_, true) => "GAP".to_string(),
+            // The gap latches for the whole take, so keep the running time
+            // beside it: knowing something was lost does not help decide
+            // whether to keep a take without knowing how long it is.
+            (_, true) => format!("GAP {:02}:{:02}", s / 60, s % 60),
             (Arm::Armed, _) => t.rec.arm.label().to_string(),
             (Arm::Running, _) => {
                 format!("{:02}:{:02} {}", s / 60, s % 60, record::size(t.rec.take_bytes))
@@ -136,7 +136,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // `glyph::boxed` adds a rule either side, so this is eight cells, and a
     // fault warning overprinting COUNTER would be one more readout that says
     // neither thing.
-    if t.rec.failed && t.power && room >= 8 {
+    if t.rec.failed && t.power && room >= if audio { 9 } else { 8 } {
         chassis::boxed(buf, w.x + 8, w.y + 3, if audio { "NO FILE" } else { "NO LOG" }, theme, true, true);
     }
 
@@ -148,8 +148,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // The meter runs while armed as well as while running — that is what
     // arming is *for*. It reads after the level trim, so what it shows is what
     // the file is getting.
+    // The mode leads this line rather than sitting on its own above it: drawn
+    // separately it occupied the same cell as the level and was overwritten
+    // exactly when recording — a legend that vanishes when it matters.
+    let mode_only = format!("{} ", t.rec.mode.label());
     if audio && (rec || armed) {
-        let label = format!("LEVEL {:+3} ", t.rec.level_db);
+        let label = format!("{} {:+3} ", t.rec.mode.label(), t.rec.level_db);
         let mx = w.x + 2 + label.chars().count() as u16;
         let bars = cx.saturating_sub(mx + 7).min(12);
         if bars >= 4 {
@@ -163,7 +167,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
                 theme,
                 true,
             );
+        } else {
+            chassis::sublegend(buf, w.x + 2, w.y + 2, &mode_only, theme, true);
         }
+    } else {
+        chassis::sublegend(buf, w.x + 2, w.y + 2, &mode_only, theme, true);
     }
 
     // --- the counter ------------------------------------------------------
@@ -407,7 +415,7 @@ mod tests {
     fn a_rolling_take_reports_its_length_and_its_cost() {
         let panel = render(audio(Arm::Running), true);
         assert!(panel.contains("02:34 27 MB"), "{panel}");
-        assert!(panel.contains("LEVEL  -3"), "the level is its own control: {panel}");
+        assert!(panel.contains("AUDIO  -3"), "the level is its own control: {panel}");
         assert!(panel.contains("pre-EQ"), "and says why that matters: {panel}");
     }
 
@@ -418,7 +426,8 @@ mod tests {
     fn an_armed_deck_meters_but_claims_no_take() {
         let panel = render(audio(Arm::Armed), true);
         assert!(panel.contains("PAUSE"), "{panel}");
-        assert!(panel.contains("LEVEL"), "the meter is the reason to arm: {panel}");
+        assert!(panel.contains("AUDIO  -3"), "the level is set from here: {panel}");
+        assert!(panel.contains("dB"), "the meter is the reason to arm: {panel}");
         assert!(!panel.contains("02:34"), "nothing has been written: {panel}");
         assert!(panel.contains("nothing written yet"), "{panel}");
     }
@@ -427,7 +436,7 @@ mod tests {
     fn an_idle_deck_in_audio_mode_shows_no_meter_and_no_take() {
         let panel = render(audio(Arm::Idle), true);
         assert!(panel.contains("AUDIO"), "the mode is always legible: {panel}");
-        assert!(!panel.contains("LEVEL"), "{panel}");
+        assert!(!panel.contains("dB"), "an idle deck meters nothing: {panel}");
         assert!(!panel.contains("02:34"), "{panel}");
     }
 
@@ -437,7 +446,7 @@ mod tests {
     fn a_dead_deck_claims_no_take_either() {
         let panel = render(audio(Arm::Running), false);
         assert!(!panel.contains("02:34"), "{panel}");
-        assert!(!panel.contains("LEVEL"), "{panel}");
+        assert!(!panel.contains("dB"), "{panel}");
         assert!(!panel.contains("pre-EQ"), "{panel}");
     }
 
@@ -447,8 +456,13 @@ mod tests {
     #[test]
     fn a_take_with_a_gap_in_it_says_so_instead_of_reporting_a_length() {
         let panel = render(RecState { dropped: true, ..audio(Arm::Running) }, true);
-        assert!(panel.contains("GAP"), "{panel}");
-        assert!(!panel.contains("02:34"), "a torn take must not report a clean length: {panel}");
+        // The length still shows — a take you cannot measure is one you cannot
+        // decide about — but never without the word that qualifies it.
+        assert!(panel.contains("GAP 02:34"), "{panel}");
+        assert!(
+            !panel.replace("GAP 02:34", "").contains("02:34"),
+            "the length must never appear unqualified: {panel}"
+        );
     }
 
     #[test]
@@ -456,6 +470,7 @@ mod tests {
         let panel = render(RecState { failed: true, ..audio(Arm::Running) }, true);
         assert!(panel.contains("NO FILE"), "{panel}");
         assert!(!panel.contains("02:34"), "{panel}");
+        assert!(!panel.contains("dB"), "{panel}");
         assert!(!panel.contains("pre-EQ"), "{panel}");
     }
 

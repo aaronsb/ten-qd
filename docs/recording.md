@@ -266,11 +266,23 @@ leaving to be discovered.
 
 The callback hands blocks to a ring and a writer thread drains it, because the
 audio callback may not allocate, lock or block. A ring with no room drops the
-block and the take reads `GAP` instead of a running time: a recording with a
-hole in it is a fault to report, and a stuttering rack is a fault you could not
-even report. Only the frames the ring actually supplied are tapped — the zeros
-padding an underrun are silence the rack invented, and writing them would put
-the fault into the file.
+*whole* block — a partial push would shift every later frame's channel
+alignment — and the take reads `GAP` beside its running time: a recording with
+a hole in it is a fault to report, and a stuttering rack is a fault you could
+not even report. Only the frames the ring actually supplied are tapped; the
+zeros padding an underrun are silence the rack invented, and writing them would
+put the fault into the file.
+
+A take has an identity, not a deduced boundary. The writer closes a file when
+its generation is superseded, rather than when it happens to observe an idle
+arm and an empty ring — because a stop and a restart can both occur while it is
+still draining a backlog, and the second take would then be appended to the
+first. Files are opened with `create_new`: take names are second-resolution, so
+a double-press would otherwise land on one path and truncate a recording that
+had just been made, with the open succeeding and nothing to report. And
+stopping waits for the header to be patched, because the two sizes in a WAV
+header are only known once the take ends and a 600 MB file claiming zero length
+is not something to leave behind.
 
 ## Consequences still to settle
 

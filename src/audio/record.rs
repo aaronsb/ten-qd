@@ -72,6 +72,17 @@ struct Shared {
     dropped: AtomicBool,
     /// The file could not be written. Latched, for the same reason.
     failed: AtomicBool,
+    /// Which take is current. Bumped every time recording starts.
+    ///
+    /// The writer cannot close on a state *observation* — "not running, and
+    /// the ring is empty" — because a stop and a restart can both happen
+    /// while it is still draining a backlog, and it would then append the
+    /// second take to the first file. A take needs an identity, not a
+    /// deduced boundary.
+    generation: AtomicU64,
+    /// A file is open. Lets an orderly shutdown wait for the header patch
+    /// instead of racing process teardown.
+    writing: AtomicBool,
 }
 
 /// The handle the panel holds.
@@ -108,6 +119,13 @@ impl Tap {
     /// rather than stalling the output — a recording with a gap is a fault to
     /// report, and a stuttering rack is a fault you cannot even report.
     pub fn feed(&mut self, block: &[f32]) -> usize {
+        // Whole frames only. A dropped block shifts the stream by its length,
+        // so an odd one would swap left and right for the rest of the take —
+        // silently, with the panel reporting only that there was a gap. The
+        // caller preserves parity by construction; this is where that
+        // invariant is written down, so it breaks here rather than in the
+        // file.
+        debug_assert_eq!(block.len() % 2, 0, "the tap takes whole stereo frames");
         let arm = self.shared.arm.load(Ordering::Relaxed);
         if arm == 0 {
             return 0;
@@ -146,6 +164,8 @@ impl Recorder {
             frames: AtomicU64::new(0),
             dropped: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            writing: AtomicBool::new(false),
         });
         let file: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -180,6 +200,7 @@ impl Recorder {
             self.shared.dropped.store(false, Ordering::Relaxed);
             self.shared.failed.store(false, Ordering::Relaxed);
             self.shared.frames.store(0, Ordering::Relaxed);
+            self.shared.generation.fetch_add(1, Ordering::Relaxed);
         }
         self.shared.arm.store(
             match arm {
@@ -220,6 +241,22 @@ impl Recorder {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
+    /// Stop recording and wait for the file to be closed properly.
+    ///
+    /// The header carries two sizes that are only known once the take ends, so
+    /// a process that exits without letting the writer patch them leaves a WAV
+    /// claiming zero length. Players mostly cope by reading to end of file;
+    /// "mostly" is not a good enough reason to leave a 600 MB artefact
+    /// malformed. Bounded, because a wedged disk must not stop the rack
+    /// quitting.
+    pub fn finish_take(&self, wait: Duration) {
+        self.set_arm(Arm::Idle);
+        let until = std::time::Instant::now() + wait;
+        while self.shared.writing.load(Ordering::Acquire) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     pub fn failed(&self) -> bool {
         self.shared.failed.load(Ordering::Relaxed)
     }
@@ -246,14 +283,33 @@ fn writer(
     let mut buf = vec![0.0f32; 8192];
 
     while !stop.load(Ordering::Relaxed) {
-        let running = shared.arm.load(Ordering::Acquire) == 2;
+        let arm = shared.arm.load(Ordering::Acquire);
+        let generation = shared.generation.load(Ordering::Relaxed);
+        let running = arm == 2;
+
+        // A take is over when its generation is superseded, or when recording
+        // has stopped and the ring has given up everything it held. The first
+        // is what makes stop-then-start always two files: without it, a
+        // restart during a long drain — a stalled disk, or REC PAUSE and
+        // resume — appends the new take to the old file.
+        let superseded = open.as_ref().is_some_and(|w| w.generation != generation);
+        let drained = !running && cons.is_empty();
+        if (superseded || drained)
+            && let Some(w) = open.take()
+        {
+            shared.writing.store(false, Ordering::Release);
+            if w.finish().is_err() {
+                shared.failed.store(true, Ordering::Relaxed);
+            }
+        }
 
         if running && open.is_none() {
-            match Wav::create(rate) {
+            match Wav::create(rate, generation) {
                 Ok(w) => {
                     if let Ok(mut g) = file.lock() {
                         *g = Some(w.path.clone());
                     }
+                    shared.writing.store(true, Ordering::Release);
                     open = Some(w);
                 }
                 Err(_) => {
@@ -269,17 +325,11 @@ fn writer(
             if n > 0 && w.write(&buf[..n]).is_err() {
                 shared.failed.store(true, Ordering::Relaxed);
             }
-            shared.frames.store(w.frames(), Ordering::Relaxed);
-        }
-
-        // Close only once the ring is empty, so the tail of a take is not lost
-        // between the operator pressing stop and the writer noticing.
-        if !running
-            && n == 0
-            && let Some(w) = open.take()
-            && w.finish().is_err()
-        {
-            shared.failed.store(true, Ordering::Relaxed);
+            // Only for the take this file belongs to. A superseded generation
+            // is closed above before it can overwrite the new take's count.
+            if w.generation == generation {
+                shared.frames.store(w.frames(), Ordering::Relaxed);
+            }
         }
 
         if n == 0 {
@@ -288,6 +338,7 @@ fn writer(
     }
 
     if let Some(w) = open.take() {
+        shared.writing.store(false, Ordering::Release);
         let _ = w.finish();
     }
 }
@@ -316,17 +367,39 @@ struct Wav {
     /// Samples add up exactly; frames are derived once, at the end.
     samples: u64,
     rate: u32,
+    /// Which take this file belongs to.
+    generation: u64,
 }
 
 impl Wav {
-    fn create(rate: u32) -> std::io::Result<Wav> {
+    /// Open a new take.
+    ///
+    /// `create_new`, never `create`. Take names are second-resolution, so two
+    /// takes in the same wall-clock second — a double-press, entirely
+    /// ordinary — would otherwise land on the same path, and `File::create`
+    /// truncates: the first recording would be destroyed silently, the open
+    /// having *succeeded*. Colliding names take a suffix, and a name that
+    /// cannot be found at all fails loudly rather than overwriting anything.
+    fn create(rate: u32, generation: u64) -> std::io::Result<Wav> {
         let dir = Recorder::dir()
             .ok_or_else(|| std::io::Error::other("no HOME — nowhere to write a recording"))?;
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.wav", crate::listen::session_id(SystemTime::now())));
-        let mut file = std::fs::File::create(&path)?;
-        file.write_all(&header(rate, 0))?;
-        Ok(Wav { file, path, samples: 0, rate })
+
+        let stem = crate::listen::session_id(SystemTime::now());
+        for n in 1..100 {
+            let name =
+                if n == 1 { format!("{stem}.wav") } else { format!("{stem}-{n}.wav") };
+            let path = dir.join(name);
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(&header(rate, 0))?;
+                    return Ok(Wav { file, path, samples: 0, rate, generation });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::other("a hundred takes in one second — something is wrong"))
     }
 
     fn write(&mut self, block: &[f32]) -> std::io::Result<()> {
@@ -438,7 +511,7 @@ mod tests {
         let path = s.0.join("take.wav");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(&header(44_100, 0)).unwrap();
-        let mut w = Wav { file: f, path: path.clone(), samples: 0, rate: 44_100 };
+        let mut w = Wav { file: f, path: path.clone(), samples: 0, rate: 44_100, generation: 1 };
 
         w.write(&[0.0; 200]).unwrap();
         assert_eq!(w.frames(), 100, "two samples make one stereo frame");
@@ -461,7 +534,7 @@ mod tests {
         let path = s.0.join("take.wav");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(&header(48_000, 0)).unwrap();
-        let mut w = Wav { file: f, path: path.clone(), samples: 0, rate: 48_000 };
+        let mut w = Wav { file: f, path: path.clone(), samples: 0, rate: 48_000, generation: 1 };
 
         // Four reads, two of them odd, carrying five whole frames between them.
         for n in [3usize, 1, 5, 1] {
@@ -475,21 +548,25 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
     }
 
+    /// Rust's float-to-int casts saturate, so nothing here can fold a
+    /// waveform inside out. What the clamp buys is symmetry: without it a
+    /// hot negative sample saturates to −32768, one step past the +32767 a
+    /// hot positive one reaches, and the two rails stop matching.
     #[test]
-    fn a_sample_over_full_scale_clips_rather_than_wrapping() {
+    fn a_sample_over_full_scale_clips_to_matching_rails() {
         let s = Scratch::new("clip");
         let path = s.0.join("take.wav");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(&header(48_000, 0)).unwrap();
-        let mut w = Wav { file: f, path: path.clone(), samples: 0, rate: 48_000 };
+        let mut w = Wav { file: f, path: path.clone(), samples: 0, rate: 48_000, generation: 1 };
         w.write(&[2.0, -2.0]).unwrap();
         w.finish().unwrap();
 
         let b = std::fs::read(&path).unwrap();
         let l = i16::from_le_bytes([b[44], b[45]]);
         let r = i16::from_le_bytes([b[46], b[47]]);
-        assert_eq!(l, i16::MAX, "a hot sample must not fold to negative");
-        assert_eq!(r, -i16::MAX);
+        assert_eq!(l, i16::MAX);
+        assert_eq!(r, -i16::MAX, "the negative rail must match the positive one");
     }
 
     /// Armed means meters live and tape stationary. Asserting only that no
@@ -534,16 +611,21 @@ mod tests {
         assert!((db - 6.0).abs() < 0.1, "+6 dB read as {db:.2} dB");
     }
 
+    /// Measured with a signal quiet enough that +12 dB does not reach full
+    /// scale. At 0.5 the meter saturates at the limit *and* far past it, so
+    /// the readings match either way and the meter's own ceiling hides
+    /// whether the control clamped at all.
     #[test]
     fn the_level_cannot_be_driven_past_its_limit() {
         let (rec, mut tap) = Recorder::start(48_000);
         rec.set_arm(Arm::Armed);
         rec.set_level_db(120);
-        tap.feed(&[0.5, 0.5]);
+        tap.feed(&[0.1, 0.1]);
         let clamped = rec.peak();
+        assert!(clamped < 0.99, "the probe must not saturate the meter: {clamped}");
 
         rec.set_level_db(LEVEL_LIMIT_DB);
-        tap.feed(&[0.5, 0.5]);
+        tap.feed(&[0.1, 0.1]);
         assert_eq!(clamped, rec.peak(), "beyond the limit is the limit");
     }
 
@@ -564,6 +646,79 @@ mod tests {
         assert_eq!(size(12_000), "12 kB");
         assert_eq!(size(5_400_000), "5 MB");
         assert_eq!(size(2_300_000_000), "2.3 GB");
+    }
+
+    /// Take names are second-resolution, so a double-press lands two takes on
+    /// one path. `File::create` would truncate — destroying a recording with
+    /// the open *succeeding*, so nothing would latch and the panel would
+    /// report a healthy new take over the corpse of the old one.
+    #[test]
+    fn a_second_take_in_the_same_second_never_overwrites_the_first() {
+        let s = Scratch::new("collide");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
+
+        let first = Wav::create(48_000, 1).expect("first take");
+        std::fs::write(&first.path, b"the first recording").unwrap();
+        let second = Wav::create(48_000, 2).expect("second take");
+
+        assert_ne!(first.path, second.path, "two takes must not share a path");
+        assert_eq!(
+            std::fs::read(&first.path).unwrap(),
+            b"the first recording",
+            "the first take must survive the second starting"
+        );
+    }
+
+    /// A take is over when its generation is superseded, not when the writer
+    /// happens to observe an idle arm with an empty ring. Stop and restart
+    /// during a long drain — a stalled disk, or REC PAUSE and resume — and
+    /// the deduced boundary never arrives, so the second take appends to the
+    /// first file.
+    #[test]
+    fn stopping_and_starting_always_makes_two_takes() {
+        let s = Scratch::new("gen");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
+        let (rec, mut tap) = Recorder::start(48_000);
+
+        rec.set_arm(Arm::Running);
+        tap.feed(&[0.25; 512]);
+        std::thread::sleep(Duration::from_millis(60));
+        let one = rec.file().expect("a first take");
+
+        // Straight back to Running, exactly as a pause-and-resume would.
+        rec.set_arm(Arm::Idle);
+        rec.set_arm(Arm::Running);
+        tap.feed(&[0.25; 512]);
+        std::thread::sleep(Duration::from_millis(80));
+        let two = rec.file().expect("a second take");
+
+        rec.finish_take(Duration::from_millis(500));
+        assert_ne!(one, two, "a restart must open its own file, not extend the last");
+    }
+
+    /// The header carries two sizes only known once the take ends. Exiting
+    /// without letting the writer patch them leaves a WAV claiming zero.
+    #[test]
+    fn finishing_a_take_waits_for_the_header_to_be_patched() {
+        let s = Scratch::new("finish");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
+        let (rec, mut tap) = Recorder::start(48_000);
+
+        rec.set_arm(Arm::Running);
+        for _ in 0..8 {
+            tap.feed(&[0.25; 1024]);
+        }
+        rec.finish_take(Duration::from_millis(1000));
+
+        let path = rec.file().expect("a take");
+        let (_, _, data) = probe(&path).expect("read it back");
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            data as u64 + 44,
+            on_disk,
+            "the header must describe the file it is at the head of"
+        );
+        assert!(data > 0, "a patched header must not still claim zero");
     }
 
     #[test]

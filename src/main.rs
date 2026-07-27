@@ -347,6 +347,17 @@ impl App {
                 // always-append is for.
                 if u == Unit::Tape && !on {
                     self.rec_stop();
+                    // And the other recorder. Stopping only the log left an
+                    // AUDIO take writing 660 MB an hour behind a panel that
+                    // had gone quiet about it — the invariant inverted, and
+                    // worse than the usual way round, because an operator
+                    // told nothing has no reason to look.
+                    if let Some(e) = &self.engine {
+                        e.record.finish_take(std::time::Duration::from_millis(500));
+                    }
+                    let mut rec = self.stack.tape.rec.clone();
+                    rec.arm = Arm::Idle;
+                    self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
                 }
                 let selected = matches!(
                     (u, self.stack.source),
@@ -1358,10 +1369,22 @@ impl App {
     /// than leaving REC lit over a file nobody is writing.
     fn poll_take(&mut self) {
         let Some(engine) = &self.engine else { return };
-        if !self.stack.tape.rec.arm.metering() {
+        // Gated on the *engine's* arm, not the panel's. Gating on the panel's
+        // meant the two could only ever resynchronise through `audio_rec`, so
+        // any path that moved one without the other left them stuck apart —
+        // and it stopped polling at Idle, which is precisely when the writer
+        // patches the header and can still fail. A take whose close failed
+        // reported success.
+        //
+        // Scoped to AUDIO mode as well, because `failed` serves both machines:
+        // without this an audio write fault would put the TRACK lamp out.
+        if self.stack.tape.rec.mode != RecMode::Audio {
             return;
         }
         let r = &engine.record;
+        if !r.arm().metering() && !self.stack.tape.rec.arm.metering() && !r.failed() {
+            return;
+        }
         let mut rec = self.stack.tape.rec.clone();
         rec.arm = r.arm();
         rec.input = r.peak();
@@ -1385,29 +1408,49 @@ impl App {
             self.status("no audio engine — nothing to record");
             return;
         };
-        if !self.stack.tape.power {
+        // Refuses to *start* without power, never to refuse to stop. A deck
+        // out of the signal path should not begin a take; a deck already
+        // recording when the power went is exactly the one that must still be
+        // stoppable, and an early return here is how it became unstoppable.
+        if want != Arm::Idle && !self.stack.tape.power {
             self.status("TAPE is out of the signal path — no power, no record");
             return;
         }
 
-        engine.record.set_arm(want);
+        // Read the take before ending it. These are the only report the
+        // operator gets — length, size, where the file is, and whether the
+        // writer kept up — and reading them after the reset always produced
+        // zero, so the message existed and could never be reached.
+        let ending = self.stack.tape.rec.arm == Arm::Running && want == Arm::Idle;
+        let (secs, bytes, dropped) =
+            (engine.record.seconds(), engine.record.bytes(), engine.record.dropped());
+
+        if want == Arm::Idle {
+            // Waits for the header to be patched, so `file` names something
+            // finished rather than something still being written.
+            engine.record.finish_take(std::time::Duration::from_millis(500));
+        } else {
+            engine.record.set_arm(want);
+        }
         let got = engine.record.arm();
         let file = engine.record.file();
+        let failed = engine.record.failed();
 
         let mut rec = self.stack.tape.rec.clone();
         rec.arm = got;
+        rec.failed = failed;
         if got == Arm::Idle {
             rec.take_seconds = 0.0;
             rec.take_bytes = 0;
             rec.input = 0.0;
+            rec.dropped = false;
         }
-        let (secs, bytes, dropped) = (rec.take_seconds, rec.take_bytes, rec.dropped);
         self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
 
         self.status(match got {
             Arm::Armed => "REC PAUSE — meters live, nothing written. Set the level".into(),
             Arm::Running => "REC — writing pre-EQ, so volume does not touch it".into(),
-            Arm::Idle if secs > 0.0 => format!(
+            Arm::Idle if ending => format!(
                 "take: {:02}:{:02} · {}{}{}",
                 secs as u64 / 60,
                 secs as u64 % 60,
@@ -2559,6 +2602,12 @@ fn run(
 ) -> Result<()> {
     let played = panel(terminal, app, keeper);
     app.rec_stop();
+    // And the take. TRACK got this treatment last round; AUDIO is the mode
+    // where the abandoned artefact is 600 MB with a header claiming zero
+    // rather than one line of JSON.
+    if let Some(e) = &app.engine {
+        e.record.finish_take(std::time::Duration::from_millis(1000));
+    }
     played
 }
 
