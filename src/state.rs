@@ -67,6 +67,70 @@ impl SourceKind {
     }
 }
 
+/// Which of the two recorders REC drives.
+///
+/// Not two settings of one feature — two different machines that happen to
+/// share a button. TRACK writes down what played and can say nothing about a
+/// signal with no name; AUDIO writes the signal exactly as it was and can say
+/// nothing about which parts of it were which.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RecMode {
+    #[default]
+    Track,
+    Audio,
+}
+
+impl RecMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            RecMode::Track => "TRACK",
+            RecMode::Audio => "AUDIO",
+        }
+    }
+    pub fn other(self) -> Self {
+        match self {
+            RecMode::Track => RecMode::Audio,
+            RecMode::Audio => RecMode::Track,
+        }
+    }
+}
+
+/// What the deck is doing about audio. Three states, not two.
+///
+/// Arming runs the meters with the tape stationary, so the record level can be
+/// set against real signal before anything is committed. That is what REC
+/// PAUSE was for, and without it a level control is guesswork.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Arm {
+    #[default]
+    Idle,
+    Armed,
+    Running,
+}
+
+impl Arm {
+    pub fn label(self) -> &'static str {
+        match self {
+            Arm::Idle => "IDLE",
+            Arm::Armed => "PAUSE",
+            Arm::Running => "REC",
+        }
+    }
+    /// The order the REC key walks: arm, roll, stop.
+    pub fn next(self) -> Self {
+        match self {
+            Arm::Idle => Arm::Armed,
+            Arm::Armed => Arm::Running,
+            Arm::Running => Arm::Idle,
+        }
+    }
+    /// Whether the meters are live. Armed meters without writing, which is the
+    /// whole point of arming.
+    pub fn metering(self) -> bool {
+        !matches!(self, Arm::Idle)
+    }
+}
+
 /// Which side of the cassette is facing the heads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Side {
@@ -119,9 +183,15 @@ pub enum Command {
     TapeEject,
     TapeDolby,
     TapeAutoReverse,
-    /// TRACK mode. Not a transport: it starts and stops the listening log,
-    /// which runs independently of what the deck itself is playing.
+    /// REC. Not a transport: in TRACK mode it starts and stops the listening
+    /// log, and in AUDIO mode it walks the three-state arm.
     TapeRecord,
+    /// Switch between the two recorders.
+    TapeRecMode,
+    /// Record level — its own gain stage, upstream of everything the
+    /// equaliser does.
+    RecLevelUp,
+    RecLevelDown,
 
     // QA-581 auxiliary input — the cable, and whatever is on the end of it
     /// Open the picker listing what is playing and could be plugged in.
@@ -241,7 +311,7 @@ impl Command {
 
             TapePlayPause | TapeStop | TapeApsNext | TapeApsPrev | TapeRew | TapeFf
             | TapeFlip | TapeEject | TapeDolby | TapeAutoReverse | TapeRecord
-            | BrowserLoadTape => Unit::Tape,
+            | TapeRecMode | RecLevelUp | RecLevelDown | BrowserLoadTape => Unit::Tape,
 
             TunerBand | TunerSeekUp | TunerSeekDown | TunerStepUp | TunerStepDown
             | TunerPreset(_) | TunerStorePreset(_) | TunerLocal | TunerPower => Unit::Tuner,
@@ -416,7 +486,7 @@ pub struct TapeState {
 /// would contain if the rack stopped at this instant; a REC lamp lit over a
 /// log that is not being appended to would be the display wishing rather than
 /// reading.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RecState {
     /// Whether the log is being appended to.
     pub on: bool,
@@ -426,6 +496,23 @@ pub struct RecState {
     /// Players currently being followed. Anything counted here has an entry
     /// that will be written when it ends.
     pub following: u8,
+    /// Which recorder REC drives.
+    pub mode: RecMode,
+    /// AUDIO mode's three-state arm. TRACK has no use for it: a log has
+    /// nothing to preview and no level to set.
+    pub arm: Arm,
+    /// Record level, dB either side of unity. Its own gain stage — the
+    /// equaliser's GAIN is downstream of the tap and cannot serve, and the two
+    /// must stay visibly different or people reach for the wrong one.
+    pub level_db: i8,
+    /// Peak of the last block, after the level trim, 0..=1. What is being
+    /// written, not what arrived.
+    pub input: f32,
+    /// Seconds committed to the current take, and its size on disk.
+    pub take_seconds: f64,
+    pub take_bytes: u64,
+    /// The writer could not keep up and the take has a hole in it.
+    pub dropped: bool,
     /// An append has failed since REC was last switched on.
     ///
     /// Latched rather than transient, because the status line that reports the

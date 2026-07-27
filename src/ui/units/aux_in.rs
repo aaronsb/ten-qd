@@ -39,7 +39,7 @@ const FLOOR_DB: f32 = -48.0;
 const SEGMENTS: u16 = 12;
 
 /// Peak level (0.0–1.0) as a position on the meter's scale (0.0–1.0).
-fn scale(level: f32) -> f32 {
+pub fn scale(level: f32) -> f32 {
     if !level.is_finite() || level <= 0.0 {
         return 0.0;
     }
@@ -50,7 +50,7 @@ fn scale(level: f32) -> f32 {
 /// What the meter prints beside the ladder. Silence gets dashes rather than a
 /// very large negative number, because "nothing" and "very quiet" are
 /// different answers and the panel should not blur them.
-fn readout(level: f32) -> String {
+pub fn readout(level: f32) -> String {
     if !level.is_finite() || level <= 0.0 {
         return " --dB".into();
     }

@@ -35,7 +35,7 @@ use audio::radio::RadioCmd;
 use audio::{EngineCmd, EngineEvent};
 use browser::Browser;
 use memory::{Keeper, Memory};
-use state::{Bank, Command, Patch, RecState, Side, SourceKind, Stack, Transport, Unit};
+use state::{Arm, Bank, Command, Patch, RecMode, Side, SourceKind, Stack, Transport, Unit};
 use ui::hit::HitMap;
 use ui::units::eq::{snap, RANGE_DB, STEP_DB};
 
@@ -51,7 +51,8 @@ ten-qd — a terminal music player wearing an 80s car stereo
 
     ten-qd [FOLDER]        load FOLDER as a disc, or resume the last one
     ten-qd --screenshot    render one frame to stdout and exit
-                           (--aux --browser --outputs --arrange --fold=… --hide=…)
+                           (--aux --browser --outputs --arrange --rec=track|audio
+                            --fold=… --hide=…)
     ten-qd --radio-check   sweep the FM band and report signal per channel
     ten-qd --aux-check     open the aux input and check the cable
     ten-qd --log           what the listening log holds, by session
@@ -158,6 +159,9 @@ impl App {
         stack.tape.dolby = mem.dolby;
         stack.tape.auto_reverse = mem.auto_reverse;
         stack.tape.rec.on = mem.rec;
+        stack.tape.rec.mode = mem.rec_mode();
+        stack.tape.rec.level_db =
+            mem.rec_level.clamp(-audio::record::LEVEL_LIMIT_DB, audio::record::LEVEL_LIMIT_DB);
         stack.layout = mem.layout();
 
         let started = SystemTime::now();
@@ -710,6 +714,52 @@ impl App {
             // desktop, which is not the same thing as what the rack is
             // playing — so the status says which it is rather than leaving
             // "recording" to be read as the tape heads.
+            // AUDIO mode is a different machine sharing the button, so it
+            // takes the whole command rather than branching further down.
+            Command::TapeRecord if self.stack.tape.rec.mode == RecMode::Audio => {
+                self.audio_rec(self.stack.tape.rec.arm.next());
+            }
+
+            Command::TapeRecMode => {
+                // Leaving a mode stops what that mode was doing. Neither
+                // recorder should keep running unattended behind a panel that
+                // has moved on to describing the other one.
+                match self.stack.tape.rec.mode {
+                    RecMode::Track if self.stack.tape.rec.on => self.dispatch(Command::TapeRecord),
+                    RecMode::Audio if self.stack.tape.rec.arm != Arm::Idle => {
+                        self.audio_rec(Arm::Idle)
+                    }
+                    _ => {}
+                }
+                let mut rec = self.stack.tape.rec.clone();
+                rec.mode = rec.mode.other();
+                rec.failed = false;
+                let mode = rec.mode;
+                self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+                self.status(match mode {
+                    RecMode::Track => "TRACK — logs what played, writes no audio".into(),
+                    RecMode::Audio => format!(
+                        "AUDIO — writes the signal, pre-EQ, to {}",
+                        audio::record::Recorder::dir()
+                            .map(|d| d.display().to_string())
+                            .unwrap_or_else(|| "nowhere (no HOME)".into())
+                    ),
+                });
+            }
+
+            Command::RecLevelUp | Command::RecLevelDown => {
+                let step = if matches!(cmd, Command::RecLevelUp) { 1 } else { -1 };
+                let mut rec = self.stack.tape.rec.clone();
+                rec.level_db = (rec.level_db + step)
+                    .clamp(-audio::record::LEVEL_LIMIT_DB, audio::record::LEVEL_LIMIT_DB);
+                let db = rec.level_db;
+                if let Some(e) = &self.engine {
+                    e.record.set_level_db(db);
+                }
+                self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+                self.status(format!("REC LEVEL {db:+} dB — independent of volume"));
+            }
+
             Command::TapeRecord => {
                 let Some(log) = self.log.as_ref().map(|l| l.file().display().to_string()) else {
                     self.status("no HOME — there is nowhere to write a log");
@@ -1266,6 +1316,7 @@ impl App {
     /// thing that happens here is that finished entries reach the disk and the
     /// panel is told what has actually been written.
     fn poll_log(&mut self) {
+        self.poll_take();
         if !self.recording() {
             return;
         }
@@ -1280,13 +1331,11 @@ impl App {
         let wrote = self.write_log(&done);
         let following = self.watcher.following().count().min(u8::MAX as usize) as u8;
 
-        let rec = &self.stack.tape.rec;
-        let (was, total, failed) = (rec.following, rec.wrote + wrote, rec.failed);
-        if wrote > 0 || following != was {
-            self.stack.apply(Patch {
-                tape_rec: Some(RecState { on: true, wrote: total, following, failed }),
-                ..Default::default()
-            });
+        let mut rec = self.stack.tape.rec.clone();
+        if wrote > 0 || following != rec.following {
+            rec.wrote += wrote;
+            rec.following = following;
+            self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
         }
     }
 
@@ -1294,7 +1343,80 @@ impl App {
     /// position; a deck with its power off is not writing anything down, and
     /// the lamp reads this rather than the switch.
     fn recording(&self) -> bool {
-        self.stack.tape.rec.on && self.stack.tape.power && self.log.is_some()
+        self.stack.tape.rec.mode == RecMode::Track
+            && self.stack.tape.rec.on
+            && self.stack.tape.power
+            && self.log.is_some()
+    }
+
+    /// Read the recorder back onto the panel, every frame.
+    ///
+    /// Everything here is measured by the writer thread or the callback —
+    /// frames that reached the file, bytes on disk, the peak after the level
+    /// trim. Nothing is predicted. The arm is read back too, so a recorder
+    /// that stopped itself on a write fault takes the panel with it rather
+    /// than leaving REC lit over a file nobody is writing.
+    fn poll_take(&mut self) {
+        let Some(engine) = &self.engine else { return };
+        if !self.stack.tape.rec.arm.metering() {
+            return;
+        }
+        let r = &engine.record;
+        let mut rec = self.stack.tape.rec.clone();
+        rec.arm = r.arm();
+        rec.input = r.peak();
+        rec.take_seconds = r.seconds();
+        rec.take_bytes = r.bytes();
+        rec.dropped = r.dropped();
+        rec.failed = r.failed();
+        if rec != self.stack.tape.rec {
+            self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+        }
+    }
+
+    /// Walk AUDIO mode's arm, and say what actually happened.
+    ///
+    /// The engine is moved first and the panel reads back from it, rather than
+    /// the panel deciding and the engine following: with no engine there is
+    /// nothing to record with, and a deck reading REC over a rack that cannot
+    /// record is the display wishing.
+    fn audio_rec(&mut self, want: Arm) {
+        let Some(engine) = &self.engine else {
+            self.status("no audio engine — nothing to record");
+            return;
+        };
+        if !self.stack.tape.power {
+            self.status("TAPE is out of the signal path — no power, no record");
+            return;
+        }
+
+        engine.record.set_arm(want);
+        let got = engine.record.arm();
+        let file = engine.record.file();
+
+        let mut rec = self.stack.tape.rec.clone();
+        rec.arm = got;
+        if got == Arm::Idle {
+            rec.take_seconds = 0.0;
+            rec.take_bytes = 0;
+            rec.input = 0.0;
+        }
+        let (secs, bytes, dropped) = (rec.take_seconds, rec.take_bytes, rec.dropped);
+        self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+
+        self.status(match got {
+            Arm::Armed => "REC PAUSE — meters live, nothing written. Set the level".into(),
+            Arm::Running => "REC — writing pre-EQ, so volume does not touch it".into(),
+            Arm::Idle if secs > 0.0 => format!(
+                "take: {:02}:{:02} · {}{}{}",
+                secs as u64 / 60,
+                secs as u64 % 60,
+                audio::record::size(bytes),
+                file.map(|p| format!(" · {}", p.display())).unwrap_or_default(),
+                if dropped { " · WITH A GAP — the writer could not keep up" } else { "" },
+            ),
+            Arm::Idle => "REC off".into(),
+        });
     }
 
     /// Close everything the watcher has open and write it out.
@@ -1665,6 +1787,9 @@ impl App {
             (KeyCode::Char('A'), _) => Some(Command::AuxOpen),
             (KeyCode::Char('y'), _) => Some(Command::TapeDolby),
             (KeyCode::Char('R'), _) => Some(Command::TapeRecord),
+            (KeyCode::Char('M'), _) => Some(Command::TapeRecMode),
+            (KeyCode::Char('('), _) => Some(Command::RecLevelDown),
+            (KeyCode::Char(')'), _) => Some(Command::RecLevelUp),
             // Auto-reverse moved off `a` when the aux input took it. `b` is
             // the side it turns the tape over to.
             (KeyCode::Char('b'), _) => Some(Command::TapeAutoReverse),
@@ -2189,6 +2314,28 @@ fn main() -> Result<()> {
         // folded and everything else is open, whatever the memory happens to
         // hold. A screenshot flag that inherits saved state produces a
         // different picture on every machine.
+        // Authoritative like the rest: `--rec=audio` means AUDIO mode armed
+        // with signal on the meter, whatever the memory holds, so the picture
+        // is the same on every machine.
+        if let Some(what) = args.iter().find_map(|a| a.strip_prefix("--rec=")) {
+            let rec = &mut app.stack.tape.rec;
+            match what {
+                "audio" => {
+                    rec.mode = state::RecMode::Audio;
+                    rec.arm = state::Arm::Running;
+                    rec.level_db = -3;
+                    rec.input = 0.42;
+                    rec.take_seconds = 154.0;
+                    rec.take_bytes = 27_000_000;
+                }
+                _ => {
+                    rec.mode = state::RecMode::Track;
+                    rec.on = true;
+                    rec.wrote = 12;
+                    rec.following = 2;
+                }
+            }
+        }
         if let Some(list) = args.iter().find_map(|a| a.strip_prefix("--fold=")) {
             app.stack.layout.collapsed = [false; 7];
             for t in list.split(',') {

@@ -99,9 +99,9 @@ make screenshot                         # render one frame to stdout and exit
 make radio-check                        # sweep the FM band and report signal
 ```
 
-`R` in the panel switches REC on, and the deck starts a log of everything any
-player on the desktop plays — what it was, and for how long. A playlist is
-something you cut out of that afterwards:
+`M` picks what REC records. In **TRACK** mode the deck logs everything any
+player on the desktop plays — what it was, and for how long — and writes no
+audio at all. A playlist is something you cut out of that afterwards:
 
 ```sh
 ten-qd --log                     # what the log holds, by session
@@ -110,7 +110,12 @@ ten-qd --export=2026-07 --rank   # a month, ordered by play count
 ```
 
 The point is a week of YouTube Music in a tab and Spotify in the afternoon
-coming out as one list you hold, in a format any player can open. See
+coming out as one list you hold, in a format any player can open.
+
+In **AUDIO** mode `R` arms the deck — meters live, nothing written — so the
+record level can be set against real signal, and again to roll. It writes WAV
+tapped *before* the equaliser, so the volume can be anywhere and the curve you
+set for your headphones is not baked into the file. See
 [docs/recording.md](docs/recording.md).
 
 Wants a terminal at least **84 columns** wide and 24-bit colour, with a font
@@ -132,7 +137,8 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `[` `]` `g` `P` | tune down/up · LOCAL · tuner power |
 | `e` `r` `z` | eject · repeat · random |
 | `v` `y` `b` | flip the tape · Dolby · auto-reverse |
-| `R` | REC — log every player: what played, and for how long |
+| `M` `R` | record mode: TRACK a list · AUDIO the signal — then arm and roll |
+| `( )` | record level, ±12 dB — its own stage, upstream of volume and GAIN |
 | `a`  `A` | select AUX · pick what to send through it |
 | `1`–`9` | …on AUX: plug that stream through the rack |
 | `↑` `↓` `m` | volume · attenuator |
