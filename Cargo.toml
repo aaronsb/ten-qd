@@ -1,8 +1,8 @@
 [package]
 name = "ten-qd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "A terminal music player wearing an 80s car stereo — real EQ, real meters, real FM off an RTL-SDR"
+description = "A terminal music player wearing an 80s car stereo — real EQ, real meters, real FM off an RTL-SDR, and a deck that writes down what it heard"
 license = "MIT"
 repository = "https://github.com/aaronsb/ten-qd"
 readme = "README.md"

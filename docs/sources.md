@@ -1,4 +1,4 @@
-# The three sources
+# The four sources
 
 One source at a time — this is a head unit, not a mixer. Everything downstream
 of the source is identical no matter where the audio came from, because the

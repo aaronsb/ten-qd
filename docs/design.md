@@ -107,7 +107,7 @@ separate materials would have collapsed.
 
 ## The rack is a cabinet
 
-The six units are *separates*, so which of them are in the cabinet and in what
+The seven units are *separates*, so which of them are in the cabinet and in what
 order is the operator's business. `~` opens the arranger: the arrows move a
 cursor, space picks a unit up so the arrows carry it, enter takes it out or
 puts it back, `r` restores the factory arrangement. Escape closes — there is
