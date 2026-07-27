@@ -13,6 +13,7 @@ mod listen;
 mod memory;
 mod mpris;
 mod playlist;
+mod project;
 mod state;
 mod ui;
 
@@ -22,7 +23,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -53,11 +54,15 @@ ten-qd — a terminal music player wearing an 80s car stereo
                            (--aux --browser --outputs --arrange --fold=… --hide=…)
     ten-qd --radio-check   sweep the FM band and report signal per channel
     ten-qd --aux-check     open the aux input and check the cable
+    ten-qd --log           what the listening log holds, by session
+    ten-qd --export[=WHAT] cut a playlist out of the log, to stdout
+                           WHAT: all (default) · last · a date or session,
+                           e.g. 2026-07 · add --rank to order by play count
     ten-qd --forget        clear the 12-volt memory (presets, tone, last disc)
     ten-qd --help          this
 
-Settings persist to $XDG_STATE_HOME/ten-qd/memory.toml.
-Press ? inside the panel for the key map.";
+Settings persist to $XDG_STATE_HOME/ten-qd/memory.toml, and REC writes
+listening.jsonl beside it. Press ? inside the panel for the key map.";
 
 /// A pending track start, waiting for the output clock to reach it.
 struct Mark {
@@ -103,7 +108,11 @@ struct App {
     /// only while it is, so switching REC on starts a clean slate rather than
     /// back-dating whatever happened to be playing.
     watcher: listen::Watcher,
-    log: listen::Log,
+    /// `None` when there is no HOME. Writing the log to the current directory
+    /// instead would put it somewhere `--export` does not look, which is worse
+    /// than not writing it: the operator would be told entries were saved and
+    /// then be unable to find one of them.
+    log: Option<listen::Log>,
     /// Streams offered for plugging in, refreshed when the adapter goes in.
     streams: Vec<adapter::Stream>,
     /// Where the loop guard should put us back, shared with its thread. It
@@ -177,9 +186,7 @@ impl App {
             adapter: None,
             mpris: mpris::Mpris::start(),
             watcher: listen::Watcher::new(listen::session_id(started)),
-            log: listen::Log::at(
-                listen::Log::path().unwrap_or_else(|| PathBuf::from("listening.jsonl")),
-            ),
+            log: listen::Log::path().map(listen::Log::at),
             streams: Vec::new(),
             guard_target: Arc::new(std::sync::Mutex::new(mem.output.clone())),
         }
@@ -222,6 +229,21 @@ impl App {
     }
 
     fn load(&mut self, path: PathBuf) {
+        // A playlist is a tape, not a disc: someone already chose the running
+        // order, and a disc is a folder read in sorted order. This is also
+        // what `--export` writes, so a tape cut out of the log can be handed
+        // straight back to the deck by name.
+        if playlist::is_playlist(&path) {
+            match browser::tape_from_playlist(&path) {
+                Ok((tape, skipped)) => {
+                    let msg = tape_line(&tape, skipped);
+                    self.insert_tape(tape, true);
+                    self.status(msg);
+                }
+                Err(e) => self.status(format!("no tape: {e}")),
+            }
+            return;
+        }
         match disc::load(&path) {
             Ok(d) => {
                 let total = d.total_seconds() as u64;
@@ -689,28 +711,46 @@ impl App {
             // playing — so the status says which it is rather than leaving
             // "recording" to be read as the tape heads.
             Command::TapeRecord => {
-                if !self.stack.tape.power {
-                    self.status("TAPE is out of the signal path — no power, no record");
+                let Some(log) = self.log.as_ref().map(|l| l.file().display().to_string()) else {
+                    self.status("no HOME — there is nowhere to write a log");
                     return;
-                }
+                };
+                // REC is a switch, not an action on the signal path, so it
+                // moves whether or not the deck has power — otherwise a rack
+                // that came up with REC remembered and the deck switched off
+                // would need powering up merely to switch REC back off. The
+                // lamp is what reports whether anything is actually being
+                // written, and it reads `power` as well as this.
                 let on = !self.stack.tape.rec.on;
                 if !on {
                     self.rec_stop();
                 }
                 let mut rec = self.stack.tape.rec.clone();
                 rec.on = on;
+                // Switching *on* clears a previous failure: that is the
+                // operator saying "try again". Switching off must not, because
+                // `rec_stop` above has just tried to flush and may have failed
+                // doing it — clearing here would hide the loss of the tail at
+                // the one moment it mattered.
+                if on {
+                    rec.failed = false;
+                }
                 let wrote = rec.wrote;
                 self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
-                self.status(if on {
+
+                // A flush that failed on the way out keeps its own message: it
+                // says the tail was lost, which a tidy count would paper over.
+                if !on && self.stack.tape.rec.failed {
+                    return;
+                }
+                self.status(match (on, self.stack.tape.power) {
                     // The session name is here because it is what selects a
                     // run back out of the log later — the tape you will cut.
-                    format!(
-                        "REC · session {} · {}",
-                        self.watcher.session(),
-                        self.log.file().display()
-                    )
-                } else {
-                    format!("REC off — {wrote} entries logged this session")
+                    (true, true) => format!("REC · session {} · {log}", self.watcher.session()),
+                    (true, false) => {
+                        "REC set, but TAPE has no power — nothing is being written".into()
+                    }
+                    (false, _) => format!("REC off — {wrote} entries logged this session"),
                 });
             }
 
@@ -889,9 +929,11 @@ impl App {
                 }
             }
             Command::BrowserLoadTape => match self.browser.as_tape() {
-                Ok(tape) => {
+                Ok((tape, skipped)) => {
                     self.browser.open = false;
+                    let msg = tape_line(&tape, skipped);
                     self.insert_tape(tape, true);
+                    self.status(msg);
                 }
                 Err(e) => self.browser.error = Some(e.to_string()),
             },
@@ -1227,14 +1269,22 @@ impl App {
         if !self.recording() {
             return;
         }
-        let done = self.watcher.observe(&self.mpris.all(), SystemTime::now());
+        // A bus that did not answer is not a bus with nothing on it. Feeding
+        // the watcher an empty list here would close every open entry, and the
+        // outage clearing would open fresh ones — one track logged as two.
+        // Skipping the poll entirely also means no time is credited across the
+        // outage, which is the truthful account: nobody was looking.
+        let Some(seen) = self.mpris.all() else { return };
+
+        let done = self.watcher.observe(&seen, SystemTime::now());
         let wrote = self.write_log(&done);
         let following = self.watcher.following().count().min(u8::MAX as usize) as u8;
 
-        let (was, total) = (self.stack.tape.rec.following, self.stack.tape.rec.wrote + wrote);
+        let rec = &self.stack.tape.rec;
+        let (was, total, failed) = (rec.following, rec.wrote + wrote, rec.failed);
         if wrote > 0 || following != was {
             self.stack.apply(Patch {
-                tape_rec: Some(RecState { on: true, wrote: total, following }),
+                tape_rec: Some(RecState { on: true, wrote: total, following, failed }),
                 ..Default::default()
             });
         }
@@ -1244,7 +1294,7 @@ impl App {
     /// position; a deck with its power off is not writing anything down, and
     /// the lamp reads this rather than the switch.
     fn recording(&self) -> bool {
-        self.stack.tape.rec.on && self.stack.tape.power
+        self.stack.tape.rec.on && self.stack.tape.power && self.log.is_some()
     }
 
     /// Close everything the watcher has open and write it out.
@@ -1270,10 +1320,25 @@ impl App {
         let mut n = 0;
         let mut failed = None;
         for e in entries {
-            match self.log.append(e) {
-                Ok(()) => n += 1,
-                Err(why) => failed = Some(format!("log unwritable: {why}")),
+            match self.log.as_ref().map(|l| l.append(e)) {
+                Some(Ok(())) => n += 1,
+                Some(Err(why)) => failed = Some(format!("log unwritable: {why}")),
+                None => failed = Some("no HOME — the log has nowhere to live".into()),
             }
+        }
+        // Latched, not just announced. The status line scrolls away within
+        // seconds and the REC lamp does not, so a lamp burning over a log that
+        // has stopped taking writes is the display wishing rather than reading.
+        //
+        // It has to clear itself, though. The latch is there to outlive the
+        // *message*, not the fault: a disk that filled and was emptied again
+        // would otherwise show NO LOG over a log being written to perfectly
+        // well for the rest of the session, which is the same lie inverted.
+        let settled = failed.is_none() && n > 0;
+        if failed.is_some() || (settled && self.stack.tape.rec.failed) {
+            let mut rec = self.stack.tape.rec.clone();
+            rec.failed = failed.is_some();
+            self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
         }
         if let Some(why) = failed {
             self.status(why);
@@ -1891,6 +1956,80 @@ fn aux_check() -> Result<()> {
     Ok(())
 }
 
+/// Read the log, or say plainly why there is nothing to read.
+///
+/// A missing file is not an error: it means REC has never been switched on,
+/// and telling the operator that is more use than a path that does not exist.
+fn open_log() -> Result<project::Read> {
+    let path = listen::Log::path().context("no HOME — the log has nowhere to live")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // stderr, not stdout: `--export` prints a playlist to stdout, and
+            // a prose notice landing above `#EXTM3U` would be read back as a
+            // track named after the sentence. A diagnostic on stderr costs
+            // `--log` nothing.
+            eprintln!("nothing logged yet — press R in the panel to switch REC on");
+            eprintln!("the log will be written to {}", path.display());
+            return Ok(project::Read { entries: Vec::new(), torn: 0 });
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("read {}", path.display()))),
+    };
+
+    let read = project::read(&text);
+    // On stderr so it cannot end up inside a playlist being piped to a file.
+    if read.torn > 0 {
+        eprintln!(
+            "{} unreadable line(s) skipped — one at the end is a crash mid-write, \
+             several means something else",
+            read.torn
+        );
+    }
+    Ok(read)
+}
+
+fn list_log() -> Result<()> {
+    let log = open_log()?;
+    let sessions = project::sessions(&log.entries);
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    for s in &sessions {
+        println!("{}", project::describe(s));
+    }
+    let plays: usize = sessions.iter().map(|s| s.entries).sum();
+    println!("\n{} session(s), {plays} play(s)", sessions.len());
+    println!("cut one out with: ten-qd --export={}", sessions[sessions.len() - 1].id);
+    Ok(())
+}
+
+fn export(what: &str, rank: bool) -> Result<()> {
+    // Parsed before the log is opened: a selector that means nothing should
+    // say so rather than emitting a header first.
+    let pick = project::Pick::parse(what).map_err(anyhow::Error::msg)?;
+    let log = open_log()?;
+    let picked = project::select(&log.entries, &pick);
+    let cuts = project::cut(&picked, rank);
+
+    // The playlist goes to stdout so it can be redirected; everything about
+    // the playlist goes to stderr so that redirect stays clean.
+    let missing = cuts.iter().filter(|c| c.uri.is_empty()).count();
+    print!("{}", project::m3u(&cuts, &pick));
+    eprintln!(
+        "{} play(s) → {} track(s){}",
+        picked.len(),
+        cuts.len() - missing,
+        match missing {
+            0 => String::new(),
+            n => format!(", {n} with no location (listed as comments)"),
+        }
+    );
+    if picked.is_empty() && !log.entries.is_empty() {
+        eprintln!("nothing matched — 'ten-qd --log' lists what is there");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--radio-check") {
@@ -1898,6 +2037,14 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--aux-check") {
         return aux_check();
+    }
+    if args.iter().any(|a| a == "--log") {
+        return list_log();
+    }
+    if let Some(what) = args.iter().find_map(|a| {
+        (a == "--export").then_some("").or_else(|| a.strip_prefix("--export="))
+    }) {
+        return export(what, args.iter().any(|a| a == "--rank"));
     }
     if args.iter().any(|a| a == "--forget") {
         return match Memory::forget() {
@@ -2173,13 +2320,26 @@ impl Drop for Hush {
     }
 }
 
+/// What to say about a tape that has just gone in.
+///
+/// Names what was dropped as well as what loaded. A tape cut from a week of
+/// Spotify and mpv arrives with the service URIs missing, and reporting only
+/// the tracks that made it is how half a playlist goes quietly absent.
+fn tape_line(tape: &state::Tape, skipped: usize) -> String {
+    let head = format!("tape: {} · {} tracks", tape.title, tape.tracks.len());
+    match skipped {
+        0 => head,
+        n => format!("{head} · {n} the deck cannot cue"),
+    }
+}
+
 fn music_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let p = PathBuf::from(home).join("Music");
     p.is_dir().then_some(p)
 }
 
-fn run(
+fn panel(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     keeper: &mut Keeper,
@@ -2237,9 +2397,45 @@ fn run(
         }
         last = Instant::now();
     }
-
-    // Switching off closes whatever was still running. A session that ends
-    // mid-track should still record the part you heard.
-    app.rec_stop();
     Ok(())
+}
+
+/// Run the panel, and close the listening log however it ends.
+///
+/// The loop propagates terminal errors with `?`, so a flush placed after it
+/// runs on a clean quit and on nothing else — and the open entries of a
+/// session that died to a resize error are exactly the ones worth keeping.
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    keeper: &mut Keeper,
+) -> Result<()> {
+    let played = panel(terminal, app, keeper);
+    app.rec_stop();
+    played
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tape cut from a week of Spotify and mpv loads with the service URIs
+    /// missing. Reporting only the tracks that made it is how half a playlist
+    /// goes quietly absent.
+    #[test]
+    fn a_tape_says_what_it_could_not_cue() {
+        let track = |t: &str| state::Track {
+            title: t.into(),
+            artist: "BoC".into(),
+            seconds: 100.0,
+            path: PathBuf::from(t),
+        };
+        let tape = state::Tape::from_tracks(
+            "mix".into(),
+            PathBuf::from("mix.m3u"),
+            vec![track("a"), track("b")],
+        );
+        assert_eq!(tape_line(&tape, 0), "tape: mix · 2 tracks");
+        assert_eq!(tape_line(&tape, 3), "tape: mix · 2 tracks · 3 the deck cannot cue");
+    }
 }

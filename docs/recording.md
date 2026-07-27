@@ -1,8 +1,8 @@
 # Recording
 
-*TRACK mode is built. AUDIO mode, and the projection that cuts a playlist out
-of the log, are not — the sections below are marked where they describe
-something that does not exist yet.*
+*TRACK mode and the projection that cuts a playlist out of the log are built.
+AUDIO mode is not — the sections below are marked where they describe something
+that does not exist yet.*
 
 **In one line:** the deck keeps an append-only log of everything you listen to,
 across every service, and a playlist is something you cut out of it later.
@@ -74,12 +74,19 @@ is kept in the 12-volt memory — always-append only gathers a week of listening
 if it survives the key coming out. There is no mode selector yet because there
 is only one mode; AUDIO will need one.
 
-REC is a switch, and the lamp beside it is a readout. Take the deck out of the
-signal path and nothing is appended, so the lamp goes dark while the switch
-stays where you left it — pull the power and put it back and the log picks up.
+REC is a switch, and the lamp beside it is a readout. It lights only while
+entries can actually be appended — take the deck out of the signal path, or let
+a write fail, and the lamp goes dark (`NO LOG` for the second case) while the
+switch stays where you left it. The fault clears itself when writes succeed
+again: the latch is there to outlive the status line, which scrolls away, not
+to outlive the fault. Pull the power and put it back and the log
+picks up.
+
 The window reports two counts, both of things that already happened: entries
-committed to disk, and players with an entry open that will be written when
-they end.
+committed to disk, and players whose entry has already run long enough that it
+*will* be written. The second is filtered by the same five-second rule the
+writer uses, which costs a new track five seconds before it appears and buys
+the count meaning exactly what it says.
 
 ### The log, and what is cut from it
 
@@ -115,6 +122,35 @@ your actual taste across every service you used, in a format any player can
 open. Nothing about that requires the services to cooperate, and none of them
 offer it.
 
+**As built:**
+
+```
+  ten-qd --log                     what the log holds, by session
+  ten-qd --export                  everything, in the order first heard
+  ten-qd --export=last             the session that just ended
+  ten-qd --export=2026-07 --rank   a month, ordered by play count
+```
+
+The playlist goes to stdout so it can be redirected; everything *about* the
+playlist goes to stderr so that redirect stays clean. A selector is matched on
+its digits alone, so `2026-07`, `202607` and a full session id are all the same
+question asked three ways.
+
+Three decisions the projection makes, none of which the log is allowed to:
+
+- **Repeats collapse, and the count survives.** `#PLAYS:` precedes anything
+  heard more than once. The log keeps every play because how often you played
+  something is the signal; the playlist is where that becomes a ranking.
+- **A track's `#EXTINF` is the longest play seen.** The log records how long
+  *you played* something, which for a song heard five times is five different
+  numbers. The longest is the closest anyone can get to its real length from
+  this side, and length is what splits a tape into sides.
+- **A track with nowhere to point is a comment.** A browser tab routinely
+  reports a title and no location. Dropping those would lose an afternoon;
+  giving them an `#EXTINF` would hand their title to whatever line came next,
+  because that is how the format works. So they come out named, counted, and
+  plainly marked as unplayable.
+
 ### Noticing what is playing
 
 Appending only works if the deck notices sources arriving and leaving on their
@@ -128,11 +164,29 @@ way, with however long it actually ran. Players are keyed by bus name, because
 two Chromium windows both call themselves the same thing and one of them
 starting a second video is not the first one changing track.
 
-Two rules keep the log from filling with things nobody listened to. Time is
+Three rules keep the log from filling with things nobody listened to. Time is
 only credited while a player reports itself playing, so a track left paused
 overnight records the minute you heard rather than the eight hours it sat
-there. And anything under five seconds is dropped: scrubbing through an album
-is not twelve plays.
+there. Anything under five seconds is dropped: scrubbing through an album is
+not twelve plays. And no single poll may credit more than a few seconds —
+because time is credited in arrears, and closing the lid at 22:00 with Spotify
+playing otherwise makes the first poll of the morning book a ten-hour listen
+into a file that is never rewritten.
+
+Two silences are also read as silences rather than as events. A player still
+present but reporting no metadata — one failed D-Bus call — is not a track
+change, or a hiccup would split one play into two, doubling its count and
+halving the length every tape cut from it inherits. And a bus that cannot be
+reached at all is not a bus with nothing on it, so an outage holds the open
+entries rather than closing every one of them.
+
+Holding is bounded in both directions, because a hold is a guess and a guess
+should not outlive its evidence. A player that goes quiet is still believed
+about whether it is *playing*, so one that clears its metadata at the moment it
+stops accrues nothing — otherwise an idle mpv would bank an hour against
+whatever track was named last. And the hold expires after fifteen seconds:
+past that, nothing supports the claim that what is running is still the track
+the entry was opened for.
 
 So TRACK writes down the order and nothing else. It costs no disk and
 duplicates no content, and the tape cut out of it later loads straight back
@@ -218,24 +272,18 @@ the level against the meter; release. Three states, not two — idle, armed,
 running — and worth building in from the start rather than retrofitting. The
 input meter is already a record-level meter; that is what those are.
 
-**Projection needs a command.** Selecting sessions and emitting a playlist is a
-separate verb from recording — likely `--export` with a session range and a
-format, rather than anything on the panel. The deck records; cutting a tape out
-of the log is a different job.
-
-**Deduplication belongs to projection, not the log.** The log keeps every play,
-because how often you played something is the signal. The playlist that comes
-out of it collapses repeats.
-
 **A track's duration is what you played, not what it was.** *Settled:* the log
 counts wall-clock seconds while the player says it is playing, rather than
 reading the track length off MPRIS. Skip halfway and it says so — which matters
 downstream, because sides are split by running time.
 
-**A service URI is not a path.** `playlist.rs` deliberately drops lines
-containing `://` as "a station, not a track" — correct for playback, and now
-needing a deliberate exception. Whether such a tape can *replay* depends on the
-service, and the deck should say so rather than silently failing to cue.
+**A service URI is not a path.** *Half settled:* `playlist.rs` now recognises a
+URI scheme rather than only `://`, so `spotify:track:…` is turned away instead
+of being read as a filename — and a tape made entirely of them says how many it
+could not cue rather than "lists nothing playable". What is *not* settled is
+replay: driving the service over MPRIS to play its own track back is a feature
+that does not exist, so for now such a tape is a list you can open elsewhere
+rather than one the deck can run.
 
 **A microphone and speakers are an acoustic loop.** Unlike the routing loop, no
 guard can prevent it. The deck can only warn.

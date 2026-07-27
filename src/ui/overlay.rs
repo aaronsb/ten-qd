@@ -67,6 +67,7 @@ pub const HELP: &[(&str, &str, bool)] = &[
     ("RECORD", "(TRACK mode — a list, not a tape)", true),
     ("R", "log every player: what played, and for how long", false),
     ("", "~/.local/state/ten-qd/listening.jsonl", false),
+    ("", "cut a tape out of it: ten-qd --log, ten-qd --export", false),
     ("", "", false),
     ("CONTROL HEAD", "", true),
     ("↑ ↓  m", "volume · attenuator", false),

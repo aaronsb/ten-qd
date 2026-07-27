@@ -94,9 +94,24 @@ errors, plus the tests.
 ```sh
 make run                                # first album found under ~/Music
 cargo run --release -- /path/to/album   # a folder of audio files is a disc
+cargo run --release -- mix.m3u          # a playlist is a tape, in its own order
 make screenshot                         # render one frame to stdout and exit
 make radio-check                        # sweep the FM band and report signal
 ```
+
+`R` in the panel switches REC on, and the deck starts a log of everything any
+player on the desktop plays — what it was, and for how long. A playlist is
+something you cut out of that afterwards:
+
+```sh
+ten-qd --log                     # what the log holds, by session
+ten-qd --export=last > mix.m3u   # the session that just ended
+ten-qd --export=2026-07 --rank   # a month, ordered by play count
+```
+
+The point is a week of YouTube Music in a tab and Spotify in the afternoon
+coming out as one list you hold, in a format any player can open. See
+[docs/recording.md](docs/recording.md).
 
 Wants a terminal at least **84 columns** wide and 24-bit colour, with a font
 that has good block-element coverage — any Nerd Font will do. The rack is 70

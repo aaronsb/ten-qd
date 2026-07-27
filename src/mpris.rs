@@ -52,7 +52,13 @@ pub struct Mpris {
     /// Every player on the bus, as the last poll saw it. The aux bay wants one
     /// player — the one on the cable — and the listening log wants all of
     /// them, so the poll gathers everything and `now` is a choice made from it.
-    all: Arc<Mutex<Vec<NowPlaying>>>,
+    ///
+    /// `None` means the bus could not be read at all, which is a different
+    /// fact from "nobody is playing" and has to stay different: an empty list
+    /// tells the listening log every player has gone away, and answering a
+    /// D-Bus outage with that would close every open entry and start fresh
+    /// ones when it cleared.
+    all: Arc<Mutex<Option<Vec<NowPlaying>>>>,
     /// The application name to prefer when several players are running —
     /// normally whatever is plugged into the aux input.
     prefer: Arc<Mutex<Option<String>>>,
@@ -71,7 +77,7 @@ impl Mpris {
     /// one-way cable it is imitating.
     pub fn start() -> Self {
         let now: Arc<Mutex<Option<NowPlaying>>> = Arc::new(Mutex::new(None));
-        let all: Arc<Mutex<Vec<NowPlaying>>> = Arc::new(Mutex::new(Vec::new()));
+        let all: Arc<Mutex<Option<Vec<NowPlaying>>>> = Arc::new(Mutex::new(None));
         let prefer: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -82,7 +88,8 @@ impl Mpris {
                 while !t_stop.load(Ordering::Relaxed) {
                     let want = t_prefer.lock().ok().and_then(|g| g.clone());
                     let found = poll();
-                    let chosen = pick(&found, want.as_deref()).cloned();
+                    let chosen =
+                        found.as_ref().and_then(|f| pick(f, want.as_deref())).cloned();
                     if let Ok(mut g) = t_now.lock() {
                         *g = chosen;
                     }
@@ -113,8 +120,12 @@ impl Mpris {
     /// Every player the last poll found, playing or not. This is what the
     /// listening log watches: Chromium at breakfast, Spotify after lunch, both
     /// at once while one is paused.
-    pub fn all(&self) -> Vec<NowPlaying> {
-        self.all.lock().map(|g| g.clone()).unwrap_or_default()
+    ///
+    /// `None` until the first successful scan, and again whenever one fails —
+    /// "the bus did not answer", which callers must not read as "nothing is
+    /// playing".
+    pub fn all(&self) -> Option<Vec<NowPlaying>> {
+        self.all.lock().ok().and_then(|g| g.clone())
     }
 
     /// Send a transport command. Synchronous, but a single D-Bus round trip
@@ -181,12 +192,16 @@ fn find(want: Option<&str>) -> Option<mpris::Player> {
     }
 }
 
-/// Snapshot every player on the bus. One scan serves both readers: a machine
-/// with no D-Bus reports an empty list rather than failing.
-fn poll() -> Vec<NowPlaying> {
-    let Some(finder) = mpris::PlayerFinder::new().ok() else { return Vec::new() };
-    let Ok(players) = finder.find_all() else { return Vec::new() };
-    players.iter().map(snapshot).collect()
+/// Snapshot every player on the bus. One scan serves both readers.
+///
+/// `None` when the bus itself could not be reached — no D-Bus, or a failed
+/// enumeration. An empty `Some` is the other thing entirely: the bus answered
+/// and nobody is running. Collapsing the two is what would let a momentary
+/// outage read as every player quitting at once.
+fn poll() -> Option<Vec<NowPlaying>> {
+    let finder = mpris::PlayerFinder::new().ok()?;
+    let players = finder.find_all().ok()?;
+    Some(players.iter().map(snapshot).collect())
 }
 
 fn snapshot(player: &mpris::Player) -> NowPlaying {
@@ -219,7 +234,7 @@ mod tests {
     /// rather than failing.
     #[test]
     fn polling_either_finds_players_or_reports_none() {
-        for n in poll() {
+        for n in poll().unwrap_or_default() {
             assert!(!n.bus.is_empty(), "a found player must have a bus name");
         }
     }

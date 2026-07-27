@@ -140,7 +140,7 @@ impl Browser {
 
         for path in lists {
             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            let below = playlist::read(&path).map(|e| e.len()).unwrap_or(0);
+            let below = playlist::read(&path).map(|l| l.entries.len()).unwrap_or(0);
             self.entries.push(Entry { kind: Kind::Playlist, here: 0, below, name, path });
         }
 
@@ -200,11 +200,12 @@ impl Browser {
         }
     }
 
-    /// Compile the highlighted row into a tape, whichever kind it is.
-    pub fn as_tape(&self) -> Result<Tape> {
+    /// Compile the highlighted row into a tape, whichever kind it is, along
+    /// with how many lines it could not cue. A folder has none by definition.
+    pub fn as_tape(&self) -> Result<(Tape, usize)> {
         let Some(e) = self.selected() else { bail!("nothing selected") };
         match e.kind {
-            Kind::Folder => tape_from_dir(&e.path),
+            Kind::Folder => tape_from_dir(&e.path).map(|t| (t, 0)),
             Kind::Playlist => tape_from_playlist(&e.path),
         }
     }
@@ -214,11 +215,12 @@ impl Browser {
 ///
 /// Unlike a folder scan this does **not** sort: a playlist's whole point is
 /// that someone already chose the running order.
-pub fn tape_from_playlist(path: &Path) -> Result<Tape> {
-    let entries = playlist::read(path)?;
+pub fn tape_from_playlist(path: &Path) -> Result<(Tape, usize)> {
+    let loaded = playlist::read(path)?;
     let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
 
-    let tracks: Vec<Track> = entries
+    let tracks: Vec<Track> = loaded
+        .entries
         .iter()
         .filter_map(|e| {
             // Metadata in the file beats the playlist's label; the label is
@@ -236,7 +238,12 @@ pub fn tape_from_playlist(path: &Path) -> Result<Tape> {
     if tracks.is_empty() {
         bail!("nothing in {name} could be decoded");
     }
-    Ok(Tape::from_tracks(name, path.to_path_buf(), tracks))
+    // Everything the deck could not cue, not only the lines `resolve` turned
+    // away: a file that has since been moved, or one in a codec symphonia does
+    // not carry, fails silently in the probe above and is just as absent from
+    // the tape as a `spotify:` line is.
+    let dropped = loaded.entries.len() - tracks.len() + loaded.remote;
+    Ok((Tape::from_tracks(name, path.to_path_buf(), tracks), dropped))
 }
 
 /// Gather every track below `dir` into a tape.
