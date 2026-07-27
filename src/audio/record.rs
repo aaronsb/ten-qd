@@ -721,6 +721,34 @@ mod tests {
         assert!(data > 0, "a patched header must not still claim zero");
     }
 
+    /// The reported length must agree with the file. At the moment stop is
+    /// pressed the ring still holds whatever the writer has not reached, so a
+    /// count read before the drain describes a shorter take than the one on
+    /// disk.
+    #[test]
+    fn the_reported_length_matches_the_file_after_the_drain() {
+        let s = Scratch::new("drain");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
+        let (rec, mut tap) = Recorder::start(48_000);
+
+        rec.set_arm(Arm::Running);
+        // More than one writer pass, fed with no pause, so the ring is deep
+        // when the take is stopped.
+        for _ in 0..40 {
+            tap.feed(&[0.25; 2048]);
+        }
+        rec.finish_take(Duration::from_millis(1000));
+
+        let path = rec.file().expect("a take");
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            rec.bytes() + 44,
+            on_disk,
+            "the panel's count and the file must be the same take"
+        );
+        assert_eq!(rec.seconds(), 40_960.0 / 48_000.0, "40 x 2048 samples is 40960 frames");
+    }
+
     #[test]
     fn a_recorder_starts_and_stops_without_ever_recording() {
         let (rec, _tap) = Recorder::start(48_000);

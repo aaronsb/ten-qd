@@ -1422,8 +1422,6 @@ impl App {
         // writer kept up — and reading them after the reset always produced
         // zero, so the message existed and could never be reached.
         let ending = self.stack.tape.rec.arm == Arm::Running && want == Arm::Idle;
-        let (secs, bytes, dropped) =
-            (engine.record.seconds(), engine.record.bytes(), engine.record.dropped());
 
         if want == Arm::Idle {
             // Waits for the header to be patched, so `file` names something
@@ -1432,6 +1430,13 @@ impl App {
         } else {
             engine.record.set_arm(want);
         }
+
+        // Read *after* the drain. The counts are what the writer committed,
+        // and at the moment the operator presses stop the ring still holds up
+        // to two seconds it has not written yet — so reading first reports a
+        // take shorter than the file it just made.
+        let (secs, bytes, dropped) =
+            (engine.record.seconds(), engine.record.bytes(), engine.record.dropped());
         let got = engine.record.arm();
         let file = engine.record.file();
         let failed = engine.record.failed();
