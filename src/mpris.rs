@@ -22,11 +22,20 @@ use std::time::Duration;
 /// What the player last told us. Cloned out by the UI each frame.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NowPlaying {
+    /// The D-Bus name, which is the only stable identity here: two Chromium
+    /// windows both call themselves "Chromium", and the listening log has to
+    /// tell them apart to know whether a track changed or a second one
+    /// started.
+    pub bus: String,
     /// The player's own name for itself: "Spotify", "Chromium", "mpv".
     pub player: String,
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// Where the track lives, as the player understands it — a `spotify:` or
+    /// `https:` URI for a service, a `file://` URL for a local file. Empty
+    /// when the player does not say.
+    pub uri: String,
     pub playing: bool,
 }
 
@@ -40,6 +49,10 @@ pub enum Transport {
 
 pub struct Mpris {
     now: Arc<Mutex<Option<NowPlaying>>>,
+    /// Every player on the bus, as the last poll saw it. The aux bay wants one
+    /// player — the one on the cable — and the listening log wants all of
+    /// them, so the poll gathers everything and `now` is a choice made from it.
+    all: Arc<Mutex<Vec<NowPlaying>>>,
     /// The application name to prefer when several players are running —
     /// normally whatever is plugged into the aux input.
     prefer: Arc<Mutex<Option<String>>>,
@@ -58,17 +71,22 @@ impl Mpris {
     /// one-way cable it is imitating.
     pub fn start() -> Self {
         let now: Arc<Mutex<Option<NowPlaying>>> = Arc::new(Mutex::new(None));
+        let all: Arc<Mutex<Vec<NowPlaying>>> = Arc::new(Mutex::new(Vec::new()));
         let prefer: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let (t_now, t_prefer, t_stop) = (now.clone(), prefer.clone(), stop.clone());
+        let (t_now, t_all, t_prefer, t_stop) = (now.clone(), all.clone(), prefer.clone(), stop.clone());
         std::thread::Builder::new()
             .name("ten-qd/mpris".into())
             .spawn(move || {
                 while !t_stop.load(Ordering::Relaxed) {
                     let want = t_prefer.lock().ok().and_then(|g| g.clone());
-                    let found = poll(want.as_deref());
+                    let found = poll();
+                    let chosen = pick(&found, want.as_deref()).cloned();
                     if let Ok(mut g) = t_now.lock() {
+                        *g = chosen;
+                    }
+                    if let Ok(mut g) = t_all.lock() {
                         *g = found;
                     }
                     std::thread::sleep(Duration::from_millis(500));
@@ -76,7 +94,7 @@ impl Mpris {
             })
             .ok();
 
-        Mpris { now, prefer, stop }
+        Mpris { now, all, prefer, stop }
     }
 
     /// Tell the watcher which player to prefer. Several can be running at
@@ -90,6 +108,13 @@ impl Mpris {
 
     pub fn now_playing(&self) -> Option<NowPlaying> {
         self.now.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Every player the last poll found, playing or not. This is what the
+    /// listening log watches: Chromium at breakfast, Spotify after lunch, both
+    /// at once while one is paused.
+    pub fn all(&self) -> Vec<NowPlaying> {
+        self.all.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Send a transport command. Synchronous, but a single D-Bus round trip
@@ -108,30 +133,45 @@ impl Mpris {
     }
 }
 
-/// Pick a player, preferring one whose identity or bus name resembles `want`.
+/// Whether a player answers to a name the operator asked for.
+///
+/// Loose on purpose: PipeWire calls it "Spotify" and so does MPRIS, but a
+/// browser is "Chromium" on one side and "chromium.instance3976392" on the
+/// other.
+fn prefers(identity: &str, bus: &str, want: &str) -> bool {
+    let (id, bus, w) = (
+        identity.to_ascii_lowercase(),
+        bus.to_ascii_lowercase(),
+        want.to_ascii_lowercase(),
+    );
+    (!id.is_empty() && (id.contains(&w) || w.contains(&id))) || bus.contains(&w)
+}
+
+/// Choose one snapshot out of the poll: the one that answers to `want`, else
+/// whichever is actually playing, since a player merely sitting paused is not
+/// what anyone means by "what is on".
+fn pick<'a>(players: &'a [NowPlaying], want: Option<&str>) -> Option<&'a NowPlaying> {
+    if let Some(w) = want
+        && let Some(p) = players.iter().find(|p| prefers(&p.player, &p.bus, w))
+    {
+        return Some(p);
+    }
+    players.iter().find(|p| p.playing).or_else(|| players.first())
+}
+
+/// Pick a live player to send a command to. Separate from `pick` because a
+/// snapshot cannot be told to skip a track — this re-scans the bus, which is
+/// fine for a keypress and would not be for a 2 Hz poll.
 fn find(want: Option<&str>) -> Option<mpris::Player> {
     let finder = mpris::PlayerFinder::new().ok()?;
     let players = finder.find_all().ok()?;
-    if players.is_empty() {
-        return None;
+
+    if let Some(w) = want
+        && let Some(i) = players.iter().position(|p| prefers(p.identity(), p.bus_name(), w))
+    {
+        return players.into_iter().nth(i);
     }
 
-    if let Some(w) = want {
-        let w = w.to_ascii_lowercase();
-        // Match loosely: PipeWire calls it "Spotify", MPRIS calls it
-        // "Spotify", but a browser is "Chromium" one side and
-        // "chromium.instance3976392" the other.
-        if let Some(p) = players.iter().position(|p| {
-            let id = p.identity().to_ascii_lowercase();
-            let bus = p.bus_name().to_ascii_lowercase();
-            id.contains(&w) || w.contains(&id) || bus.contains(&w)
-        }) {
-            return players.into_iter().nth(p);
-        }
-    }
-
-    // No preference, or nothing matched: whichever is actually playing wins
-    // over one merely sitting paused.
     let playing = players
         .iter()
         .position(|p| matches!(p.get_playback_status(), Ok(mpris::PlaybackStatus::Playing)));
@@ -141,10 +181,18 @@ fn find(want: Option<&str>) -> Option<mpris::Player> {
     }
 }
 
-fn poll(want: Option<&str>) -> Option<NowPlaying> {
-    let player = find(want)?;
+/// Snapshot every player on the bus. One scan serves both readers: a machine
+/// with no D-Bus reports an empty list rather than failing.
+fn poll() -> Vec<NowPlaying> {
+    let Some(finder) = mpris::PlayerFinder::new().ok() else { return Vec::new() };
+    let Ok(players) = finder.find_all() else { return Vec::new() };
+    players.iter().map(snapshot).collect()
+}
+
+fn snapshot(player: &mpris::Player) -> NowPlaying {
     let meta = player.get_metadata().ok();
-    Some(NowPlaying {
+    NowPlaying {
+        bus: player.bus_name().to_string(),
         player: player.identity().to_string(),
         playing: matches!(player.get_playback_status(), Ok(mpris::PlaybackStatus::Playing)),
         title: meta.as_ref().and_then(|m| m.title()).unwrap_or_default().to_string(),
@@ -154,21 +202,67 @@ fn poll(want: Option<&str>) -> Option<NowPlaying> {
             .map(|a| a.join(", "))
             .unwrap_or_default(),
         album: meta.as_ref().and_then(|m| m.album_name()).unwrap_or_default().to_string(),
-    })
+        uri: meta.as_ref().and_then(|m| m.url()).unwrap_or_default().to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn player(bus: &str, identity: &str, playing: bool) -> NowPlaying {
+        NowPlaying { bus: bus.into(), player: identity.into(), playing, ..Default::default() }
+    }
+
     /// Exercises the real bus when one is present. Read-only, so it is safe
-    /// anywhere; a machine with no D-Bus or no player reports nothing rather
-    /// than failing.
+    /// anywhere; a machine with no D-Bus or no player reports an empty list
+    /// rather than failing.
     #[test]
-    fn polling_either_finds_a_player_or_reports_none() {
-        if let Some(n) = poll(None) {
-            assert!(!n.player.is_empty(), "a found player must name itself");
+    fn polling_either_finds_players_or_reports_none() {
+        for n in poll() {
+            assert!(!n.bus.is_empty(), "a found player must have a bus name");
         }
+    }
+
+    #[test]
+    fn a_preferred_player_wins_over_one_that_is_playing() {
+        let all = [
+            player("org.mpris.MediaPlayer2.spotify", "Spotify", true),
+            player("org.mpris.MediaPlayer2.chromium.instance3976392", "Chromium", false),
+        ];
+        assert_eq!(pick(&all, Some("Chromium")).unwrap().player, "Chromium");
+    }
+
+    #[test]
+    fn without_a_preference_whatever_is_playing_wins() {
+        let all = [
+            player("org.mpris.MediaPlayer2.chromium.instance1", "Chromium", false),
+            player("org.mpris.MediaPlayer2.spotify", "Spotify", true),
+        ];
+        assert_eq!(pick(&all, None).unwrap().player, "Spotify");
+        assert!(pick(&[], None).is_none());
+    }
+
+    #[test]
+    fn an_unmatched_preference_falls_back_rather_than_reporting_nothing() {
+        let all = [player("org.mpris.MediaPlayer2.spotify", "Spotify", true)];
+        assert_eq!(pick(&all, Some("Rhythmbox")).unwrap().player, "Spotify");
+    }
+
+    #[test]
+    fn a_player_is_matched_by_bus_name_when_its_identity_does_not_say() {
+        // PipeWire labels the stream "chromium"; MPRIS calls the player
+        // "Chromium" and buses it as "chromium.instance3976392".
+        assert!(prefers("Chromium", "org.mpris.MediaPlayer2.chromium.instance1", "chromium"));
+        assert!(prefers("Spotify", "org.mpris.MediaPlayer2.spotify", "Spotify"));
+        assert!(!prefers("Spotify", "org.mpris.MediaPlayer2.spotify", "mpv"));
+    }
+
+    /// A player that has not filled in its identity must not match everything
+    /// by virtue of the empty string being a substring of every name.
+    #[test]
+    fn a_nameless_player_matches_nothing_by_accident() {
+        assert!(!prefers("", "org.mpris.MediaPlayer2.vlc", "spotify"));
     }
 
     #[test]

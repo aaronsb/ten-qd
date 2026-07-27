@@ -1,6 +1,8 @@
 # Recording
 
-*A design note. None of this is built yet.*
+*TRACK mode is built. AUDIO mode, and the projection that cuts a playlist out
+of the log, are not — the sections below are marked where they describe
+something that does not exist yet.*
 
 **In one line:** the deck keeps an append-only log of everything you listen to,
 across every service, and a playlist is something you cut out of it later.
@@ -42,8 +44,8 @@ bus, which is holding a microphone to a speaker without the room in the way.
 
 | mode | writes | captures | cannot know |
 |---|---|---|---|
-| **TRACK** | an M3U playlist | the sequence — what played, in order, with its source | what a nameless signal *is*. It can still say where it came from. |
-| **AUDIO** | a file per take | the signal, exactly as it was | which parts of it were which. |
+| **TRACK** | the listening log | the sequence — what played, in order, with its source | what a nameless signal *is*. It can still say where it came from. |
+| **AUDIO** *(not built)* | a file per take | the signal, exactly as it was | which parts of it were which. |
 
 The modes are not two settings of one feature. They are two different machines
 that happen to share a button.
@@ -67,12 +69,17 @@ way of getting your own listening back out of them, and appending is what makes
 that work without you having to decide in advance that a moment was worth
 keeping.
 
-So the mode has two settings, both persisted in the 12-volt memory:
+**As built:** `R`, or the ●REC key on the deck, switches it on, and the switch
+is kept in the 12-volt memory — always-append only gathers a week of listening
+if it survives the key coming out. There is no mode selector yet because there
+is only one mode; AUDIO will need one.
 
-| | |
-|---|---|
-| **record mode** | TRACK or AUDIO |
-| **always append** | keep logging whenever the rack is running |
+REC is a switch, and the lamp beside it is a readout. Take the deck out of the
+signal path and nothing is appended, so the lamp goes dark while the switch
+stays where you left it — pull the power and put it back and the log picks up.
+The window reports two counts, both of things that already happened: entries
+committed to disk, and players with an entry open that will be written when
+they end.
 
 ### The log, and what is cut from it
 
@@ -111,22 +118,28 @@ offer it.
 ### Noticing what is playing
 
 Appending only works if the deck notices sources arriving and leaving on their
-own. `mpris.rs` polls at 2 Hz and picks *one* player; TRACK mode needs
-`find_all()` and needs to treat players as coming and going — Chromium at
-breakfast, Spotify after lunch, both at once while one is paused.
+own. `mpris.rs` polls the whole bus at 2 Hz and keeps every player; the aux
+bay's single "what is on the cable" is now a choice made out of that list
+rather than a separate scan.
 
-A new entry is warranted when a player's `(artist, title, album)` tuple changes,
-or when a player appears already playing something. A player disappearing closes
-its current entry with however long it actually ran.
+A new entry begins when a player that is playing has something to say, and ends
+when its `(artist, title, album)` tuple changes or the player goes away — either
+way, with however long it actually ran. Players are keyed by bus name, because
+two Chromium windows both call themselves the same thing and one of them
+starting a second video is not the first one changing track.
 
-So TRACK writes down the order and nothing else. It costs no disk, duplicates
-no content, and produces a tape that loads straight back into the deck — which
-replays it by driving the player over MPRIS. Same songs, same order, no copy.
-`playlist.rs` already reads and writes M3U with `#EXTINF`; `Mpris::poll` already
-runs at 2 Hz and reports title, artist and album. A change in that tuple is a
-track boundary.
+Two rules keep the log from filling with things nobody listened to. Time is
+only credited while a player reports itself playing, so a track left paused
+overnight records the minute you heard rather than the eight hours it sat
+there. And anything under five seconds is dropped: scrubbing through an album
+is not twelve plays.
 
-**AUDIO is for the things that have no playlist.** A microphone, a line input,
+So TRACK writes down the order and nothing else. It costs no disk and
+duplicates no content, and the tape cut out of it later loads straight back
+into the deck — which replays it by driving the player over MPRIS. Same songs,
+same order, no copy.
+
+**AUDIO is for the things that have no playlist.** *(Not built.)* A microphone, a line input,
 a broadcast. Those exist only as signal, and no playlist can carry them.
 
 But they are not anonymous. PipeWire names every device, and the names are
@@ -192,7 +205,7 @@ is upstream of ten-qd entirely, needs no tap and no encoder, and captures
 exactly what arrived. The callback tap is uniform across sources; the monitor
 tap is simpler but aux-only.
 
-## Consequences to settle before building
+## Consequences still to settle
 
 **REC LEVEL is its own gain stage.** GAIN is the equaliser's *output* trim,
 downstream of the tap, so it cannot serve. That is correct — a deck's REC LEVEL
@@ -205,10 +218,6 @@ the level against the meter; release. Three states, not two — idle, armed,
 running — and worth building in from the start rather than retrofitting. The
 input meter is already a record-level meter; that is what those are.
 
-**TRACK mode needs `find_all()`, not `find()`.** `mpris.rs` picks one player
-today, which is right for driving transport keys and wrong for logging
-everything that plays.
-
 **Projection needs a command.** Selecting sessions and emitting a playlist is a
 separate verb from recording — likely `--export` with a session range and a
 format, rather than anything on the panel. The deck records; cutting a tape out
@@ -218,9 +227,10 @@ of the log is a different job.
 because how often you played something is the signal. The playlist that comes
 out of it collapses repeats.
 
-**A track's duration is what you played, not what it was.** MPRIS reports
-position. Skip halfway and the `#EXTINF` should say so, because sides are split
-by running time and a tape should be honest about how long it actually ran.
+**A track's duration is what you played, not what it was.** *Settled:* the log
+counts wall-clock seconds while the player says it is playing, rather than
+reading the track length off MPRIS. Skip halfway and it says so — which matters
+downstream, because sides are split by running time.
 
 **A service URI is not a path.** `playlist.rs` deliberately drops lines
 containing `://` as "a station, not a track" — correct for playback, and now

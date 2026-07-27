@@ -117,6 +117,7 @@ calendar cues a track. Press `?` in the app for the full key map.
 | `[` `]` `g` `P` | tune down/up · LOCAL · tuner power |
 | `e` `r` `z` | eject · repeat · random |
 | `v` `y` `b` | flip the tape · Dolby · auto-reverse |
+| `R` | REC — log every player: what played, and for how long |
 | `a`  `A` | select AUX · pick what to send through it |
 | `1`–`9` | …on AUX: plug that stream through the rack |
 | `↑` `↓` `m` | volume · attenuator |
@@ -156,7 +157,7 @@ measured to make the meters honest.
 |---|---|
 | [docs/sources.md](docs/sources.md) | the four sources — what a disc, a tape, a station and a cable each are |
 | [docs/audio.md](docs/audio.md) | the signal path, the DSP, and the clock the display runs on |
-| [docs/recording.md](docs/recording.md) | a design note on the record button — not built yet |
+| [docs/recording.md](docs/recording.md) | REC and the listening log — a mixtape is an order, not a copy |
 | [docs/tuner.md](docs/tuner.md) | FM demodulation on an RTL-SDR, and calibrating it against the band |
 | [docs/design.md](docs/design.md) | the panel language: glyphs, colour, and what is invented |
 | [docs/memory.md](docs/memory.md) | the 12-volt memory: what persists, where, and how it heals |

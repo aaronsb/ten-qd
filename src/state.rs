@@ -119,6 +119,9 @@ pub enum Command {
     TapeEject,
     TapeDolby,
     TapeAutoReverse,
+    /// TRACK mode. Not a transport: it starts and stops the listening log,
+    /// which runs independently of what the deck itself is playing.
+    TapeRecord,
 
     // QA-581 auxiliary input — the cable, and whatever is on the end of it
     /// Open the picker listing what is playing and could be plugged in.
@@ -237,7 +240,7 @@ impl Command {
             | CdRandom | BrowserLoadDisc => Unit::Cd,
 
             TapePlayPause | TapeStop | TapeApsNext | TapeApsPrev | TapeRew | TapeFf
-            | TapeFlip | TapeEject | TapeDolby | TapeAutoReverse
+            | TapeFlip | TapeEject | TapeDolby | TapeAutoReverse | TapeRecord
             | BrowserLoadTape => Unit::Tape,
 
             TunerBand | TunerSeekUp | TunerSeekDown | TunerStepUp | TunerStepDown
@@ -402,6 +405,27 @@ pub struct TapeState {
     pub dolby: bool,
     pub auto_reverse: bool,
     pub tape: Option<Tape>,
+    /// What the deck is writing down.
+    pub rec: RecState,
+}
+
+/// TRACK mode — the deck keeping a log of what played.
+///
+/// Every field here is a count of something that has already happened. The
+/// panel shows `wrote` and `following`, and both must be exactly what the log
+/// would contain if the rack stopped at this instant; a REC lamp lit over a
+/// log that is not being appended to would be the display wishing rather than
+/// reading.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecState {
+    /// Whether the log is being appended to.
+    pub on: bool,
+    /// Entries written this session. Not tracks heard — tracks *committed to
+    /// disk*, so a log that cannot be written stops counting.
+    pub wrote: u32,
+    /// Players currently being followed. Anything counted here has an entry
+    /// that will be written when it ends.
+    pub following: u8,
 }
 
 /// What is on the other end of the cable.
@@ -457,6 +481,7 @@ impl Default for TapeState {
             dolby: true,
             auto_reverse: true,
             tape: None,
+            rec: RecState::default(),
         }
     }
 }
@@ -806,6 +831,7 @@ pub struct Patch {
     pub tape_counter: Option<f64>,
     pub tape_dolby: Option<bool>,
     pub tape_auto_reverse: Option<bool>,
+    pub tape_rec: Option<RecState>,
     pub cd_power: Option<bool>,
     pub tape_power: Option<bool>,
     pub aux_power: Option<bool>,
@@ -891,6 +917,9 @@ impl Stack {
         }
         if let Some(v) = p.tape_auto_reverse {
             self.tape.auto_reverse = v;
+        }
+        if let Some(v) = p.tape_rec {
+            self.tape.rec = v;
         }
         if let Some(v) = p.cd_power {
             self.cd.power = v;
