@@ -258,30 +258,37 @@ fn oneline(s: &str) -> String {
 /// non-comment line, so emitting one for a track with nowhere to point would
 /// hand its title to whatever came after it.
 pub fn m3u(cuts: &[Cut], what: &Pick) -> String {
-    let playable = cuts.iter().filter(|c| !c.uri.is_empty()).count();
+    // Flattened *before* anything asks whether there is a location at all.
+    // `uri` is whatever the player put in `xesam:url`, so it needs the same
+    // treatment as the label — but doing it at the point of use would leave
+    // the branch above deciding from the raw string, and a `uri` of nothing
+    // but control characters would then take the playable path and emit an
+    // `#EXTINF` above a blank line. Blank lines are skipped on the way back
+    // in, so that is the label leak this function exists to avoid, reached by
+    // a different road.
+    let located: Vec<(&Cut, String)> = cuts.iter().map(|c| (c, oneline(&c.uri))).collect();
+    let playable = located.iter().filter(|(_, uri)| !uri.is_empty()).count();
+
     let mut out = String::from("#EXTM3U\n");
     out.push_str(&format!(
         "#PLAYLIST:ten-qd · {} · {playable} tracks\n",
         what.describe()
     ));
 
-    for c in cuts {
+    for (c, uri) in located {
         let label = if c.artist.is_empty() {
             oneline(&c.title)
         } else {
             format!("{} - {}", oneline(&c.artist), oneline(&c.title))
         };
-        if c.uri.is_empty() {
+        if uri.is_empty() {
             out.push_str(&format!("# no location · {} play(s) · {label}\n", c.plays));
             continue;
         }
         if c.plays > 1 {
             out.push_str(&format!("#PLAYS:{}\n", c.plays));
         }
-        // The location gets the same treatment as the label, for the same
-        // reason: `uri` is whatever the player put in `xesam:url`, and a
-        // control character in it would split this line too.
-        out.push_str(&format!("#EXTINF:{},{label}\n{}\n", c.seconds, oneline(&c.uri)));
+        out.push_str(&format!("#EXTINF:{},{label}\n{uri}\n", c.seconds));
     }
     out
 }
@@ -430,6 +437,25 @@ mod tests {
         assert_eq!(extinf.len(), 1, "{text}");
         assert_eq!(extinf[0], "#EXTINF:100,BoC spotify:track:evil - Cold Earth");
         assert_eq!(text.lines().count(), 4, "header, playlist, extinf, location: {text}");
+    }
+
+    /// A location that flattens to nothing is not a location. Deciding from
+    /// the raw string put an `#EXTINF` above a blank line, and blank lines are
+    /// skipped coming back in — so the label landed on the next track.
+    #[test]
+    fn a_location_that_is_only_whitespace_is_no_location_at_all() {
+        let entries = vec![
+            e("s", "2026-07-26T10:00:00Z", "BoC", "Cold Earth", "\n\t ", 100),
+            e("s", "2026-07-26T10:05:00Z", "BoC", "Reach", "spotify:b", 200),
+        ];
+        let text = m3u(&cut(&entries, false), &Pick::All);
+        assert!(text.contains("# no location · 1 play(s) · BoC - Cold Earth"), "{text}");
+        assert!(text.contains("#PLAYLIST:ten-qd · everything · 1 tracks"), "{text}");
+        assert!(!text.lines().any(str::is_empty), "a blank line loses the label: {text}");
+
+        // And read back through our own parser, the surviving label is Reach's.
+        let extinf: Vec<&str> = text.lines().filter(|l| l.starts_with("#EXTINF:")).collect();
+        assert_eq!(extinf, vec!["#EXTINF:200,BoC - Reach"], "{text}");
     }
 
     #[test]
