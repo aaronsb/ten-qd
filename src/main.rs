@@ -352,12 +352,14 @@ impl App {
                     // had gone quiet about it — the invariant inverted, and
                     // worse than the usual way round, because an operator
                     // told nothing has no reason to look.
-                    if let Some(e) = &self.engine {
-                        e.record.finish_take(std::time::Duration::from_millis(500));
+                    //
+                    // Through the same path a REC press takes, so cutting the
+                    // power still reports the take's length, size and where it
+                    // went. A stop that says nothing is how that report went
+                    // missing the first time.
+                    if self.stack.tape.rec.arm != Arm::Idle {
+                        self.audio_rec(Arm::Idle);
                     }
-                    let mut rec = self.stack.tape.rec.clone();
-                    rec.arm = Arm::Idle;
-                    self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
                 }
                 let selected = matches!(
                     (u, self.stack.source),
@@ -1452,6 +1454,12 @@ impl App {
         }
         self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
 
+        // A create that failed says why. NO FILE on its own cannot tell no
+        // HOME from a full disk from a permission change.
+        if let Some(why) = failed.then(|| engine.record.why()).flatten() {
+            self.status(format!("no take: {why}"));
+            return;
+        }
         self.status(match got {
             Arm::Armed => "REC PAUSE — meters live, nothing written. Set the level".into(),
             Arm::Running => "REC — writing pre-EQ, so volume does not touch it".into(),
@@ -2609,7 +2617,8 @@ fn run(
     app.rec_stop();
     // And the take. TRACK got this treatment last round; AUDIO is the mode
     // where the abandoned artefact is 600 MB with a header claiming zero
-    // rather than one line of JSON.
+    // rather than one line of JSON. Worth a full second: the operator is
+    // leaving anyway, and the alternative is a malformed file.
     if let Some(e) = &app.engine {
         e.record.finish_take(std::time::Duration::from_millis(1000));
     }

@@ -382,8 +382,20 @@ mod tests {
         // and the NO LOG warning that replaces them. The warning was the one
         // that still overprinted, and a sweep that only set `failed: false`
         // could never have seen it.
-        for failed in [false, true] {
-            let rec = RecState { on: true, wrote: 12, following: 2, failed, ..Default::default() };
+        for (mode, failed) in
+            [(RecMode::Track, false), (RecMode::Track, true), (RecMode::Audio, true)]
+        {
+            let rec = RecState {
+                on: true,
+                wrote: 12,
+                following: 2,
+                failed,
+                mode,
+                arm: Arm::Running,
+                take_seconds: 154.0,
+                take_bytes: 27_000_000,
+                ..Default::default()
+            };
             let mut drawn = 0;
             for width in 50..=120u16 {
                 let mut stack = Stack::default();
@@ -398,14 +410,21 @@ mod tests {
                 // of overprint and `contains("NO LOG")` would stay green over
                 // a visibly garbled row. The rule is the cell COUNTER eats
                 // first, which makes it the thing worth asserting.
-                let shown = if failed { "NO LOG▕" } else { "012 LOG · 2" };
-                if text.contains("LOG") {
+                let shown = match (mode, failed) {
+                    // Nine cells for AUDIO's label, eight for TRACK's — and
+                    // the closing rule either way, since that is the cell
+                    // COUNTER eats first.
+                    (RecMode::Audio, _) => "NO FILE▕",
+                    (_, true) => "NO LOG▕",
+                    _ => "012 LOG · 2",
+                };
+                if text.contains("LOG") || text.contains("FILE") {
                     drawn += 1;
-                    assert!(text.contains("COUNTER"), "at {width} ({failed}): {text}");
-                    assert!(text.contains(shown), "at {width} ({failed}): {text}");
+                    assert!(text.contains("COUNTER"), "at {width} ({mode:?}/{failed}): {text}");
+                    assert!(text.contains(shown), "at {width} ({mode:?}/{failed}): {text}");
                 }
             }
-            assert!(drawn > 0, "nothing drawn for failed={failed} — this proves nothing");
+            assert!(drawn > 0, "nothing drawn for {mode:?}/{failed} — this proves nothing");
         }
     }
 
@@ -454,7 +473,7 @@ mod tests {
     /// its length as though it were continuous would be the worst kind of
     /// readout: precise, and wrong.
     #[test]
-    fn a_take_with_a_gap_in_it_says_so_instead_of_reporting_a_length() {
+    fn a_take_with_a_gap_never_reports_its_length_unqualified() {
         let panel = render(RecState { dropped: true, ..audio(Arm::Running) }, true);
         // The length still shows — a take you cannot measure is one you cannot
         // decide about — but never without the word that qualifies it.

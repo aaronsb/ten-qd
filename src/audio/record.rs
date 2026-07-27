@@ -39,7 +39,7 @@
 //! says out loud rather than leaving to be discovered.
 
 use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -80,9 +80,31 @@ struct Shared {
     /// second take to the first file. A take needs an identity, not a
     /// deduced boundary.
     generation: AtomicU64,
-    /// A file is open. Lets an orderly shutdown wait for the header patch
-    /// instead of racing process teardown.
-    writing: AtomicBool,
+    /// Total samples the tap has queued, ever. Published so a take boundary
+    /// can be expressed as a position in the stream.
+    pushed: AtomicU64,
+    /// The stream position at which the open file must close, or `u64::MAX`
+    /// for "no boundary pending".
+    ///
+    /// Separating the *files* is not enough: the ring is shared and carries
+    /// no marker, so at a restart whatever the writer has not yet popped
+    /// still belongs to the take that just ended. Closing on the generation
+    /// alone wrote that tail into the *next* file — losing the end of one
+    /// take and prefixing the next with it, in exactly the stalled-disk case
+    /// the generation was added for. The boundary travels with the stream, so
+    /// the split lands on the right sample.
+    boundary: AtomicU64,
+    /// Why the last create failed, if it did. `NO FILE` on its own cannot
+    /// distinguish no HOME from a full disk from a permission change.
+    why: Mutex<Option<String>>,
+    /// The writer has stopped, has nothing open and nothing waiting.
+    ///
+    /// Deliberately not "a file is open": that question flickers at a
+    /// boundary, where a close and the create after it straddle two
+    /// statements. This is published once an iteration, after every part of
+    /// the question has settled, so a shutdown waiting on it cannot slip
+    /// through the gap — and never before `finish` has actually returned.
+    quiescent: AtomicBool,
 }
 
 /// The handle the panel holds.
@@ -150,6 +172,9 @@ impl Tap {
         for s in block {
             let _ = self.prod.try_push(s * level);
         }
+        // Published after the push, so a boundary taken from it never names a
+        // position the ring has not reached.
+        self.shared.pushed.fetch_add(block.len() as u64, Ordering::Release);
         block.len()
     }
 }
@@ -157,6 +182,18 @@ impl Tap {
 impl Recorder {
     /// Start the writer thread and hand back the callback's tap.
     pub fn start(rate: u32) -> (Recorder, Tap) {
+        Self::start_in(Self::dir(), rate)
+    }
+
+    /// The same, against an explicit directory.
+    ///
+    /// Exists so tests need not reach through `XDG_STATE_HOME` to say where a
+    /// take goes. They did, and it was a real data race: the variable is read
+    /// on the *writer* thread at create time while other tests in the same
+    /// binary set it to their own scratch directories. That is what `set_var`
+    /// being unsafe in Rust 2024 is about, and it let the collision test pass
+    /// without testing anything.
+    pub fn start_in(dir: Option<PathBuf>, rate: u32) -> (Recorder, Tap) {
         let shared = Arc::new(Shared {
             arm: AtomicU32::new(0),
             level: AtomicU32::new(1.0f32.to_bits()),
@@ -165,7 +202,10 @@ impl Recorder {
             dropped: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             generation: AtomicU64::new(0),
-            writing: AtomicBool::new(false),
+            pushed: AtomicU64::new(0),
+            boundary: AtomicU64::new(u64::MAX),
+            why: Mutex::new(None),
+            quiescent: AtomicBool::new(true),
         });
         let file: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -174,7 +214,7 @@ impl Recorder {
         let (t_shared, t_file, t_stop) = (shared.clone(), file.clone(), stop.clone());
         std::thread::Builder::new()
             .name("ten-qd/record".into())
-            .spawn(move || writer(t_shared, t_file, t_stop, cons, rate))
+            .spawn(move || writer(t_shared, t_file, t_stop, cons, dir, rate))
             .ok();
 
         (Recorder { shared: shared.clone(), file, stop, rate }, Tap { shared, prod })
@@ -200,7 +240,12 @@ impl Recorder {
             self.shared.dropped.store(false, Ordering::Relaxed);
             self.shared.failed.store(false, Ordering::Relaxed);
             self.shared.frames.store(0, Ordering::Relaxed);
-            self.shared.generation.fetch_add(1, Ordering::Relaxed);
+            // Where the outgoing take ends. Safe to read here because the tap
+            // pushes only while running, so nothing is being added right now.
+            self.shared
+                .boundary
+                .store(self.shared.pushed.load(Ordering::Acquire), Ordering::Release);
+            self.shared.generation.fetch_add(1, Ordering::Release);
         }
         self.shared.arm.store(
             match arm {
@@ -241,6 +286,11 @@ impl Recorder {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
+    /// Why the last create failed, if it did.
+    pub fn why(&self) -> Option<String> {
+        self.shared.why.lock().ok().and_then(|g| g.clone())
+    }
+
     /// Stop recording and wait for the file to be closed properly.
     ///
     /// The header carries two sizes that are only known once the take ends, so
@@ -252,7 +302,7 @@ impl Recorder {
     pub fn finish_take(&self, wait: Duration) {
         self.set_arm(Arm::Idle);
         let until = std::time::Instant::now() + wait;
-        while self.shared.writing.load(Ordering::Acquire) && std::time::Instant::now() < until {
+        while !self.shared.quiescent.load(Ordering::Acquire) && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -277,60 +327,93 @@ fn writer(
     file: Arc<Mutex<Option<PathBuf>>>,
     stop: Arc<AtomicBool>,
     mut cons: <HeapRb<f32> as Split>::Cons,
+    dir: Option<PathBuf>,
     rate: u32,
 ) {
     let mut open: Option<Wav> = None;
     let mut buf = vec![0.0f32; 8192];
+    // Samples taken out of the ring, ever — the position a boundary is
+    // expressed in.
+    let mut popped: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         let arm = shared.arm.load(Ordering::Acquire);
-        let generation = shared.generation.load(Ordering::Relaxed);
+        let generation = shared.generation.load(Ordering::Acquire);
         let running = arm == 2;
+        let mut boundary = shared.boundary.load(Ordering::Acquire);
 
-        // A take is over when its generation is superseded, or when recording
-        // has stopped and the ring has given up everything it held. The first
-        // is what makes stop-then-start always two files: without it, a
-        // restart during a long drain — a stalled disk, or REC PAUSE and
-        // resume — appends the new take to the old file.
-        let superseded = open.as_ref().is_some_and(|w| w.generation != generation);
-        let drained = !running && cons.is_empty();
-        if (superseded || drained)
-            && let Some(w) = open.take()
-        {
-            shared.writing.store(false, Ordering::Release);
-            if w.finish().is_err() {
-                shared.failed.store(true, Ordering::Relaxed);
-            }
+        // A boundary the stream has already passed with nothing open is spent:
+        // the take it ended was written out in full before the next one began,
+        // which is the ordinary case and includes the very first take, where
+        // the boundary is armed at position zero. Left standing it would hold
+        // `room` at nothing and the writer would never read another sample.
+        if boundary != u64::MAX && popped >= boundary && open.is_none() {
+            shared.boundary.store(u64::MAX, Ordering::Release);
+            boundary = u64::MAX;
         }
 
-        if running && open.is_none() {
-            match Wav::create(rate, generation) {
+        // Read first, and never past a pending boundary: those samples belong
+        // to the next take and must not land in this file.
+        let room = boundary.saturating_sub(popped).min(buf.len() as u64) as usize;
+        let n = if room == 0 { 0 } else { cons.pop_slice(&mut buf[..room]) };
+        popped += n as u64;
+
+        // A file is opened for *data*, not for the current arm. Deciding from
+        // the arm meant a take whose audio was still in the ring when
+        // recording stopped never got a file at all — the ring was drained and
+        // the audio discarded. Everything in here was pushed while running,
+        // because the tap pushes at no other time.
+        if n > 0 && open.is_none() {
+            match Wav::create(dir.as_deref(), rate, generation) {
                 Ok(w) => {
                     if let Ok(mut g) = file.lock() {
                         *g = Some(w.path.clone());
                     }
-                    shared.writing.store(true, Ordering::Release);
                     open = Some(w);
                 }
-                Err(_) => {
+                Err(e) => {
+                    // The reason matters: no HOME, a full disk and a
+                    // permission change otherwise light the same lamp.
+                    if let Ok(mut g) = shared.why.lock() {
+                        *g = Some(e.to_string());
+                    }
                     shared.failed.store(true, Ordering::Relaxed);
-                    // Do not spin on a directory that cannot be written.
                     std::thread::sleep(Duration::from_millis(250));
                 }
             }
         }
 
-        let n = cons.pop_slice(&mut buf);
         if let Some(w) = open.as_mut() {
             if n > 0 && w.write(&buf[..n]).is_err() {
                 shared.failed.store(true, Ordering::Relaxed);
             }
-            // Only for the take this file belongs to. A superseded generation
-            // is closed above before it can overwrite the new take's count.
+            // Only for the take this file belongs to. A file left from the
+            // previous generation is closed below before the next is opened,
+            // so it can never overwrite the new take's count.
             if w.generation == generation {
                 shared.frames.store(w.frames(), Ordering::Relaxed);
             }
         }
+
+        // A take ends at its boundary in the stream, or — when recording has
+        // stopped and nothing is left anywhere — once the ring is empty.
+        let at_boundary = boundary != u64::MAX && popped >= boundary;
+        let drained = !running && n == 0 && cons.is_empty();
+        if (at_boundary || drained)
+            && let Some(w) = open.take()
+        {
+            // `finish` first, then quiescence below: it seeks, rewrites the
+            // header and flushes, and announcing before doing it let a waiting
+            // shutdown return mid-patch — defeating the point of waiting.
+            if w.finish().is_err() {
+                shared.failed.store(true, Ordering::Relaxed);
+            }
+        }
+        if at_boundary {
+            shared.boundary.store(u64::MAX, Ordering::Release);
+        }
+
+        shared.quiescent.store(!running && open.is_none() && cons.is_empty(), Ordering::Release);
 
         if n == 0 {
             std::thread::sleep(Duration::from_millis(10));
@@ -338,9 +421,9 @@ fn writer(
     }
 
     if let Some(w) = open.take() {
-        shared.writing.store(false, Ordering::Release);
         let _ = w.finish();
     }
+    shared.quiescent.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,10 +463,10 @@ impl Wav {
     /// truncates: the first recording would be destroyed silently, the open
     /// having *succeeded*. Colliding names take a suffix, and a name that
     /// cannot be found at all fails loudly rather than overwriting anything.
-    fn create(rate: u32, generation: u64) -> std::io::Result<Wav> {
-        let dir = Recorder::dir()
-            .ok_or_else(|| std::io::Error::other("no HOME — nowhere to write a recording"))?;
-        std::fs::create_dir_all(&dir)?;
+    fn create(dir: Option<&Path>, rate: u32, generation: u64) -> std::io::Result<Wav> {
+        let dir =
+            dir.ok_or_else(|| std::io::Error::other("no HOME — nowhere to write a recording"))?;
+        std::fs::create_dir_all(dir)?;
 
         let stem = crate::listen::session_id(SystemTime::now());
         for n in 1..100 {
@@ -392,7 +475,14 @@ impl Wav {
             let path = dir.join(name);
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
-                    file.write_all(&header(rate, 0))?;
+                    // A header that will not write leaves a zero-length file
+                    // holding the name, so the next take this second takes a
+                    // suffix for no reason. Take the name back.
+                    if let Err(e) = file.write_all(&header(rate, 0)) {
+                        drop(file);
+                        std::fs::remove_file(&path).ok();
+                        return Err(e);
+                    }
                     return Ok(Wav { file, path, samples: 0, rate, generation });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -577,7 +667,7 @@ mod tests {
     /// watch.
     #[test]
     fn arming_meters_without_writing_anything() {
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(None, 48_000);
         rec.set_arm(Arm::Armed);
         let queued: usize = (0..64).map(|_| tap.feed(&[0.5, -0.5])).sum();
         assert!(rec.peak() > 0.4, "armed must meter: {}", rec.peak());
@@ -589,14 +679,14 @@ mod tests {
 
     #[test]
     fn idle_meters_nothing_at_all() {
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(None, 48_000);
         assert_eq!(tap.feed(&[1.0, 1.0]), 0);
         assert_eq!(rec.peak(), 0.0, "an idle deck is not measuring anything");
     }
 
     #[test]
     fn the_record_level_is_its_own_gain_stage() {
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(None, 48_000);
         rec.set_arm(Arm::Armed);
 
         rec.set_level_db(0);
@@ -617,7 +707,7 @@ mod tests {
     /// whether the control clamped at all.
     #[test]
     fn the_level_cannot_be_driven_past_its_limit() {
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(None, 48_000);
         rec.set_arm(Arm::Armed);
         rec.set_level_db(120);
         tap.feed(&[0.1, 0.1]);
@@ -634,7 +724,7 @@ mod tests {
     /// took a clipped one.
     #[test]
     fn the_meter_reads_after_the_level_not_before() {
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(None, 48_000);
         rec.set_arm(Arm::Armed);
         rec.set_level_db(LEVEL_LIMIT_DB);
         tap.feed(&[0.5, 0.5]);
@@ -655,12 +745,15 @@ mod tests {
     #[test]
     fn a_second_take_in_the_same_second_never_overwrites_the_first() {
         let s = Scratch::new("collide");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
-
-        let first = Wav::create(48_000, 1).expect("first take");
+        let first = Wav::create(Some(&s.0), 48_000, 1).expect("first take");
         std::fs::write(&first.path, b"the first recording").unwrap();
-        let second = Wav::create(48_000, 2).expect("second take");
+        let second = Wav::create(Some(&s.0), 48_000, 2).expect("second take");
 
+        assert_eq!(
+            first.path.parent(),
+            second.path.parent(),
+            "same directory, or this proves nothing"
+        );
         assert_ne!(first.path, second.path, "two takes must not share a path");
         assert_eq!(
             std::fs::read(&first.path).unwrap(),
@@ -677,8 +770,7 @@ mod tests {
     #[test]
     fn stopping_and_starting_always_makes_two_takes() {
         let s = Scratch::new("gen");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(Some(s.0.clone()), 48_000);
 
         rec.set_arm(Arm::Running);
         tap.feed(&[0.25; 512]);
@@ -696,13 +788,61 @@ mod tests {
         assert_ne!(one, two, "a restart must open its own file, not extend the last");
     }
 
+    /// Separating the *files* is not enough. The ring is shared and carries no
+    /// marker, so at a restart whatever the writer has not yet popped still
+    /// belongs to the take that just ended — and closing on the generation
+    /// alone wrote that tail into the next file. This buries the writer before
+    /// restarting, which is the stalled-disk case the split was built for and
+    /// the one a sleep-and-restart test cannot reach.
+    #[test]
+    fn a_restart_does_not_bleed_the_last_take_into_the_next() {
+        let s = Scratch::new("bleed");
+        let (rec, mut tap) = Recorder::start_in(Some(s.0.clone()), 48_000);
+
+        // Take one, with its file genuinely open and the writer draining —
+        // without this the restart happens before the writer has run at all
+        // and there is no backlog to bleed.
+        rec.set_arm(Arm::Running);
+        let mut first = tap.feed(&[0.25; 2048]);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(rec.file().is_some(), "take one should be open before the restart");
+
+        // Now bury it: far more than one writer pass, then stop and restart
+        // with the backlog still in the ring.
+        for _ in 0..30 {
+            first += tap.feed(&[0.25; 2048]);
+        }
+        rec.set_arm(Arm::Idle);
+        rec.set_arm(Arm::Running);
+
+        // Take two: one small block, distinguishable by size alone.
+        let second = tap.feed(&[0.5; 512]);
+        rec.finish_take(Duration::from_millis(2000));
+
+        let takes: Vec<PathBuf> = std::fs::read_dir(&s.0)
+            .expect("the take directory")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        assert_eq!(takes.len(), 2, "a stop and a restart are two takes: {takes:?}");
+
+        // By size, not by name: same-second takes are `X.wav` and `X-2.wav`,
+        // and `-` sorts before `.`, so the suffixed one comes first.
+        let bytes = |p: &PathBuf| std::fs::metadata(p).unwrap().len() - 44;
+        let mut sizes = takes.iter().map(bytes).collect::<Vec<_>>();
+        sizes.sort();
+        assert_eq!(
+            sizes,
+            vec![second as u64 * 2, first as u64 * 2],
+            "the first take must keep its tail and the second start at its own audio"
+        );
+    }
+
     /// The header carries two sizes only known once the take ends. Exiting
     /// without letting the writer patch them leaves a WAV claiming zero.
     #[test]
     fn finishing_a_take_waits_for_the_header_to_be_patched() {
         let s = Scratch::new("finish");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(Some(s.0.clone()), 48_000);
 
         rec.set_arm(Arm::Running);
         for _ in 0..8 {
@@ -728,8 +868,7 @@ mod tests {
     #[test]
     fn the_reported_length_matches_the_file_after_the_drain() {
         let s = Scratch::new("drain");
-        unsafe { std::env::set_var("XDG_STATE_HOME", &s.0) };
-        let (rec, mut tap) = Recorder::start(48_000);
+        let (rec, mut tap) = Recorder::start_in(Some(s.0.clone()), 48_000);
 
         rec.set_arm(Arm::Running);
         // More than one writer pass, fed with no pause, so the ring is deep
@@ -751,7 +890,7 @@ mod tests {
 
     #[test]
     fn a_recorder_starts_and_stops_without_ever_recording() {
-        let (rec, _tap) = Recorder::start(48_000);
+        let (rec, _tap) = Recorder::start_in(None, 48_000);
         assert_eq!(rec.arm(), Arm::Idle);
         assert!(!rec.failed());
         assert!(!rec.dropped());
