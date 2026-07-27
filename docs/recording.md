@@ -1,8 +1,7 @@
 # Recording
 
-*TRACK mode and the projection that cuts a playlist out of the log are built.
-AUDIO mode is not — the sections below are marked where they describe something
-that does not exist yet.*
+*All of this is built: TRACK mode, the projection that cuts a playlist out of
+the log, and AUDIO mode.*
 
 **In one line:** the deck keeps an append-only log of everything you listen to,
 across every service, and a playlist is something you cut out of it later.
@@ -45,7 +44,7 @@ bus, which is holding a microphone to a speaker without the room in the way.
 | mode | writes | captures | cannot know |
 |---|---|---|---|
 | **TRACK** | the listening log | the sequence — what played, in order, with its source | what a nameless signal *is*. It can still say where it came from. |
-| **AUDIO** *(not built)* | a file per take | the signal, exactly as it was | which parts of it were which. |
+| **AUDIO** | a file per take | the signal, exactly as it was | which parts of it were which. |
 
 The modes are not two settings of one feature. They are two different machines
 that happen to share a button.
@@ -193,7 +192,7 @@ duplicates no content, and the tape cut out of it later loads straight back
 into the deck — which replays it by driving the player over MPRIS. Same songs,
 same order, no copy.
 
-**AUDIO is for the things that have no playlist.** *(Not built.)* A microphone, a line input,
+**AUDIO is for the things that have no playlist.** A microphone, a line input,
 a broadcast. Those exist only as signal, and no playlist can carry them.
 
 But they are not anonymous. PipeWire names every device, and the names are
@@ -253,24 +252,51 @@ the speakers. It also means a curve set for your headphones cannot be baked into
 the tape — you would hear it a second time on playback, through whatever you
 played it back on.
 
-For AUDIO mode on aux there is a simpler alternative worth weighing: point
-`pw-record` at the aux sink's monitor and let it write the file directly. That
-is upstream of ten-qd entirely, needs no tap and no encoder, and captures
-exactly what arrived. The callback tap is uniform across sources; the monitor
-tap is simpler but aux-only.
+There was a simpler alternative: point `pw-record` at the aux sink's monitor
+and let it write the file directly, upstream of ten-qd entirely, needing no tap
+and no encoder. It was not taken, because it only ever captures aux — the disc,
+the tape and the radio could not be recorded at all — and a second, differently
+shaped recording path for one source is worse than an encoder.
+
+**As built:** WAV, 16-bit PCM, at the output rate, one file per take under
+`~/.local/state/ten-qd/recordings/`. Uncompressed is the honest first answer —
+it is the signal with nothing decided about it, and it needs no dependency —
+and it costs about 660 MB an hour, which the panel says out loud rather than
+leaving to be discovered.
+
+The callback hands blocks to a ring and a writer thread drains it, because the
+audio callback may not allocate, lock or block. A ring with no room drops the
+*whole* block — a partial push would shift every later frame's channel
+alignment — and the take reads `GAP` beside its running time: a recording with
+a hole in it is a fault to report, and a stuttering rack is a fault you could
+not even report. Only the frames the ring actually supplied are tapped; the
+zeros padding an underrun are silence the rack invented, and writing them would
+put the fault into the file.
+
+A take has an identity, not a deduced boundary. The writer closes a file when
+its generation is superseded, rather than when it happens to observe an idle
+arm and an empty ring — because a stop and a restart can both occur while it is
+still draining a backlog, and the second take would then be appended to the
+first. Files are opened with `create_new`: take names are second-resolution, so
+a double-press would otherwise land on one path and truncate a recording that
+had just been made, with the open succeeding and nothing to report. And
+stopping waits for the header to be patched, because the two sizes in a WAV
+header are only known once the take ends and a 600 MB file claiming zero length
+is not something to leave behind.
 
 ## Consequences still to settle
 
-**REC LEVEL is its own gain stage.** GAIN is the equaliser's *output* trim,
-downstream of the tap, so it cannot serve. That is correct — a deck's REC LEVEL
-was always separate from its playback volume — but it is a second gain control
-and the two must be visibly different things or people will reach for the wrong
-one.
+**REC LEVEL is its own gain stage.** *Settled:* `( )` on the deck, ±12 dB,
+applied at the tap. GAIN is the equaliser's *output* trim, downstream of the
+tap, so it could not serve — and the two are drawn nothing alike, because two
+controls that look the same is how people reach for the wrong one. The meter
+reads *after* the level, so what it shows is what the file is getting.
 
-**REC PAUSE is the preview.** Arm the deck, meters live, tape stationary; set
-the level against the meter; release. Three states, not two — idle, armed,
-running — and worth building in from the start rather than retrofitting. The
-input meter is already a record-level meter; that is what those are.
+**REC PAUSE is the preview.** *Settled:* `R` walks idle → armed → running →
+idle. Armed runs the meters with the tape stationary, which is the only way to
+set a level against real signal before committing to it. Arming offers the
+writer nothing at all: audio leaking into the ring while armed would surface
+later, prepended to the next take.
 
 **A track's duration is what you played, not what it was.** *Settled:* the log
 counts wall-clock seconds while the player says it is playing, rather than

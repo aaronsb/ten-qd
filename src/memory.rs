@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Bank, Layout, SourceKind, Stack, Unit};
+use crate::state::{Bank, Layout, RecMode, SourceKind, Stack, Unit};
 use crate::ui::theme::Ill;
 
 /// Bumped when a field changes meaning rather than merely being added. Unknown
@@ -106,6 +106,12 @@ pub struct Memory {
     /// key coming out like every other switch on the panel.
     #[serde(default)]
     pub rec: bool,
+    /// Which recorder REC drives, and what the record level is set to. Both
+    /// are switch positions on the panel and persist like every other one.
+    #[serde(default)]
+    pub rec_mode: String,
+    #[serde(default)]
+    pub rec_level: i8,
 
     // what was in the machine, and where you were looking
     pub disc: Option<PathBuf>,
@@ -162,6 +168,8 @@ impl Default for Memory {
             dolby: s.tape.dolby,
             auto_reverse: s.tape.auto_reverse,
             rec: s.tape.rec.on,
+            rec_mode: rec_mode_name(s.tape.rec.mode).into(),
+            rec_level: s.tape.rec.level_db,
             disc: None,
             tape: None,
             browser: None,
@@ -206,6 +214,13 @@ fn source_name(s: SourceKind) -> &'static str {
         SourceKind::Tape => "tape",
         SourceKind::Aux => "aux",
         SourceKind::Tuner => "tuner",
+    }
+}
+
+fn rec_mode_name(m: RecMode) -> &'static str {
+    match m {
+        RecMode::Track => "track",
+        RecMode::Audio => "audio",
     }
 }
 
@@ -287,6 +302,10 @@ impl Memory {
         self.treble = self.treble.clamp(-2, 2);
         self.tuner_freq = self.tuner_freq.clamp(crate::state::FM_LO, crate::state::FM_HI);
         self.dimmer = self.dimmer.min(crate::ui::theme::DIM_MAX);
+        self.rec_level = self.rec_level.clamp(
+            -crate::audio::record::LEVEL_LIMIT_DB,
+            crate::audio::record::LEVEL_LIMIT_DB,
+        );
 
         for bank in [&mut self.eq_front, &mut self.eq_rear] {
             bank.resize(9, 0.0);
@@ -336,6 +355,8 @@ impl Memory {
             dolby: stack.tape.dolby,
             auto_reverse: stack.tape.auto_reverse,
             rec: stack.tape.rec.on,
+            rec_mode: rec_mode_name(stack.tape.rec.mode).into(),
+            rec_level: stack.tape.rec.level_db,
             disc: stack.cd.disc.as_ref().map(|d| d.path.clone()),
             tape: stack.tape.tape.as_ref().map(|t| t.path.clone()),
             browser: browser.map(Path::to_path_buf),
@@ -381,6 +402,15 @@ impl Memory {
             "tuner" => SourceKind::Tuner,
             "aux" => SourceKind::Aux,
             _ => SourceKind::Cd,
+        }
+    }
+
+    /// Which recorder REC drives. An unrecognised value is TRACK, which is
+    /// the mode that writes no audio — the safe way to be wrong.
+    pub fn rec_mode(&self) -> RecMode {
+        match self.rec_mode.as_str() {
+            "audio" => RecMode::Audio,
+            _ => RecMode::Track,
         }
     }
 
@@ -723,7 +753,13 @@ mod tests {
             text.contains("eq_front = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]"),
             "arrays should be inline:\n{text}"
         );
-        assert!(text.lines().count() < 30, "too long to read at a glance:\n{text}");
+        // A ceiling on sprawl, not a cap on what the panel may do. It has held
+        // firm twice when the growth was redundant — six power booleans became
+        // one `powered_off` list rather than six lines — and it moves when the
+        // growth is real, as three genuinely independent record settings are.
+        // Contorting the schema to hit a number would trade a readable file
+        // for a passing test.
+        assert!(text.lines().count() <= 34, "too long to read at a glance:\n{text}");
     }
 
     #[test]

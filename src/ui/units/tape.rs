@@ -15,8 +15,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
-use super::SPINE;
-use crate::state::{Command, Side, SourceKind, Stack, Transport, Unit};
+use super::{aux_in, SPINE};
+use crate::audio::record;
+use crate::state::{Arm, Command, RecMode, Side, SourceKind, Stack, Transport, Unit};
 use crate::ui::chassis;
 use crate::ui::glyph::{self, transport as tr};
 use crate::ui::hit::HitMap;
@@ -87,27 +88,90 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
 
     // --- what is being written down ---------------------------------------
     // REC is a switch; this lamp is a readout. A deck with its power off is
-    // not appending to anything, and neither is one whose last write failed,
-    // so the switch can be left where it was and the lamp still tells the
-    // truth.
-    let rec = t.power && t.rec.on && !t.rec.failed;
+    // not writing anything, and neither is one whose last write failed, so
+    // the switch can be left where it was and the lamp still tells the truth.
+    //
+    // Both modes share this row, because they share the button. What differs
+    // is what the counts beside it count.
+    let audio = t.rec.mode == RecMode::Audio;
+    let rec = t.power
+        && !t.rec.failed
+        && if audio { t.rec.arm == Arm::Running } else { t.rec.on };
+    let armed = audio && t.power && !t.rec.failed && t.rec.arm == Arm::Armed;
+
     chassis::boxed(buf, w.x + 2, w.y + 3, "REC", theme, rec, true);
 
-    // The counts share a row with COUNTER, which is right-aligned and moves
-    // with the bay's width. Drawn only where they fit, because a readout
-    // overprinting another readout produces a third that says neither.
-    let counts = format!("{:03} LOG · {}", t.rec.wrote.min(999), t.rec.following);
+    // Everything on this row shares it with COUNTER, which is right-aligned
+    // and moves with the bay's width. Drawn only where it fits, because a
+    // readout overprinting another produces a third that says neither.
     let room = cx.saturating_sub(w.x + 9) as usize;
-    if rec && counts.chars().count() <= room {
-        // Both counts are of things that already happened: entries on disk,
-        // and players whose entry has run long enough that it will be written.
+    let counts = if audio {
+        // Seconds committed and bytes on disk — both measured by the writer,
+        // neither predicted. A take with a hole in it says so instead of
+        // reporting a length it cannot stand behind.
+        //
+        // Gated on the lamp, not on the arm: a deck out of the signal path is
+        // writing nothing, and the length of what it was writing before is not
+        // a fact about now.
+        let s = t.rec.take_seconds as u64;
+        match (if rec || armed { t.rec.arm } else { Arm::Idle }, t.rec.dropped && rec) {
+            // The gap latches for the whole take, so keep the running time
+            // beside it: knowing something was lost does not help decide
+            // whether to keep a take without knowing how long it is.
+            (_, true) => format!("GAP {:02}:{:02}", s / 60, s % 60),
+            (Arm::Armed, _) => t.rec.arm.label().to_string(),
+            (Arm::Running, _) => {
+                format!("{:02}:{:02} {}", s / 60, s % 60, record::size(t.rec.take_bytes))
+            }
+            (Arm::Idle, _) => String::new(),
+        }
+    } else if rec {
+        format!("{:03} LOG · {}", t.rec.wrote.min(999), t.rec.following)
+    } else {
+        String::new()
+    };
+    if !counts.is_empty() && counts.chars().count() <= room {
         chassis::sublegend(buf, w.x + 8, w.y + 3, &counts, theme, true);
     }
-    // Same room test — `glyph::boxed` adds a rule either side, so this is
-    // eight cells, and a fault warning overprinting COUNTER would be one more
-    // readout that says neither thing.
-    if t.rec.failed && t.power && room >= 8 {
-        chassis::boxed(buf, w.x + 8, w.y + 3, "NO LOG", theme, true, true);
+    // `glyph::boxed` adds a rule either side, so this is eight cells, and a
+    // fault warning overprinting COUNTER would be one more readout that says
+    // neither thing.
+    if t.rec.failed && t.power && room >= if audio { 9 } else { 8 } {
+        chassis::boxed(buf, w.x + 8, w.y + 3, if audio { "NO FILE" } else { "NO LOG" }, theme, true, true);
+    }
+
+    // --- record level -----------------------------------------------------
+    // Its own gain stage, and deliberately drawn nothing like the equaliser's
+    // GAIN: that one is downstream of the tap and cannot serve here, and two
+    // controls that look alike is how people reach for the wrong one.
+    //
+    // The meter runs while armed as well as while running — that is what
+    // arming is *for*. It reads after the level trim, so what it shows is what
+    // the file is getting.
+    // The mode leads this line rather than sitting on its own above it: drawn
+    // separately it occupied the same cell as the level and was overwritten
+    // exactly when recording — a legend that vanishes when it matters.
+    let mode_only = format!("{} ", t.rec.mode.label());
+    if audio && (rec || armed) {
+        let label = format!("{} {:+3} ", t.rec.mode.label(), t.rec.level_db);
+        let mx = w.x + 2 + label.chars().count() as u16;
+        let bars = cx.saturating_sub(mx + 7).min(12);
+        if bars >= 4 {
+            chassis::sublegend(buf, w.x + 2, w.y + 2, &label, theme, true);
+            chassis::ramp_bar(buf, mx, w.y + 2, bars, aux_in::scale(t.rec.input), theme);
+            chassis::sublegend(
+                buf,
+                mx + bars + 1,
+                w.y + 2,
+                &aux_in::readout(t.rec.input),
+                theme,
+                true,
+            );
+        } else {
+            chassis::sublegend(buf, w.x + 2, w.y + 2, &mode_only, theme, true);
+        }
+    } else {
+        chassis::sublegend(buf, w.x + 2, w.y + 2, &mode_only, theme, true);
     }
 
     // --- the counter ------------------------------------------------------
@@ -191,7 +255,8 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // Next to the transport because that is where it was, but it is not one:
     // REC writes down what every player on the desktop is doing, which carries
     // on regardless of what this deck is playing.
-    press(&mut row, 6, "●REC", rec, Command::TapeRecord, hits);
+    press(&mut row, 6, "●REC", rec || armed, Command::TapeRecord, hits);
+    press(&mut row, 6, t.rec.mode.label(), audio, Command::TapeRecMode, hits);
     row.gap(2);
 
     // APS — Automatic Program Search, the deck's name for track skip. It finds
@@ -211,11 +276,18 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         (Some(tape), None) => format!("{} · {} tracks", tape.title, tape.tracks.len()),
         _ => "no tape".to_string(),
     };
-    // TRACK mode is not on the tape, so it says so here rather than in the
-    // window: what is being written is a list, and the tape in the deck — if
-    // there is one — has nothing to do with it.
-    if rec {
-        strip.push_str(" · REC to the listening log, not to tape");
+    // Neither mode writes to the tape in the deck, and each is not-the-tape
+    // in a different way — so the strip says which, rather than one sentence
+    // covering both and being wrong about one of them.
+    match (t.rec.mode, rec, armed) {
+        (RecMode::Track, true, _) => strip.push_str(" · REC to the listening log, not to tape"),
+        (RecMode::Audio, true, _) => {
+            strip.push_str(" · REC to a file, pre-EQ — volume does not touch it")
+        }
+        (RecMode::Audio, _, true) => {
+            strip.push_str(" · REC PAUSE — meters live, nothing written yet")
+        }
+        _ => {}
     }
     let max = inner.width.saturating_sub(SPINE + 2) as usize;
     let strip: String = strip.chars().take(max).collect();
@@ -236,6 +308,18 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
 mod tests {
     use super::*;
     use crate::state::RecState;
+
+    fn audio(arm: Arm) -> RecState {
+        RecState {
+            mode: RecMode::Audio,
+            arm,
+            level_db: -3,
+            input: 0.42,
+            take_seconds: 154.0,
+            take_bytes: 27_000_000,
+            ..Default::default()
+        }
+    }
 
     /// The bay as text, so what the panel claims can be asserted on.
     fn render(rec: RecState, power: bool) -> String {
@@ -282,7 +366,7 @@ mod tests {
     #[test]
     fn a_log_that_cannot_be_written_puts_the_rec_lamp_out() {
         let panel = render(
-            RecState { on: true, wrote: 12, following: 2, failed: true },
+            RecState { on: true, wrote: 12, following: 2, failed: true, ..Default::default() },
             true,
         );
         assert!(!panel.contains("LOG ·"), "a failed log kept counting: {panel}");
@@ -298,8 +382,20 @@ mod tests {
         // and the NO LOG warning that replaces them. The warning was the one
         // that still overprinted, and a sweep that only set `failed: false`
         // could never have seen it.
-        for failed in [false, true] {
-            let rec = RecState { on: true, wrote: 12, following: 2, failed };
+        for (mode, failed) in
+            [(RecMode::Track, false), (RecMode::Track, true), (RecMode::Audio, true)]
+        {
+            let rec = RecState {
+                on: true,
+                wrote: 12,
+                following: 2,
+                failed,
+                mode,
+                arm: Arm::Running,
+                take_seconds: 154.0,
+                take_bytes: 27_000_000,
+                ..Default::default()
+            };
             let mut drawn = 0;
             for width in 50..=120u16 {
                 let mut stack = Stack::default();
@@ -314,15 +410,87 @@ mod tests {
                 // of overprint and `contains("NO LOG")` would stay green over
                 // a visibly garbled row. The rule is the cell COUNTER eats
                 // first, which makes it the thing worth asserting.
-                let shown = if failed { "NO LOG▕" } else { "012 LOG · 2" };
-                if text.contains("LOG") {
+                let shown = match (mode, failed) {
+                    // Nine cells for AUDIO's label, eight for TRACK's — and
+                    // the closing rule either way, since that is the cell
+                    // COUNTER eats first.
+                    (RecMode::Audio, _) => "NO FILE▕",
+                    (_, true) => "NO LOG▕",
+                    _ => "012 LOG · 2",
+                };
+                if text.contains("LOG") || text.contains("FILE") {
                     drawn += 1;
-                    assert!(text.contains("COUNTER"), "at {width} ({failed}): {text}");
-                    assert!(text.contains(shown), "at {width} ({failed}): {text}");
+                    assert!(text.contains("COUNTER"), "at {width} ({mode:?}/{failed}): {text}");
+                    assert!(text.contains(shown), "at {width} ({mode:?}/{failed}): {text}");
                 }
             }
-            assert!(drawn > 0, "nothing drawn for failed={failed} — this proves nothing");
+            assert!(drawn > 0, "nothing drawn for {mode:?}/{failed} — this proves nothing");
         }
+    }
+
+    // ---- AUDIO mode ---------------------------------------------------
+
+    #[test]
+    fn a_rolling_take_reports_its_length_and_its_cost() {
+        let panel = render(audio(Arm::Running), true);
+        assert!(panel.contains("02:34 27 MB"), "{panel}");
+        assert!(panel.contains("AUDIO  -3"), "the level is its own control: {panel}");
+        assert!(panel.contains("pre-EQ"), "and says why that matters: {panel}");
+    }
+
+    /// The whole point of arming: meters live, nothing committed. A panel that
+    /// showed a running take here would be inviting the operator to believe a
+    /// file was growing.
+    #[test]
+    fn an_armed_deck_meters_but_claims_no_take() {
+        let panel = render(audio(Arm::Armed), true);
+        assert!(panel.contains("PAUSE"), "{panel}");
+        assert!(panel.contains("AUDIO  -3"), "the level is set from here: {panel}");
+        assert!(panel.contains("dB"), "the meter is the reason to arm: {panel}");
+        assert!(!panel.contains("02:34"), "nothing has been written: {panel}");
+        assert!(panel.contains("nothing written yet"), "{panel}");
+    }
+
+    #[test]
+    fn an_idle_deck_in_audio_mode_shows_no_meter_and_no_take() {
+        let panel = render(audio(Arm::Idle), true);
+        assert!(panel.contains("AUDIO"), "the mode is always legible: {panel}");
+        assert!(!panel.contains("dB"), "an idle deck meters nothing: {panel}");
+        assert!(!panel.contains("02:34"), "{panel}");
+    }
+
+    /// Same invariant as TRACK, different file. A deck out of the signal path
+    /// is writing nothing, whichever machine the button is driving.
+    #[test]
+    fn a_dead_deck_claims_no_take_either() {
+        let panel = render(audio(Arm::Running), false);
+        assert!(!panel.contains("02:34"), "{panel}");
+        assert!(!panel.contains("dB"), "{panel}");
+        assert!(!panel.contains("pre-EQ"), "{panel}");
+    }
+
+    /// A take the writer could not keep up with has a hole in it. Reporting
+    /// its length as though it were continuous would be the worst kind of
+    /// readout: precise, and wrong.
+    #[test]
+    fn a_take_with_a_gap_never_reports_its_length_unqualified() {
+        let panel = render(RecState { dropped: true, ..audio(Arm::Running) }, true);
+        // The length still shows — a take you cannot measure is one you cannot
+        // decide about — but never without the word that qualifies it.
+        assert!(panel.contains("GAP 02:34"), "{panel}");
+        assert!(
+            !panel.replace("GAP 02:34", "").contains("02:34"),
+            "the length must never appear unqualified: {panel}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_written_puts_the_rec_lamp_out_in_audio_mode_too() {
+        let panel = render(RecState { failed: true, ..audio(Arm::Running) }, true);
+        assert!(panel.contains("NO FILE"), "{panel}");
+        assert!(!panel.contains("02:34"), "{panel}");
+        assert!(!panel.contains("dB"), "{panel}");
+        assert!(!panel.contains("pre-EQ"), "{panel}");
     }
 
     #[test]

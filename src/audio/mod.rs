@@ -26,6 +26,7 @@ pub mod analysis;
 pub mod capture;
 pub mod dsp;
 pub mod radio;
+pub mod record;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,6 +111,9 @@ pub struct Engine {
     pub events: Receiver<EngineEvent>,
     pub radio: radio::RadioHandle,
     pub capture: capture::Capture,
+    /// AUDIO mode. Taps the signal before the equaliser, so record level is
+    /// independent of listening level.
+    pub record: record::Recorder,
     cmd_tx: Sender<EngineCmd>,
     /// Output rate, which is what the clock is denominated in.
     pub sample_rate: u32,
@@ -177,6 +181,7 @@ pub fn start(preferred: Option<&str>) -> Result<Engine> {
     let mut chain = DspChain::new();
     let mut stereo: Vec<f32> = vec![0.0; 4096];
     let mut seen_flush = 0u64;
+    let (recorder, mut tap) = record::Recorder::start(sample_rate);
 
     let stream = device.build_output_stream(
         config,
@@ -199,6 +204,12 @@ pub fn start(preferred: Option<&str>) -> Result<Engine> {
             let want_samples = frames * 2;
             let got = cons.pop_slice(&mut stereo[..want_samples]);
             stereo[got..want_samples].fill(0.0);
+
+            // The record tap, before the equaliser and therefore before the
+            // volume. Only what the ring actually gave us: the zeros padding
+            // an underrun are silence the rack invented, and writing them
+            // would put the fault into the file.
+            let _ = tap.feed(&stereo[..got]);
 
             chain.process(&mut stereo[..want_samples]);
 
@@ -288,6 +299,7 @@ pub fn start(preferred: Option<&str>) -> Result<Engine> {
         sample_rate,
         radio,
         capture,
+        record: recorder,
         _stream: stream,
     })
 }
