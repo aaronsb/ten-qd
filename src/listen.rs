@@ -33,11 +33,11 @@
 //! what you are allowed to listen to. The deck's job is to tell the truth
 //! about the signal.
 
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::mpris::NowPlaying;
 
@@ -47,7 +47,12 @@ use crate::mpris::NowPlaying;
 const MIN_PLAY: Duration = Duration::from_secs(5);
 
 /// One line of the log: something that played, and for how long.
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+///
+/// Read back as well as written, and the file is hand-editable — so every
+/// field defaults rather than being required. A line missing something is a
+/// line with a gap in it, not a reason to abandon the rest of the history.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct Entry {
     /// When it started, RFC 3339 in UTC. A local timestamp would reorder
     /// itself twice a year and lie about which side of a flight it was on.
@@ -281,11 +286,24 @@ impl Log {
         }
         let mut line = serde_json::to_string(e).map_err(std::io::Error::other)?;
         line.push('\n');
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?
-            .write_all(line.as_bytes())
+
+        let mut f =
+            std::fs::OpenOptions::new().create(true).read(true).append(true).open(&self.path)?;
+        // A crash mid-write leaves a line with no newline on the end.
+        // Appending straight onto it would fuse the wreck to the next entry
+        // and cost two plays instead of one, so the broken line is closed
+        // first — which is what makes "a torn final line is discardable on its
+        // own" true rather than merely intended.
+        let len = f.metadata()?.len();
+        if len > 0 {
+            let mut last = [0u8; 1];
+            f.seek(std::io::SeekFrom::Start(len - 1))?;
+            f.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                f.write_all(b"\n")?;
+            }
+        }
+        f.write_all(line.as_bytes())
     }
 }
 
@@ -403,6 +421,22 @@ mod tests {
         assert_eq!(done[0].seconds, 90);
         assert_eq!(w.following().count(), 0);
         assert!(w.close(at(100)).is_empty(), "closing twice must not duplicate");
+    }
+
+    /// Append-only survives a crash only if the wreckage stays on one line.
+    #[test]
+    fn a_line_left_unterminated_by_a_crash_does_not_swallow_the_next_one() {
+        let dir = std::env::temp_dir().join(format!("ten-qd-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let log = Log::at(dir.join("listening.jsonl"));
+        std::fs::write(log.file(), r#"{"at":"2026-07-26T10:00:0"#).expect("half a line");
+
+        log.append(&Entry { title: "survivor".into(), ..Default::default() }).expect("append");
+        let text = std::fs::read_to_string(log.file()).expect("read back");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(text.lines().count(), 2, "the wreck must not fuse to the entry: {text}");
+        assert!(text.lines().nth(1).unwrap().contains("survivor"), "{text}");
     }
 
     #[test]

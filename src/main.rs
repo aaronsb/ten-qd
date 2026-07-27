@@ -13,6 +13,7 @@ mod listen;
 mod memory;
 mod mpris;
 mod playlist;
+mod project;
 mod state;
 mod ui;
 
@@ -22,7 +23,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -53,11 +54,15 @@ ten-qd — a terminal music player wearing an 80s car stereo
                            (--aux --browser --outputs --arrange --fold=… --hide=…)
     ten-qd --radio-check   sweep the FM band and report signal per channel
     ten-qd --aux-check     open the aux input and check the cable
+    ten-qd --log           what the listening log holds, by session
+    ten-qd --export[=WHAT] cut a playlist out of the log, to stdout
+                           WHAT: all (default) · last · a date or session,
+                           e.g. 2026-07 · add --rank to order by play count
     ten-qd --forget        clear the 12-volt memory (presets, tone, last disc)
     ten-qd --help          this
 
-Settings persist to $XDG_STATE_HOME/ten-qd/memory.toml.
-Press ? inside the panel for the key map.";
+Settings persist to $XDG_STATE_HOME/ten-qd/memory.toml, and REC writes
+listening.jsonl beside it. Press ? inside the panel for the key map.";
 
 /// A pending track start, waiting for the output clock to reach it.
 struct Mark {
@@ -222,6 +227,22 @@ impl App {
     }
 
     fn load(&mut self, path: PathBuf) {
+        // A playlist is a tape, not a disc: someone already chose the running
+        // order, and a disc is a folder read in sorted order. This is also
+        // what `--export` writes, so a tape cut out of the log can be handed
+        // straight back to the deck by name.
+        if playlist::is_playlist(&path) {
+            match browser::tape_from_playlist(&path) {
+                Ok(tape) => {
+                    let n = tape.tracks.len();
+                    let title = tape.title.clone();
+                    self.insert_tape(tape, true);
+                    self.status(format!("tape: {title} · {n} tracks"));
+                }
+                Err(e) => self.status(format!("no tape: {e}")),
+            }
+            return;
+        }
         match disc::load(&path) {
             Ok(d) => {
                 let total = d.total_seconds() as u64;
@@ -1891,6 +1912,74 @@ fn aux_check() -> Result<()> {
     Ok(())
 }
 
+/// Read the log, or say plainly why there is nothing to read.
+///
+/// A missing file is not an error: it means REC has never been switched on,
+/// and telling the operator that is more use than a path that does not exist.
+fn open_log() -> Result<project::Read> {
+    let path = listen::Log::path().context("no HOME — the log has nowhere to live")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("nothing logged yet — press R in the panel to switch REC on");
+            println!("the log will be written to {}", path.display());
+            return Ok(project::Read { entries: Vec::new(), torn: 0 });
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("read {}", path.display()))),
+    };
+
+    let read = project::read(&text);
+    // On stderr so it cannot end up inside a playlist being piped to a file.
+    if read.torn > 0 {
+        eprintln!(
+            "{} unreadable line(s) skipped — one at the end is a crash mid-write, \
+             several means something else",
+            read.torn
+        );
+    }
+    Ok(read)
+}
+
+fn list_log() -> Result<()> {
+    let log = open_log()?;
+    let sessions = project::sessions(&log.entries);
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    for s in &sessions {
+        println!("{}", project::describe(s));
+    }
+    let plays: usize = sessions.iter().map(|s| s.entries).sum();
+    println!("\n{} session(s), {plays} play(s)", sessions.len());
+    println!("cut one out with: ten-qd --export={}", sessions[sessions.len() - 1].id);
+    Ok(())
+}
+
+fn export(what: &str, rank: bool) -> Result<()> {
+    let log = open_log()?;
+    let pick = project::Pick::parse(what);
+    let picked = project::select(&log.entries, &pick);
+    let cuts = project::cut(&picked, rank);
+
+    // The playlist goes to stdout so it can be redirected; everything about
+    // the playlist goes to stderr so that redirect stays clean.
+    let missing = cuts.iter().filter(|c| c.uri.is_empty()).count();
+    print!("{}", project::m3u(&cuts, &pick));
+    eprintln!(
+        "{} play(s) → {} track(s){}",
+        picked.len(),
+        cuts.len() - missing,
+        match missing {
+            0 => String::new(),
+            n => format!(", {n} with no location (listed as comments)"),
+        }
+    );
+    if picked.is_empty() && !log.entries.is_empty() {
+        eprintln!("nothing matched — 'ten-qd --log' lists what is there");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--radio-check") {
@@ -1898,6 +1987,14 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--aux-check") {
         return aux_check();
+    }
+    if args.iter().any(|a| a == "--log") {
+        return list_log();
+    }
+    if let Some(what) = args.iter().find_map(|a| {
+        (a == "--export").then_some("").or_else(|| a.strip_prefix("--export="))
+    }) {
+        return export(what, args.iter().any(|a| a == "--rank"));
     }
     if args.iter().any(|a| a == "--forget") {
         return match Memory::forget() {
