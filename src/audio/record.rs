@@ -243,10 +243,15 @@ impl Recorder {
     /// arm 2, so `pushed` cannot move while armed and the boundary taken here
     /// is the same one the old placement took.
     pub fn set_arm(&self, arm: Arm) {
-        if arm == self.arm() {
+        // Read once. Every caller is the main thread, so two reads would agree
+        // today — but "the state we compared against" and "the state we branch
+        // on" being the same load is the property this depends on, and one
+        // binding says so instead of relying on the caller list staying true.
+        let was = self.arm();
+        if arm == was {
             return;
         }
-        if self.arm() == Arm::Idle {
+        if was == Arm::Idle {
             // Cleared per take, not per session: a hole in the *last* take is
             // not a fault of this one.
             self.shared.dropped.store(false, Ordering::Relaxed);
@@ -901,6 +906,42 @@ mod tests {
             vec![second as u64 * 2, first as u64 * 2],
             "the first take must keep its tail and the second start at its own audio"
         );
+    }
+
+    /// The same wait, reached the way takes now ordinarily end.
+    ///
+    /// Every other test here stops from `Running`, which after the pause change
+    /// is no longer the common path: the record key rests in `Armed`, and STOP
+    /// is the only exit. So the header patch on the main stop path had no test
+    /// at all — it was covered by inspection, which is not coverage.
+    #[test]
+    fn a_take_stopped_from_a_pause_still_gets_its_header_patched() {
+        let s = Scratch::new("pausestop");
+        let (rec, mut tap) = Recorder::start_in(Some(s.0.clone()), 48_000);
+
+        rec.set_arm(Arm::Armed);
+        rec.set_arm(Arm::Running);
+        for _ in 0..8 {
+            tap.feed(&[0.25; 1024]);
+        }
+        std::thread::sleep(Duration::from_millis(80));
+
+        // Paused, and left paused long enough for the writer to drain and go
+        // quiet with the file still open — the state a forgotten take sits in.
+        rec.set_arm(Arm::Armed);
+        std::thread::sleep(Duration::from_millis(60));
+        rec.finish_take(Duration::from_millis(1000));
+
+        let path = rec.file().expect("a take");
+        let (_, _, data) = probe(&path).expect("read it back");
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            data as u64 + 44,
+            on_disk,
+            "a take stopped from a pause must still describe itself"
+        );
+        assert!(data > 0, "a patched header must not still claim zero");
+        assert_eq!(rec.arm(), Arm::Idle, "and STOP must actually have stopped it");
     }
 
     /// The header carries two sizes only known once the take ends. Exiting

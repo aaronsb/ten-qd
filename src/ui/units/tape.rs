@@ -147,6 +147,13 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
             // beside it: knowing something was lost does not help decide
             // whether to keep a take without knowing how long it is.
             (_, true) => format!("GAP {:02}:{:02}", s / 60, s % 60),
+            // A pause holds a file open with an unpatched header for as long as
+            // the rack runs, so a paused take keeps its size on the panel. The
+            // one number that says a forgotten take is costing disk should not
+            // be hidden exactly while it is being forgotten.
+            (Arm::Armed, _) if s > 0 || t.rec.take_bytes > 0 => {
+                format!("PAUSE {:02}:{:02} {}", s / 60, s % 60, record::size(t.rec.take_bytes))
+            }
             (Arm::Armed, _) => t.rec.arm.label().to_string(),
             (Arm::Running, _) => {
                 format!("{:02}:{:02} {}", s / 60, s % 60, record::size(t.rec.take_bytes))
@@ -326,6 +333,13 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         (RecMode::Audio, true, _) => {
             strip.push_str(" · REC to a file, pre-EQ — volume does not touch it")
         }
+        // Two pauses again, and the difference is a whole take. Before rolling
+        // nothing has been written and saying so is the point; mid-take that
+        // same sentence sits over a file with minutes in it, and would be the
+        // panel flatly denying what is on the disk.
+        (RecMode::Audio, _, true) if t.rec.take_seconds > 0.0 => {
+            strip.push_str(" · REC PAUSE — take held, REC resumes the same file, STOP ends it")
+        }
         (RecMode::Audio, _, true) => {
             strip.push_str(" · REC PAUSE — meters live, nothing written yet")
         }
@@ -483,14 +497,33 @@ mod tests {
     /// The whole point of arming: meters live, nothing committed. A panel that
     /// showed a running take here would be inviting the operator to believe a
     /// file was growing.
+    ///
+    /// This is `Armed` reached from `Idle` — the pre-roll — which the zeroed
+    /// take is what distinguishes. The other `Armed` is a held take, below.
     #[test]
     fn an_armed_deck_meters_but_claims_no_take() {
-        let panel = render(audio(Arm::Armed), true);
+        let preroll = RecState { take_seconds: 0.0, take_bytes: 0, ..audio(Arm::Armed) };
+        let panel = render(preroll, true);
         assert!(panel.contains("PAUSE"), "{panel}");
         assert!(panel.contains("AUDIO  -3"), "the level is set from here: {panel}");
         assert!(panel.contains("dB"), "the meter is the reason to arm: {panel}");
         assert!(!panel.contains("02:34"), "nothing has been written: {panel}");
         assert!(panel.contains("nothing written yet"), "{panel}");
+    }
+
+    /// The other `Armed`, and the panel must not confuse it with the first.
+    ///
+    /// A held take is minutes of audio in an open file with an unpatched
+    /// header. Reporting "nothing written yet" over it is the panel denying
+    /// what is on the disk, and hiding the size is hiding the one number that
+    /// says a forgotten take is still costing something.
+    #[test]
+    fn a_held_take_says_what_it_is_holding() {
+        let panel = render(audio(Arm::Armed), true);
+        assert!(panel.contains("PAUSE 02:34"), "a held take keeps its length: {panel}");
+        assert!(panel.contains("27 MB"), "and its cost: {panel}");
+        assert!(!panel.contains("nothing written yet"), "154 seconds is not nothing: {panel}");
+        assert!(panel.contains("STOP ends it"), "and the way out is not the record key: {panel}");
     }
 
     #[test]
@@ -563,6 +596,56 @@ mod tests {
             assert!(row.contains("REW"), "and the indicators must survive too: {row}");
         }
         assert!(drawn > 0, "the window never drew — this proves nothing");
+    }
+
+    /// The width at which a recording deck stops saying what it is doing.
+    ///
+    /// `room` for the counts and `bars` for the meter are both measured back
+    /// from where the counter starts, so widening the counter — as making it a
+    /// clock did, by eight cells — moves both of these. Asserting only "fine at
+    /// 84" does not notice that: it stayed green through a revert that took
+    /// another eight cells off the row. So the thresholds themselves are
+    /// pinned. They are a budget, not a preference.
+    ///
+    /// If this fails with a *larger* number, something took cells from the row
+    /// that reports what is being recorded. That is a decision to take on
+    /// purpose, not to discover in a narrow terminal.
+    #[test]
+    fn the_width_at_which_a_recording_deck_goes_quiet_is_pinned() {
+        /// What the README tells people they need.
+        const PROMISED: u16 = 84;
+
+        let panel_at = |width: u16| {
+            let mut stack = Stack::default();
+            stack.tape.rec = audio(Arm::Running);
+            stack.tape.power = true;
+            let area = Rect::new(0, 0, width, 12);
+            let mut buf = Buffer::empty(area);
+            let theme = Theme::for_stack(&stack);
+            draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+            (0..area.height)
+                .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let first = |needle: &str| (40..=120u16).find(|&w| panel_at(w).contains(needle));
+
+        assert_eq!(first("02:34"), Some(72), "the take's length and size");
+        assert_eq!(first("dB"), Some(75), "the record meter");
+
+        // Whatever the thresholds are, they have to be inside the promise.
+        for (what, at) in [("counts", 72u16), ("meter", 75)] {
+            assert!(at <= PROMISED, "{what} needs {at} columns, README promises {PROMISED}");
+        }
+        // And once they draw they must keep drawing — a readout that blinks
+        // back out as the terminal grows would be worse than one that never
+        // appeared.
+        for width in 75..=120u16 {
+            let panel = panel_at(width);
+            assert!(panel.contains("02:34"), "counts vanished again at {width}");
+            assert!(panel.contains("27 MB"), "size vanished again at {width}");
+            assert!(panel.contains("dB"), "meter vanished again at {width}");
+        }
     }
 
     // ---- the counter ----------------------------------------------------
