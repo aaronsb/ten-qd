@@ -64,6 +64,10 @@ pub const HELP: &[(&str, &str, bool)] = &[
     ("A", "aux: pick what to send through the rack", false),
     ("1-9", "aux: plug that stream in", false),
     ("", "", false),
+    ("RECORD", "(TRACK mode — a list, not a tape)", true),
+    ("R", "log every player: what played, and for how long", false),
+    ("", "~/.local/state/ten-qd/listening.jsonl", false),
+    ("", "", false),
     ("CONTROL HEAD", "", true),
     ("↑ ↓  m", "volume · attenuator", false),
     (", .  / < >", "bass · treble", false),
@@ -489,7 +493,7 @@ mod tests {
         let heads: Vec<&str> = HELP.iter().filter(|(_, _, h)| *h).map(|(k, _, _)| *k).collect();
         assert_eq!(
             heads,
-            vec!["SOURCE", "TRANSPORT", "CONTROL HEAD", "THE RACK", "EQUALISER"],
+            vec!["SOURCE", "TRANSPORT", "RECORD", "CONTROL HEAD", "THE RACK", "EQUALISER"],
             "a heading was missed, or a binding was mistaken for one"
         );
         // And nothing that answers a keypress is dressed as a heading.

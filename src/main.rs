@@ -9,6 +9,7 @@ mod adapter;
 mod audio;
 mod browser;
 mod disc;
+mod listen;
 mod memory;
 mod mpris;
 mod playlist;
@@ -19,7 +20,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use ratatui::crossterm::event::{
@@ -33,7 +34,7 @@ use audio::radio::RadioCmd;
 use audio::{EngineCmd, EngineEvent};
 use browser::Browser;
 use memory::{Keeper, Memory};
-use state::{Bank, Command, Patch, Side, SourceKind, Stack, Transport, Unit};
+use state::{Bank, Command, Patch, RecState, Side, SourceKind, Stack, Transport, Unit};
 use ui::hit::HitMap;
 use ui::units::eq::{snap, RANGE_DB, STEP_DB};
 
@@ -97,6 +98,12 @@ struct App {
     adapter: Option<adapter::Adapter>,
     /// Watches whatever is on the other end of the cable.
     mpris: mpris::Mpris,
+    /// TRACK mode: what has been heard so far this session, and where it is
+    /// written down. The watcher runs whether or not REC is on — it is fed
+    /// only while it is, so switching REC on starts a clean slate rather than
+    /// back-dating whatever happened to be playing.
+    watcher: listen::Watcher,
+    log: listen::Log,
     /// Streams offered for plugging in, refreshed when the adapter goes in.
     streams: Vec<adapter::Stream>,
     /// Where the loop guard should put us back, shared with its thread. It
@@ -141,7 +148,10 @@ impl App {
         stack.cd.random = mem.random;
         stack.tape.dolby = mem.dolby;
         stack.tape.auto_reverse = mem.auto_reverse;
+        stack.tape.rec.on = mem.rec;
         stack.layout = mem.layout();
+
+        let started = SystemTime::now();
         App {
             stack,
             engine,
@@ -166,6 +176,10 @@ impl App {
             layout_grabbed: false,
             adapter: None,
             mpris: mpris::Mpris::start(),
+            watcher: listen::Watcher::new(listen::session_id(started)),
+            log: listen::Log::at(
+                listen::Log::path().unwrap_or_else(|| PathBuf::from("listening.jsonl")),
+            ),
             streams: Vec::new(),
             guard_target: Arc::new(std::sync::Mutex::new(mem.output.clone())),
         }
@@ -301,6 +315,13 @@ impl App {
                     Unit::Ctrl => return,
                 };
                 self.stack.apply(patch);
+                // A deck with no power is not writing anything down either.
+                // The switch position is left alone — pull the power and put
+                // it back and the log picks up where it was, which is what
+                // always-append is for.
+                if u == Unit::Tape && !on {
+                    self.rec_stop();
+                }
                 let selected = matches!(
                     (u, self.stack.source),
                     (Unit::Cd, SourceKind::Cd)
@@ -661,6 +682,36 @@ impl App {
                     e.send(EngineCmd::SetAutoReverse(v));
                 }
                 self.stack.apply(Patch { tape_auto_reverse: Some(v), ..Default::default() });
+            }
+
+            // TRACK mode. What this records is every media player on the
+            // desktop, which is not the same thing as what the rack is
+            // playing — so the status says which it is rather than leaving
+            // "recording" to be read as the tape heads.
+            Command::TapeRecord => {
+                if !self.stack.tape.power {
+                    self.status("TAPE is out of the signal path — no power, no record");
+                    return;
+                }
+                let on = !self.stack.tape.rec.on;
+                if !on {
+                    self.rec_stop();
+                }
+                let mut rec = self.stack.tape.rec.clone();
+                rec.on = on;
+                let wrote = rec.wrote;
+                self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+                self.status(if on {
+                    // The session name is here because it is what selects a
+                    // run back out of the log later — the tape you will cut.
+                    format!(
+                        "REC · session {} · {}",
+                        self.watcher.session(),
+                        self.log.file().display()
+                    )
+                } else {
+                    format!("REC off — {wrote} entries logged this session")
+                });
             }
 
             // ---- auxiliary input ------------------------------------------
@@ -1164,6 +1215,72 @@ impl App {
 
     // -- engine feedback ---------------------------------------------------
 
+    // ---- the listening log ------------------------------------------------
+
+    /// Fold one look at the bus into the log.
+    ///
+    /// Called every frame. All of the deciding — where a track ends, when a
+    /// player counts as having gone away — lives in the watcher; the only
+    /// thing that happens here is that finished entries reach the disk and the
+    /// panel is told what has actually been written.
+    fn poll_log(&mut self) {
+        if !self.recording() {
+            return;
+        }
+        let done = self.watcher.observe(&self.mpris.all(), SystemTime::now());
+        let wrote = self.write_log(&done);
+        let following = self.watcher.following().count().min(u8::MAX as usize) as u8;
+
+        let (was, total) = (self.stack.tape.rec.following, self.stack.tape.rec.wrote + wrote);
+        if wrote > 0 || following != was {
+            self.stack.apply(Patch {
+                tape_rec: Some(RecState { on: true, wrote: total, following }),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// Whether the log is genuinely being appended to. REC is a switch
+    /// position; a deck with its power off is not writing anything down, and
+    /// the lamp reads this rather than the switch.
+    fn recording(&self) -> bool {
+        self.stack.tape.rec.on && self.stack.tape.power
+    }
+
+    /// Close everything the watcher has open and write it out.
+    ///
+    /// A track that was playing when you pressed STOP was still played, and
+    /// dropping it would lose the part you heard — so the tail of a session
+    /// counts, at whatever length it actually ran.
+    fn rec_stop(&mut self) {
+        let done = self.watcher.close(SystemTime::now());
+        let wrote = self.write_log(&done);
+        let mut rec = self.stack.tape.rec.clone();
+        rec.wrote += wrote;
+        rec.following = 0;
+        self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+    }
+
+    /// Append entries, returning how many reached the disk.
+    ///
+    /// Counting successes rather than attempts is the point: `wrote` on the
+    /// panel is a claim about the file, so a log that cannot be written stops
+    /// counting and says why instead of reporting tracks it did not save.
+    fn write_log(&mut self, entries: &[listen::Entry]) -> u32 {
+        let mut n = 0;
+        let mut failed = None;
+        for e in entries {
+            match self.log.append(e) {
+                Ok(()) => n += 1,
+                Err(why) => failed = Some(format!("log unwritable: {why}")),
+            }
+        }
+        if let Some(why) = failed {
+            self.status(why);
+        }
+        n
+    }
+
     fn poll_engine(&mut self) {
         // Let the activity lamps burn down. Done here rather than in the
         // renderer so a lamp lit by a command is timed by frames, not by how
@@ -1482,6 +1599,7 @@ impl App {
             (KeyCode::Char('v'), _) => Some(Command::TapeFlip),
             (KeyCode::Char('A'), _) => Some(Command::AuxOpen),
             (KeyCode::Char('y'), _) => Some(Command::TapeDolby),
+            (KeyCode::Char('R'), _) => Some(Command::TapeRecord),
             // Auto-reverse moved off `a` when the aux input took it. `b` is
             // the side it turns the tape over to.
             (KeyCode::Char('b'), _) => Some(Command::TapeAutoReverse),
@@ -2070,6 +2188,7 @@ fn run(
 
     while app.running {
         app.poll_engine();
+        app.poll_log();
 
         keeper.maybe_save(&app.stack, Some(&app.browser.cwd));
         if let Some(err) = keeper.error.take() {
@@ -2118,5 +2237,9 @@ fn run(
         }
         last = Instant::now();
     }
+
+    // Switching off closes whatever was still running. A session that ends
+    // mid-track should still record the part you heard.
+    app.rec_stop();
     Ok(())
 }

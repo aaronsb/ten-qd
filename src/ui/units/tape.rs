@@ -79,6 +79,26 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         Style::default().fg(theme.ink_white).bg(theme.window),
     );
 
+    // --- what is being written down ---------------------------------------
+    // REC is a switch; this lamp is a readout. A deck with its power off is
+    // not appending to anything, so the switch can be left where it was and
+    // the lamp still tells the truth.
+    let rec = t.power && t.rec.on;
+    chassis::boxed(buf, w.x + 2, w.y + 3, "REC", theme, rec, true);
+    if rec {
+        // Both counts are of things that already happened: entries on disk,
+        // and players with an entry open that will be written when they end.
+        let following = t.rec.following;
+        chassis::sublegend(
+            buf,
+            w.x + 8,
+            w.y + 3,
+            &format!("{:03} LOG · {following}", t.rec.wrote.min(999)),
+            theme,
+            true,
+        );
+    }
+
     // --- the counter ------------------------------------------------------
     // Four digits and no colon: a deck counts tape, not time, and cannot tell
     // you where a track begins. With an adapter in, the hubs are turning
@@ -159,6 +179,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     );
     press(&mut row, 6, tr::FF, t.transport == Transport::Ff, Command::TapeFf, hits);
     press(&mut row, 6, tr::STOP, t.transport == Transport::Stop, Command::TapeStop, hits);
+    row.gap(1);
+    // Next to the transport because that is where it was, but it is not one:
+    // REC writes down what every player on the desktop is doing, which carries
+    // on regardless of what this deck is playing.
+    press(&mut row, 6, "●REC", rec, Command::TapeRecord, hits);
     row.gap(2);
 
     // APS — Automatic Program Search, the deck's name for track skip. It finds
@@ -171,13 +196,19 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     press(&mut row, 8, "EJECT", t.tape.is_some(), Command::TapeEject, hits);
 
 
-    let strip = match (t.tape.as_ref(), t.current()) {
+    let mut strip = match (t.tape.as_ref(), t.current()) {
         (Some(tape), Some(track)) => {
             format!("{} — {} · side {} of {}", track.artist, track.title, t.side.label(), tape.title)
         }
         (Some(tape), None) => format!("{} · {} tracks", tape.title, tape.tracks.len()),
         _ => "no tape".to_string(),
     };
+    // TRACK mode is not on the tape, so it says so here rather than in the
+    // window: what is being written is a list, and the tape in the deck — if
+    // there is one — has nothing to do with it.
+    if rec {
+        strip.push_str(" · REC to the listening log, not to tape");
+    }
     let max = inner.width.saturating_sub(SPINE + 2) as usize;
     let strip: String = strip.chars().take(max).collect();
     buf.set_string(
@@ -191,4 +222,56 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     );
 
     chassis::model_corner(buf, inner, &["STEREO CASSETTE DECK QD-581"], theme);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::RecState;
+
+    /// The bay as text, so what the panel claims can be asserted on.
+    fn render(rec: RecState, power: bool) -> String {
+        let mut stack = Stack::default();
+        stack.tape.rec = rec;
+        stack.tape.power = power;
+        let area = Rect::new(0, 0, 120, 12);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::for_stack(&stack);
+        draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_recording_deck_reports_what_it_has_written() {
+        let panel = render(RecState { on: true, wrote: 12, following: 2 }, true);
+        assert!(panel.contains("012 LOG · 2"), "{panel}");
+    }
+
+    /// The whole invariant in one test: REC is a switch position, and the
+    /// panel reads the log, not the switch. A deck with no power appends
+    /// nothing, so it must not say it is recording.
+    #[test]
+    fn a_deck_with_no_power_does_not_claim_to_be_recording() {
+        let panel = render(RecState { on: true, wrote: 12, following: 2 }, false);
+        assert!(!panel.contains("LOG ·"), "a dead deck counted entries: {panel}");
+        assert!(!panel.contains("listening log"), "a dead deck claimed to record: {panel}");
+    }
+
+    /// TRACK mode writes a list, and the tape in the deck has nothing to do
+    /// with it. Saying so is the difference between a readout and a wish.
+    #[test]
+    fn the_strip_says_the_recording_is_not_going_to_tape() {
+        let panel = render(RecState { on: true, ..Default::default() }, true);
+        assert!(panel.contains("REC to the listening log, not to tape"), "{panel}");
+    }
+
+    #[test]
+    fn a_deck_that_is_not_recording_says_nothing_about_a_log() {
+        let panel = render(RecState::default(), true);
+        assert!(!panel.contains("LOG"), "{panel}");
+        assert!(!panel.contains("listening log"), "{panel}");
+    }
 }

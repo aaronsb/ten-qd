@@ -100,6 +100,12 @@ pub struct Memory {
     pub random: bool,
     pub dolby: bool,
     pub auto_reverse: bool,
+    /// TRACK mode left switched on. Always-append is the whole point of the
+    /// listening log — a week of listening is only gathered if the deck was
+    /// writing it down without being asked each morning — so REC survives the
+    /// key coming out like every other switch on the panel.
+    #[serde(default)]
+    pub rec: bool,
 
     // what was in the machine, and where you were looking
     pub disc: Option<PathBuf>,
@@ -155,6 +161,7 @@ impl Default for Memory {
             random: s.cd.random,
             dolby: s.tape.dolby,
             auto_reverse: s.tape.auto_reverse,
+            rec: s.tape.rec.on,
             disc: None,
             tape: None,
             browser: None,
@@ -209,14 +216,24 @@ fn ill_name(i: Ill) -> &'static str {
     }
 }
 
+/// The rack's corner of the filesystem. Honours `XDG_STATE_HOME` when it is
+/// set, falling back to the directory the spec names.
+///
+/// One place decides this, because the memory is no longer the only thing that
+/// lives here — the listening log is beside it, and a second copy of this
+/// fallback would eventually disagree with the first.
+pub fn state_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_STATE_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
+    };
+    Some(base.join("ten-qd"))
+}
+
 impl Memory {
-    /// Where the memory lives. Honours `XDG_STATE_HOME` when it is set.
+    /// Where the memory lives.
     pub fn path() -> Option<PathBuf> {
-        let base = match std::env::var_os("XDG_STATE_HOME") {
-            Some(v) if !v.is_empty() => PathBuf::from(v),
-            _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
-        };
-        Some(base.join("ten-qd").join("memory.toml"))
+        Some(state_dir()?.join("memory.toml"))
     }
 
     /// Read the memory back.
@@ -318,6 +335,7 @@ impl Memory {
             random: stack.cd.random,
             dolby: stack.tape.dolby,
             auto_reverse: stack.tape.auto_reverse,
+            rec: stack.tape.rec.on,
             disc: stack.cd.disc.as_ref().map(|d| d.path.clone()),
             tape: stack.tape.tape.as_ref().map(|t| t.path.clone()),
             browser: browser.map(Path::to_path_buf),

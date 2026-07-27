@@ -48,6 +48,7 @@ browser = "/home/you/Music"
 | control head | volume, ATT, bass, treble, fader, illumination colour |
 | every unit | whether it is in the signal path, as one `powered_off` list |
 | transports | repeat, random, Dolby, auto-reverse |
+| the deck | whether REC is switched on — always-append only works if it survives being switched off |
 | loaded media | the disc in the tray and the tape in the deck, by path |
 | browser | the folder you were last looking in |
 | the rack | which units are in it, in what order, and which are folded shut |
