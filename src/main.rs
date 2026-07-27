@@ -35,7 +35,9 @@ use audio::radio::RadioCmd;
 use audio::{EngineCmd, EngineEvent};
 use browser::Browser;
 use memory::{Keeper, Memory};
-use state::{Arm, Bank, Command, Patch, RecMode, Side, SourceKind, Stack, Transport, Unit};
+use state::{
+    Arm, Bank, Command, Patch, RecMode, RecState, Side, SourceKind, Stack, Transport, Unit,
+};
 use ui::hit::HitMap;
 use ui::units::eq::{snap, RANGE_DB, STEP_DB};
 
@@ -114,6 +116,14 @@ struct App {
     /// than not writing it: the operator would be told entries were saved and
     /// then be unable to find one of them.
     log: Option<listen::Log>,
+    /// When the log was last seen to be live, for the counter.
+    ///
+    /// Time is accumulated between ticks rather than measured from a start
+    /// instant, so the counter credits only the time the log was genuinely
+    /// being appended to. A deck switched off mid-session holds where it was
+    /// and carries on when the power comes back, which is what the file shows.
+    /// `None` while not logging, so the first tick after a gap credits nothing.
+    log_tick: Option<std::time::Instant>,
     /// Streams offered for plugging in, refreshed when the adapter goes in.
     streams: Vec<adapter::Stream>,
     /// Where the loop guard should put us back, shared with its thread. It
@@ -191,6 +201,7 @@ impl App {
             mpris: mpris::Mpris::start(),
             watcher: listen::Watcher::new(listen::session_id(started)),
             log: listen::Log::path().map(listen::Log::at),
+            log_tick: None,
             streams: Vec::new(),
             guard_target: Arc::new(std::sync::Mutex::new(mem.output.clone())),
         }
@@ -623,6 +634,20 @@ impl App {
             }
 
             Command::TapeStop => {
+                // On a deck, STOP is what ends a take — REC and PAUSE are one
+                // motion between them. This is the only way back to Idle, so it
+                // has to come before the transport.
+                //
+                // And it does *only* this: a deck recording while a tape plays
+                // would, on the real thing, stop both, but ending a take cannot
+                // be undone and stopping playback can. One press, one thing;
+                // press it again to stop the tape.
+                if self.stack.tape.rec.mode == RecMode::Audio
+                    && self.stack.tape.rec.arm != Arm::Idle
+                {
+                    self.audio_rec(Arm::Idle);
+                    return;
+                }
                 let epoch = self.new_epoch();
                 if let Some(e) = &self.engine
                     && self.stack.source == SourceKind::Tape
@@ -790,6 +815,11 @@ impl App {
                 }
                 let mut rec = self.stack.tape.rec.clone();
                 rec.on = on;
+                // The counter belongs to the session, so both edges of the
+                // switch clear it: switching off ends the run, and switching on
+                // starts a new one that must not inherit the last one's time.
+                rec.log_seconds = 0.0;
+                self.log_tick = None;
                 // Switching *on* clears a previous failure: that is the
                 // operator saying "try again". Switching off must not, because
                 // `rec_stop` above has just tried to flush and may have failed
@@ -1331,8 +1361,10 @@ impl App {
     fn poll_log(&mut self) {
         self.poll_take();
         if !self.recording() {
+            self.log_tick = None;
             return;
         }
+        self.credit_log_time();
         // A bus that did not answer is not a bus with nothing on it. Feeding
         // the watcher an empty list here would close every open entry, and the
         // outage clearing would open fresh ones — one track logged as two.
@@ -1349,6 +1381,30 @@ impl App {
             rec.wrote += wrote;
             rec.following = following;
             self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+        }
+    }
+
+    /// Advance TRACK mode's counter by the time since the last tick.
+    ///
+    /// Only ever called from the logging path, so what it measures is time the
+    /// log was live — not time since the switch moved. The panel is patched on
+    /// the whole second, because that is all the counter can show and a patch
+    /// per frame would be sixty writes announcing nothing.
+    fn credit_log_time(&mut self) {
+        let now = std::time::Instant::now();
+        let dt = match self.log_tick.replace(now) {
+            Some(last) => now.duration_since(last).as_secs_f64(),
+            // First tick of a session, or the first after an outage: there is
+            // no interval to credit yet, and inventing one back-dates the log.
+            None => return,
+        };
+        let was = self.stack.tape.rec.log_seconds;
+        let is = was + dt;
+        if is as u64 != was as u64 {
+            let rec = RecState { log_seconds: is, ..self.stack.tape.rec.clone() };
+            self.stack.apply(Patch { tape_rec: Some(rec), ..Default::default() });
+        } else {
+            self.stack.tape.rec.log_seconds = is;
         }
     }
 
@@ -1461,8 +1517,20 @@ impl App {
             return;
         }
         self.status(match got {
+            // Two different pauses, told apart by the take rather than by
+            // remembering which way we came: arming zeroes the count, so
+            // anything above zero is a take being held. Before rolling there is
+            // a level to set; mid-take the useful thing to say is how to get
+            // out, because REC no longer walks to a stop.
+            Arm::Armed if secs > 0.0 => format!(
+                "REC PAUSE — take held at {:02}:{:02}. REC resumes the same file, STOP ends it",
+                secs as u64 / 60,
+                secs as u64 % 60,
+            ),
             Arm::Armed => "REC PAUSE — meters live, nothing written. Set the level".into(),
-            Arm::Running => "REC — writing pre-EQ, so volume does not touch it".into(),
+            Arm::Running => {
+                "REC — writing pre-EQ, so volume does not touch it · STOP ends the take".into()
+            }
             Arm::Idle if ending => format!(
                 "take: {:02}:{:02} · {}{}{}",
                 secs as u64 / 60,

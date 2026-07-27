@@ -228,13 +228,25 @@ impl Recorder {
         }
     }
 
-    /// Move to a new state. Going to `Running` starts a take; leaving it
+    /// Move to a new state. Leaving `Idle` starts a take; returning to it
     /// closes one.
+    ///
+    /// The take begins on the way *out of* `Idle` rather than on the way into
+    /// `Running`, and that is the whole of REC PAUSE. `Armed` and `Running`
+    /// differ only in whether the tap is pushing, so pausing leaves the file
+    /// open and the count standing, and resuming writes on into the same file
+    /// — a splice, exactly as a deck's pause is. Resetting on the way into
+    /// `Running` instead meant every resume opened a new file and zeroed the
+    /// counter, which is a stop, not a pause.
+    ///
+    /// Nothing is written between `Idle` and `Running`: the tap pushes only at
+    /// arm 2, so `pushed` cannot move while armed and the boundary taken here
+    /// is the same one the old placement took.
     pub fn set_arm(&self, arm: Arm) {
         if arm == self.arm() {
             return;
         }
-        if arm == Arm::Running {
+        if self.arm() == Arm::Idle {
             // Cleared per take, not per session: a hole in the *last* take is
             // not a fault of this one.
             self.shared.dropped.store(false, Ordering::Relaxed);
@@ -339,7 +351,11 @@ fn writer(
     while !stop.load(Ordering::Relaxed) {
         let arm = shared.arm.load(Ordering::Acquire);
         let generation = shared.generation.load(Ordering::Acquire);
-        let running = arm == 2;
+        // A take ends at `Idle`, not at "not running" — `Armed` is REC PAUSE
+        // and its file stays open across it. Closing on `!running` is what made
+        // a pause indistinguishable from a stop, and the writer has no other
+        // use for knowing whether the tap is pushing: it writes what arrives.
+        let idle = arm == 0;
         let mut boundary = shared.boundary.load(Ordering::Acquire);
 
         // A boundary the stream has already passed with nothing open is spent:
@@ -398,7 +414,7 @@ fn writer(
         // A take ends at its boundary in the stream, or — when recording has
         // stopped and nothing is left anywhere — once the ring is empty.
         let at_boundary = boundary != u64::MAX && popped >= boundary;
-        let drained = !running && n == 0 && cons.is_empty();
+        let drained = idle && n == 0 && cons.is_empty();
         if (at_boundary || drained)
             && let Some(w) = open.take()
         {
@@ -413,7 +429,10 @@ fn writer(
             shared.boundary.store(u64::MAX, Ordering::Release);
         }
 
-        shared.quiescent.store(!running && open.is_none() && cons.is_empty(), Ordering::Release);
+        // Also `idle`, and for the same reason: a paused take is still a take
+        // in progress. Reporting quiescence over one would let `finish_take`
+        // return while a file it never closed was still open.
+        shared.quiescent.store(idle && open.is_none() && cons.is_empty(), Ordering::Release);
 
         if n == 0 {
             std::thread::sleep(Duration::from_millis(10));
@@ -764,9 +783,8 @@ mod tests {
 
     /// A take is over when its generation is superseded, not when the writer
     /// happens to observe an idle arm with an empty ring. Stop and restart
-    /// during a long drain — a stalled disk, or REC PAUSE and resume — and
-    /// the deduced boundary never arrives, so the second take appends to the
-    /// first file.
+    /// during a long drain — a stalled disk, say — and the deduced boundary
+    /// never arrives, so the second take appends to the first file.
     #[test]
     fn stopping_and_starting_always_makes_two_takes() {
         let s = Scratch::new("gen");
@@ -786,6 +804,54 @@ mod tests {
 
         rec.finish_take(Duration::from_millis(500));
         assert_ne!(one, two, "a restart must open its own file, not extend the last");
+    }
+
+    /// The other half of that rule, and the one that makes REC PAUSE a pause:
+    /// a stop splits, and a pause must not. Both audio blocks belong to one
+    /// take, so there must be one file with both of them in it — not two files
+    /// that happen to sum to the same length, which is what closing on
+    /// "not running" produced and what an operator only discovers afterwards.
+    #[test]
+    fn pausing_and_resuming_keeps_one_take() {
+        let s = Scratch::new("pause");
+        let (rec, mut tap) = Recorder::start_in(Some(s.0.clone()), 48_000);
+
+        rec.set_arm(Arm::Armed);
+        rec.set_arm(Arm::Running);
+        let mut fed = tap.feed(&[0.25; 2048]);
+        // Long enough for the writer to open the file and drain, so the pause
+        // below lands on a take genuinely in progress rather than before one
+        // has started — which would prove nothing.
+        std::thread::sleep(Duration::from_millis(80));
+        let during = rec.file().expect("a take should be open before the pause");
+
+        rec.set_arm(Arm::Armed);
+        // Feeding while paused must add nothing: the tap is gated, and a pause
+        // that still wrote would be a pause in name only.
+        assert_eq!(tap.feed(&[0.9; 2048]), 0, "a paused tap must push nothing");
+        std::thread::sleep(Duration::from_millis(80));
+        let held = rec.seconds();
+        assert!(held > 0.0, "the take must have length by now, or the hold proves nothing");
+
+        rec.set_arm(Arm::Running);
+        fed += tap.feed(&[0.25; 2048]);
+        rec.finish_take(Duration::from_millis(2000));
+
+        let takes: Vec<PathBuf> = std::fs::read_dir(&s.0)
+            .expect("the take directory")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        assert_eq!(takes.len(), 1, "a pause is not a stop: {takes:?}");
+        assert_eq!(takes[0], during, "and it must be the same file, still open");
+        assert_eq!(
+            std::fs::metadata(&takes[0]).unwrap().len() - 44,
+            fed as u64 * 2,
+            "both sides of the pause belong to the one take"
+        );
+        assert!(
+            rec.seconds() > held,
+            "resuming must carry on from the held count, not start again"
+        );
     }
 
     /// Separating the *files* is not enough. The ring is shared and carries no

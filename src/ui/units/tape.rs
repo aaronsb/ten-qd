@@ -26,6 +26,27 @@ use crate::ui::theme::Theme;
 /// The four hub-rotation phases, so a running reel visibly turns.
 const REEL: [char; 4] = ['◜', '◝', '◞', '◟'];
 
+/// Cells `SIDE` and the far reel occupy, immediately left of the counter.
+const SIDE_COL: u16 = 10;
+
+/// An unlit counter. Blanks, not spaces-in-a-shorter-string: `vfd` draws a
+/// ghost `8` behind every blank and keeps separators their own width, so this
+/// has to have the same shape as a reading or the dark display is a different
+/// size from the lit one.
+const BLANK: &str = "  :  :  ";
+
+/// The counter's reading, as hours, minutes and seconds.
+///
+/// A cassette deck's counter was four digits of tape revolutions — a number
+/// with no unit, useful only against itself. This one counts seconds, because
+/// what it now measures is a recording, and a recording's length is a fact
+/// about the world rather than about a spool. Saturates at 99:59:59 rather
+/// than wrapping: a counter that rolls over reads as a shorter take.
+fn clock(seconds: f64) -> String {
+    let s = if seconds.is_finite() { (seconds.max(0.0) as u64).min(359_999) } else { 0 };
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
 pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &mut HitMap) {
     let inner = chassis::bay(buf, area, theme);
     let t = &stack.tape;
@@ -47,7 +68,15 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         6,
     );
     let w = chassis::window(buf, win, theme, live && running);
-    if w.width < 40 {
+    // Everything the counter's row has to hold, left to right: SIDE with its
+    // reel, the numerals, and the indicator stack. Derived from the counter's
+    // own width rather than written down as a number, because the counter got
+    // eight cells wider when it became a clock and a hardcoded 40 left SIDE
+    // being pushed out of the window and onto the POWER spine — one readout
+    // printed over another, which is a third that says neither.
+    let cw = glyph::seven_seg_width(BLANK);
+    let right_col = 12u16;
+    if w.width < SIDE_COL + cw + 2 + right_col {
         return;
     }
 
@@ -80,10 +109,9 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         Style::default().fg(theme.ink_white).bg(theme.window),
     );
 
-    // Where the counter sits. Computed before anything else on its row, since
-    // it is right-aligned and everything to its left has to know where it ends.
-    let cw = glyph::seven_seg_width("8888");
-    let right_col = 12u16;
+    // Where the counter sits: right-aligned, so everything to its left has to
+    // know where it ends. Measured above, before the width guard that depends
+    // on it.
     let cx = w.x + w.width.saturating_sub(right_col + cw + 2);
 
     // --- what is being written down ---------------------------------------
@@ -175,22 +203,36 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     }
 
     // --- the counter ------------------------------------------------------
-    // Four digits and no colon: a deck counts tape, not time, and cannot tell
-    // you where a track begins. With an adapter in, the hubs are turning
-    // against a loop of tape that is not the music — so the counter still
-    // runs, and now it means nothing at all.
-    let counter = if t.tape.is_some() {
-        let c = (t.counter.max(0.0) as u64).min(5999);
-        format!("{:02}{:02}", c / 60, c % 60)
+    // One display, two things to count, and which one it is showing is decided
+    // here rather than left to whichever was written last.
+    //
+    // While the deck is recording it counts the take, because that is the
+    // number worth having: a take is something being made, and its length is
+    // the only way to judge it while it is happening. The rest of the time it
+    // counts the tape, which is what the hubs are actually turning against.
+    //
+    // Each source is measured, never predicted. AUDIO's is seconds the writer
+    // committed to a file — so it holds across a REC PAUSE, because a paused
+    // take has stopped growing, and it holds through a dropout, because time
+    // that never reached the disk is not in the file. TRACK's is time the log
+    // was genuinely live. With an adapter in and no tape, the hubs turn against
+    // a loop that is not the music, so there is nothing to count and the
+    // display goes dark rather than showing a number that means nothing.
+    let counter = if audio && (rec || armed) {
+        clock(t.rec.take_seconds)
+    } else if !audio && rec {
+        clock(t.rec.log_seconds)
+    } else if t.tape.is_some() {
+        clock(t.counter)
     } else {
-        "    ".to_string()
+        BLANK.to_string()
     };
 
     chassis::vfd(buf, cx, w.y, &counter, theme);
     chassis::sublegend(buf, cx, w.y + 3, "COUNTER", theme, true);
 
     // Side, and the reel at the far end of the tape path.
-    let sx = cx.saturating_sub(10);
+    let sx = cx.saturating_sub(SIDE_COL);
     chassis::sublegend(buf, sx, w.y, "SIDE", theme, true);
     buf.set_string(
         sx + 5,
@@ -491,6 +533,157 @@ mod tests {
         assert!(!panel.contains("02:34"), "{panel}");
         assert!(!panel.contains("dB"), "{panel}");
         assert!(!panel.contains("pre-EQ"), "{panel}");
+    }
+
+    /// The counter's row has SIDE on it too, and the counter is right-aligned,
+    /// so SIDE is placed relative to it and moves when it does. The counter
+    /// grew eight cells becoming a clock; at the old minimum width that pushed
+    /// SIDE clean out of the window and onto the POWER spine. The sweep below
+    /// is the whole point — a single width would have missed it, since it only
+    /// misbehaves in the few columns above the guard.
+    #[test]
+    fn side_never_gets_pushed_out_of_the_window() {
+        let mut drawn = 0;
+        for width in 40..=120u16 {
+            let mut stack = Stack::default();
+            stack.tape.tape =
+                Some(crate::state::Tape::from_tracks("t".into(), "/t".into(), vec![]));
+            let area = Rect::new(0, 0, width, 12);
+            let mut buf = Buffer::empty(area);
+            let theme = Theme::for_stack(&stack);
+            draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+
+            let row: String = (0..area.width).map(|x| buf[(x, 2)].symbol()).collect();
+            let Some(at) = row.find("SIDE") else { continue };
+            drawn += 1;
+            // The window's left edge: the bay's inset, the spine the POWER
+            // lamp lives on, and the window's own border.
+            let edge = 1 + SPINE as usize + 1;
+            assert!(at >= edge, "SIDE landed on the spine at width {width}, col {at}: {row}");
+            assert!(row.contains("REW"), "and the indicators must survive too: {row}");
+        }
+        assert!(drawn > 0, "the window never drew — this proves nothing");
+    }
+
+    // ---- the counter ----------------------------------------------------
+
+    /// The counter is seven-segment, so it cannot be asserted on as text. Read
+    /// it back off the buffer instead — which is also the only way to catch it
+    /// being drawn at the wrong width.
+    fn counter_of(rec: RecState, power: bool, tape: bool, position: f64) -> String {
+        let mut stack = Stack::default();
+        stack.tape.rec = rec;
+        stack.tape.power = power;
+        stack.tape.counter = position;
+        // Anything but the tape, so the counter is the only thing on these rows
+        // drawn in the lit colour — SIDE takes it too when the deck is the
+        // selected source, and would answer for the counter in every assertion
+        // below.
+        stack.source = SourceKind::Cd;
+        if tape {
+            stack.tape.tape =
+                Some(crate::state::Tape::from_tracks("t".into(), "/t".into(), vec![]));
+        }
+        let area = Rect::new(0, 0, 120, 12);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::for_stack(&stack);
+        draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+
+        // The lit segments only: the ghost `8`s behind them are the same for
+        // every reading, so including them would make every counter identical
+        // and the assertions below vacuous. Three rows starting at the top of
+        // the window, which is where `vfd` puts the numerals.
+        let lit = theme.vfd;
+        (0..3)
+            .map(|r| {
+                (0..area.width)
+                    .map(|x| {
+                        let c = &buf[(x, 2 + r)];
+                        if c.style().fg == Some(lit) { c.symbol() } else { " " }
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_counter_reads_hours_minutes_and_seconds() {
+        assert_eq!(clock(0.0), "00:00:00");
+        assert_eq!(clock(154.0), "00:02:34");
+        // Past the four digits the old counter had: 9999 seconds used to be
+        // unreachable, and this is the range the change was made for.
+        assert_eq!(clock(9999.0), "02:46:39");
+        // Saturates rather than wrapping. A counter that rolls over reads as a
+        // take hours shorter than the file.
+        assert_eq!(clock(359_999.0), "99:59:59");
+        assert_eq!(clock(400_000.0), "99:59:59");
+        // Nothing here may render as a negative or a NaN: the seven-segment
+        // font has no glyph for either, so both would silently draw as blanks.
+        assert_eq!(clock(-5.0), "00:00:00");
+        assert_eq!(clock(f64::NAN), "00:00:00");
+    }
+
+    /// The whole point of the change. A deck writing a file must count what it
+    /// is writing — the earlier one showed the tape position, which with no
+    /// tape in the deck meant a recording deck with a dead counter.
+    #[test]
+    fn a_recording_deck_counts_the_take_and_not_the_tape() {
+        // No tape, which is the ordinary case when recording an aux stream.
+        let rolling = counter_of(audio(Arm::Running), true, false, 0.0);
+        let expected = glyph::seven_seg("00:02:34");
+        for row in expected.iter() {
+            assert!(rolling.contains(row.trim_end()), "154s must read 00:02:34:\n{rolling}");
+        }
+    }
+
+    /// A paused take is still a take. The count holds, because the file is
+    /// still open and still that long — resetting it would say the take had
+    /// been abandoned.
+    #[test]
+    fn a_paused_take_holds_its_count() {
+        let held = counter_of(audio(Arm::Armed), true, false, 0.0);
+        let rolling = counter_of(audio(Arm::Running), true, false, 0.0);
+        assert_eq!(held, rolling, "a pause must not move the counter:\n{held}");
+    }
+
+    /// Same invariant the lamp has. A deck out of the signal path is writing
+    /// nothing, so there is no take to count and the tape position is what is
+    /// left — here, nothing at all.
+    #[test]
+    fn a_dead_deck_counts_nothing() {
+        let dead = counter_of(audio(Arm::Running), false, false, 0.0);
+        // The separators stay lit — they are the display's furniture, like the
+        // ghost `8`s behind the digits, and a VFD with nothing to show still
+        // shows its own shape. No *digit* may be lit, which is the claim.
+        assert_eq!(
+            dead.replace('▪', " ").trim(),
+            "",
+            "a dead deck must not count a take:\n{dead}"
+        );
+    }
+
+    /// With no take running the counter goes back to the tape, which is what
+    /// the hubs are turning against.
+    #[test]
+    fn an_idle_deck_counts_the_tape() {
+        let idle = counter_of(audio(Arm::Idle), true, true, 154.0);
+        let expected = glyph::seven_seg("00:02:34");
+        for row in expected.iter() {
+            assert!(idle.contains(row.trim_end()), "the tape position:\n{idle}");
+        }
+    }
+
+    /// TRACK writes no audio, so it has no take to measure — but it has been
+    /// logging for some length of time, and that is the counter's business.
+    #[test]
+    fn track_mode_counts_how_long_it_has_been_logging() {
+        let rec = RecState { on: true, log_seconds: 154.0, ..Default::default() };
+        let logging = counter_of(rec, true, false, 0.0);
+        let expected = glyph::seven_seg("00:02:34");
+        for row in expected.iter() {
+            assert!(logging.contains(row.trim_end()), "the session length:\n{logging}");
+        }
     }
 
     #[test]
