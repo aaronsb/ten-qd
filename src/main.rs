@@ -339,6 +339,14 @@ impl App {
                             self.adapter = None;
                             self.streams.clear();
                             self.mpris.prefer(None);
+                            // The guard must stop watching an index that is no
+                            // longer ours to watch. It would come to no harm
+                            // today — with the sink unloaded there is nothing
+                            // to be seated against — but that is the adapter's
+                            // absence doing the work, not an intention.
+                            if let Ok(mut p) = self.plugged.lock() {
+                                *p = None;
+                            }
                             patch.aux = Some(Default::default());
                         }
                         patch.aux_power = Some(on);
@@ -1657,17 +1665,25 @@ impl App {
 
         // What the route guard last saw. Read here rather than asked here:
         // `pactl` is three orders of magnitude too slow for a frame.
-        let seen = self.routing.lock().ok().map(|r| r.clone()).unwrap_or_default();
+        // Never `unwrap_or_default()` here: a poisoned lock would read as
+        // `Idle` on both counts — every warning silently off, and the panel
+        // back to claiming a signal path it has not checked.
+        let seen = self.routing.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if self.stack.link != seen.output {
             // Edge-triggered. The condition can last for hours, and a status
             // line rewritten every second is a line nobody can read.
             let name = self.stack.output.clone().unwrap_or_else(|| "the default".into());
             match &seen.output {
-                adapter::Link::Adrift(on) => {
-                    self.status(format!("output drifted onto \"{on}\" — putting it back on \"{name}\""))
-                }
-                adapter::Link::Contested(on) => {
-                    self.status(format!("\"{on}\" is holding the rack's output away from \"{name}\""))
+                adapter::Link::Adrift(w) => self.status(format!(
+                    "output drifted onto \"{}\" — putting it back on \"{name}\"",
+                    w.desc
+                )),
+                adapter::Link::Contested(w) => self.status(format!(
+                    "\"{}\" is holding the rack's output away from \"{name}\"",
+                    w.desc
+                )),
+                adapter::Link::Absent => {
+                    self.status(format!("\"{name}\" is not on the system — pick another output"))
                 }
                 _ => {}
             }
@@ -1731,7 +1747,15 @@ impl App {
             // statement about this cable. Left ungated, the bay described a
             // player going straight to the speakers as though it were coming
             // through the rack.
-            if a.source.is_some() {
+            // A stream that has ended is not plugged in, whatever the bay was
+            // saying a second ago. Without this the strip goes on reading
+            // "· via aux" over a stream that no longer exists — the panel
+            // asserting a signal path it has not got, which is the whole thing
+            // this unit is not allowed to do. The successor stream is not
+            // adopted yet; see the follow-up issue.
+            let ended = a.source.is_some() && seen.aux == adapter::Link::Gone;
+
+            if a.source.is_some() && !ended {
                 let live = self.engine.as_ref().is_some_and(|e| e.capture.state.running());
                 let np = self.mpris.now_playing();
                 next.live = live && np.as_ref().is_some_and(|n| n.playing);
@@ -1749,12 +1773,22 @@ impl App {
             // being pushed back in gets somebody blamed for it.
             let what = a.source.clone().unwrap_or_else(|| "the cable".into());
             let note = match (&next.link, &a.link) {
-                (adapter::Link::Adrift(on), was) if !was.astray() => {
-                    Some(format!("{what} came off the aux input onto \"{on}\" — plugging it back in"))
+                // Compared by payload, not just by shape: `Adrift(x) → Adrift(y)`
+                // and `Contested(x) → Adrift(y)` are the moment a grabber quit
+                // and the rack resumed acting, which is the one transition the
+                // operator most wants to hear about.
+                (adapter::Link::Adrift(w), was) if was.desc() != Some(w.desc.as_str()) => Some(
+                    format!("{what} came off the aux input onto \"{}\" — plugging it back in", w.desc),
+                ),
+                (adapter::Link::Contested(w), was)
+                    if !matches!(was, adapter::Link::Contested(_)) =>
+                {
+                    Some(format!(
+                        "\"{}\" keeps taking {what} back — the rack has stopped trying",
+                        w.desc
+                    ))
                 }
-                (adapter::Link::Contested(who), was) if !matches!(was, adapter::Link::Contested(_)) => {
-                    Some(format!("\"{who}\" keeps taking {what} back — the rack has stopped trying"))
-                }
+                _ if ended => Some(format!("{what} ended — nothing on the aux input now")),
                 _ => None,
             };
             if next != *a {
@@ -2617,42 +2651,69 @@ fn main() -> Result<()> {
         let want = app.guard_target.clone();
         let plugged = app.plugged.clone();
         let seen = app.routing.clone();
-        let mut aux_reseat = adapter::Reseat::default();
-        let mut out_reseat = adapter::Reseat::default();
+        let mut guard = adapter::Guard::default();
         std::thread::Builder::new().name("ten-qd/routeguard".into()).spawn(move || {
+            // A poisoned lock must not read as good news. Every payload here is
+            // plain, always-consistent data, so taking the value a panicking
+            // thread left behind is strictly better than inventing a default —
+            // which for `preferred` would silently mean "follow the system
+            // default" and start moving the operator's output to a device they
+            // did not choose.
+            macro_rules! held {
+                ($m:expr) => {
+                    $m.lock().unwrap_or_else(|e| e.into_inner())
+                };
+            }
             loop {
                 std::thread::sleep(Duration::from_millis(1000));
-                let preferred = want.lock().ok().and_then(|g| g.clone());
+                let preferred = held!(want).clone();
 
                 // The loop, which is the one thing worth fighting over.
                 if adapter::own_output_is_looping() {
                     if let Some(s) = adapter::safe_output(preferred.as_deref()) {
                         let _ = adapter::route_own_output(&s.name);
                     }
+                    // Say nothing rather than go on saying the last thing. This
+                    // tick examined no routing, and the panel must not keep
+                    // showing a reading that is no longer being taken — the
+                    // condition can persist, when there is no safe output to
+                    // move to or the move keeps failing.
+                    *held!(seen) = adapter::Routing::default();
                     continue;
                 }
 
-                let idx = plugged.lock().ok().and_then(|p| *p);
-                let raw = adapter::routing(idx, preferred.as_deref());
+                let idx = *held!(plugged);
 
-                // One attempt each, then the truth. `judge` decides whether
-                // this is a plug worth pushing back in or a fight already lost;
-                // the push happens here so the deciding stays testable.
-                let (aux, reseat_aux) = aux_reseat.judge(raw.aux);
-                if reseat_aux && let Some(i) = idx {
-                    let _ = adapter::reseat(i);
+                // All of the deciding, none of the doing — so that which
+                // decision drives which move is something a test can read.
+                let (now, acts) =
+                    guard.tick(adapter::routing(idx, preferred.as_deref()), idx);
+
+                for act in acts {
+                    match act {
+                        adapter::Act::Reseat(i) => {
+                            let _ = adapter::reseat(i);
+                        }
+                        adapter::Act::Reroute => {
+                            if let Some(s) = adapter::safe_output(preferred.as_deref()) {
+                                let _ = adapter::route_own_output(&s.name);
+                            }
+                        }
+                    }
                 }
 
-                let (output, reroute) = out_reseat.judge(raw.output);
-                if reroute
-                    && let Some(s) = adapter::safe_output(preferred.as_deref())
-                {
-                    let _ = adapter::route_own_output(&s.name);
+                // A failed read is not an observation: say nothing rather than
+                // publish a healthy-looking default.
+                let Some(now) = now else { continue };
+
+                // A stream that has ended stops being watched. The index was the
+                // server's, not ours, and it may already have been handed to
+                // somebody else — see the identity check in `decide`.
+                if now.aux == adapter::Link::Gone {
+                    *held!(plugged) = None;
                 }
 
-                if let Ok(mut g) = seen.lock() {
-                    *g = adapter::Routing { aux, output };
-                }
+                *held!(seen) = now;
             }
         })?;
     }

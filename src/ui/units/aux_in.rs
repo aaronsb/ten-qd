@@ -203,11 +203,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // that would not stay put after being pushed back in gets somebody named,
     // and by then the naming is evidence rather than a guess.
     let strip = match (&a.state.link, &a.state.source) {
-        (crate::adapter::Link::Adrift(on), Some(src)) => {
-            format!("{src} — went to \"{on}\", not through the rack")
+        (crate::adapter::Link::Adrift(w), Some(src)) => {
+            format!("{src} — went to \"{}\", not through the rack", w.desc)
         }
-        (crate::adapter::Link::Contested(who), Some(src)) => {
-            format!("{src} — held on \"{who}\"; the rack cannot get it back")
+        (crate::adapter::Link::Contested(w), Some(src)) => {
+            format!("{src} — held on \"{}\"; the rack cannot get it back", w.desc)
         }
         _ => shelf(a),
     };
@@ -243,7 +243,12 @@ fn shelf(a: &crate::state::Aux) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::Link;
+    use crate::adapter::{Link, Where};
+
+    /// A sink, as the answer names it.
+    fn at(sink: u64, desc: &str) -> Where {
+        Where { sink, desc: desc.into() }
+    }
 
     /// The bay as text, so what the panel claims can be asserted on.
     fn render(link: Link, source: Option<&str>, frame: u64) -> String {
@@ -265,7 +270,7 @@ mod tests {
     /// sink must not go on being described as a signal path.
     #[test]
     fn a_stream_that_is_not_on_our_sink_stops_claiming_a_path() {
-        let panel = render(Link::Adrift("EasyEffects Sink".into()), Some("Google Chrome"), 0);
+        let panel = render(Link::Adrift(at(47, "EasyEffects Sink")), Some("Google Chrome"), 0);
         assert!(panel.contains("not through the rack"), "{panel}");
         assert!(!panel.contains("via aux"), "the rack must not claim a path it has not got:\n{panel}");
     }
@@ -276,7 +281,7 @@ mod tests {
     /// the stream sends the operator to argue with the wrong program.
     #[test]
     fn a_bystander_sink_is_located_not_blamed() {
-        let panel = render(Link::Adrift("Muh Chickin Waffles".into()), Some("Google Chrome"), 0);
+        let panel = render(Link::Adrift(at(87446, "Muh Chickin Waffles")), Some("Google Chrome"), 0);
         assert!(panel.contains("went to \"Muh Chickin Waffles\""), "{panel}");
         for accusation in ["taken", "took", "holding", "held"] {
             assert!(!panel.contains(accusation), "accused a bystander of {accusation}:\n{panel}");
@@ -288,7 +293,7 @@ mod tests {
     /// that it has stopped trying, so the operator knows to go and fix it.
     #[test]
     fn a_stream_something_is_holding_names_it() {
-        let panel = render(Link::Contested("EasyEffects Sink".into()), Some("Google Chrome"), 0);
+        let panel = render(Link::Contested(at(47, "EasyEffects Sink")), Some("Google Chrome"), 0);
         assert!(panel.contains("held on \"EasyEffects Sink\""), "{panel}");
         assert!(panel.contains("cannot get it back"), "{panel}");
     }
@@ -302,13 +307,18 @@ mod tests {
         assert!(!panel.contains("not through the rack"), "{panel}");
     }
 
-    /// Whether the LINK segment is lit on this frame.
+    /// Whether the LINK segment is lit on this frame, and what colour.
     ///
     /// Read off the style, not the text: an unlit segment is still drawn, the
     /// same way an unlit segment of a real VFD is still a segment you can see.
     /// Asking whether the panel *contains* "LINK" answers a question about the
     /// glyph, not about the lamp.
-    fn link_lit(link: Link, frame: u64) -> bool {
+    ///
+    /// The colour is half the meaning and cannot be skipped. `boxed` and
+    /// `boxed_green` both write BOLD when lit, so brightness alone cannot tell
+    /// an alert from a mode — drawing the fault lamp in green would look
+    /// perfectly correct to a test that only reads the modifier.
+    fn link_lamp(link: Link, frame: u64) -> (bool, Option<ratatui::style::Color>) {
         let mut stack = Stack::default();
         stack.aux.state.source = Some("Google Chrome".into());
         stack.aux.state.link = link;
@@ -322,7 +332,8 @@ mod tests {
                 if ["L", "I", "N", "K"].iter().enumerate().all(|(i, c)| {
                     buf[(x + i as u16, y)].symbol() == *c
                 }) {
-                    return buf[(x, y)].style().add_modifier.contains(Modifier::BOLD);
+                    let st = buf[(x, y)].style();
+                    return (st.add_modifier.contains(Modifier::BOLD), st.fg);
                 }
             }
         }
@@ -334,10 +345,10 @@ mod tests {
     /// phase that flashes once and sticks cannot pass.
     #[test]
     fn the_warning_blinks_rather_than_flashing_once() {
-        let pulled = Link::Contested("EasyEffects Sink".into());
-        assert!(link_lit(pulled.clone(), 0), "must be lit on the frame the fault appears");
-        assert!(!link_lit(pulled.clone(), 20), "must go dark between flashes");
-        assert!(link_lit(pulled, 35), "and must come back — a single flash can be missed");
+        let pulled = Link::Contested(at(47, "EasyEffects Sink"));
+        assert!(link_lamp(pulled.clone(), 0).0, "must be lit on the frame the fault appears");
+        assert!(!link_lamp(pulled.clone(), 20).0, "must go dark between flashes");
+        assert!(link_lamp(pulled, 35).0, "and must come back — a single flash can be missed");
     }
 
     /// A seated plug is a steady lamp, not a blinking one: it must read the
@@ -345,17 +356,31 @@ mod tests {
     #[test]
     fn a_seated_plug_does_not_blink() {
         for f in [0, 20, 35, 100] {
-            assert!(link_lit(Link::Seated, f), "seated must stay lit, frame {f}");
+            assert!(link_lamp(Link::Seated, f).0, "seated must stay lit, frame {f}");
         }
     }
 
-    /// `Gone` is a stream that ended, which is what stopping the music looks
-    /// like from here. Lighting a fault for it would train the operator to
-    /// ignore the lamp.
+    /// Red is an alert and green is a mode — the panel's own grammar, and the
+    /// reason there are two `boxed` helpers at all. Drawing the fault lamp with
+    /// the wrong helper looks entirely correct to any test that only asks
+    /// whether the segment is lit.
     #[test]
-    fn a_stream_that_ended_raises_no_alarm() {
-        let panel = render(Link::Gone, Some("Google Chrome"), 0);
-        assert!(!panel.contains("taken back"), "{panel}");
+    fn a_fault_lamp_is_red_and_a_healthy_one_is_green() {
+        let theme = Theme::for_stack(&Stack::default());
+        let (_, fault) = link_lamp(Link::Adrift(at(47, "EasyEffects Sink")), 0);
+        assert_eq!(fault, Some(theme.ink_red), "a plug that came out is an alert");
+        let (_, ok) = link_lamp(Link::Seated, 0);
+        assert_eq!(ok, Some(theme.led_g), "a seated plug is a mode, not an alarm");
+    }
+
+    /// The stream ended. Nothing is plugged in, so the bay must stop describing
+    /// a signal path — this is where it used to go on reading "· via aux" over
+    /// a stream that no longer existed.
+    #[test]
+    fn a_stream_that_ended_stops_claiming_the_cable() {
+        let panel = render(Link::Gone, None, 0);
+        assert!(panel.contains("nothing plugged in"), "{panel}");
+        assert!(!panel.contains("via aux"), "{panel}");
     }
 
     #[test]
