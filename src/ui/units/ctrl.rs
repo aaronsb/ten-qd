@@ -14,6 +14,7 @@ use ratatui::style::{Modifier, Style};
 use super::SPINE;
 use crate::ui::chassis;
 use crate::ui::theme::Theme;
+use crate::adapter::Link;
 use crate::state::{Command, SourceKind, Stack};
 use crate::ui::hit::HitMap;
 
@@ -133,13 +134,22 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // stops asserting it is where the sound is going. This is the failure that
     // had OUTPUT reading a set of headphones while every sample went somewhere
     // else entirely.
+    // Three states, not two. White asserts the rack is driving this device;
+    // red withdraws the assertion; grey declines to make it, because the guard
+    // spent this tick untangling a loop and looked at nothing. Drawing that
+    // third case white would be the panel reporting a reading nobody took.
     let astray = stack.link.astray();
+    let unchecked = stack.link == Link::Unknown;
     buf.set_string(
         x + 8,
         oy,
         &name,
         Style::default()
-            .fg(if astray { theme.ink_red } else { theme.ink_white })
+            .fg(match (astray, unchecked) {
+                (true, _) => theme.ink_red,
+                (_, true) => theme.ink_grey,
+                _ => theme.ink_white,
+            })
             .bg(theme.chassis),
     );
     if astray {
@@ -217,7 +227,8 @@ fn fader(buf: &mut Buffer, x: u16, y: u16, value: f32, theme: &Theme, hits: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{Link, Where};
+    use crate::adapter::route::Where;
+    use crate::adapter::Link;
 
     /// The control head as text and styles. OUTPUT is the only thing here that
     /// makes a claim about the outside world, so it is the only thing that can

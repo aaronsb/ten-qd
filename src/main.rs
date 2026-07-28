@@ -130,11 +130,14 @@ struct App {
     /// has to be told when the operator changes output, or it would restore
     /// whatever was remembered at start-up for the rest of the run.
     guard_target: Arc<std::sync::Mutex<Option<String>>>,
-    /// The sink-input the operator plugged into the aux bay, shared with the
-    /// route guard so it knows which stream to keep an eye on. An index rather
-    /// than a name: it is what `move-sink-input` was given, so it is what the
-    /// answer has to be about.
-    plugged: Arc<std::sync::Mutex<Option<u32>>>,
+    /// What the operator plugged into the aux bay, shared with the route guard
+    /// so it knows what to keep an eye on. The application as well as the
+    /// index, because the index is only where that application's audio lives at
+    /// this moment — see [`adapter::Plug`].
+    plugged: Arc<std::sync::Mutex<Option<adapter::Plug>>>,
+    /// Whether the guard was last seen untangling a loop, so the announcement
+    /// fires on the edge rather than once a second for as long as it lasts.
+    howling: bool,
     /// What the route guard last saw. Written once a second by that thread and
     /// read every frame by the panel — `pactl` costs far too much to ask at
     /// thirty frames a second.
@@ -214,6 +217,7 @@ impl App {
             streams: Vec::new(),
             guard_target: Arc::new(std::sync::Mutex::new(mem.output.clone())),
             plugged: Arc::new(std::sync::Mutex::new(None)),
+            howling: false,
             routing: Arc::new(std::sync::Mutex::new(adapter::Routing::default())),
         }
     }
@@ -915,7 +919,8 @@ impl App {
                         // Tell the route guard what to watch. `plug` only means
                         // the request was accepted; whether it held is a
                         // different question, asked a second from now.
-                        *held(&self.plugged) = Some(stream.index);
+                        *held(&self.plugged) =
+                            Some(adapter::Plug { index: stream.index, app: stream.app.clone() });
                         let mut t = self.stack.aux.state.clone();
                         t.link = adapter::Link::Seated;
                         t.source = Some(stream.label());
@@ -1681,6 +1686,15 @@ impl App {
                 }
                 _ => {}
             }
+            // The one condition the rack fights rather than reports, and until
+            // now it fought it in silence: the operator could be listening to a
+            // howl being caught and undone once a second, told nothing.
+            if seen.howling && !self.howling {
+                self.status(format!(
+                    "the rack's output was on its own input — put back on \"{name}\""
+                ));
+            }
+            self.howling = seen.howling;
             self.stack.link = seen.output;
         }
 
@@ -2656,22 +2670,27 @@ fn main() -> Result<()> {
                     if let Some(s) = adapter::safe_output(preferred.as_deref()) {
                         let _ = adapter::route_own_output(&s.name);
                     }
-                    // Say nothing rather than go on saying the last thing. This
-                    // tick examined no routing, and the panel must not keep
-                    // showing a reading that is no longer being taken — the
-                    // condition can persist, when there is no safe output to
-                    // move to or the move keeps failing.
-                    *held(&seen) = adapter::Routing::default();
+                    // This tick examined no routing, and says so. `Idle` would
+                    // be a lie of a different kind — it is a *finding*, and the
+                    // panel draws it as one, so a persistent loop would render
+                    // as a clean bill of health while nothing was being checked.
+                    // The loop itself is announced too: until now the rack could
+                    // howl and recover once a second and tell nobody.
+                    *held(&seen) = adapter::Routing {
+                        aux: adapter::Link::Unknown,
+                        output: adapter::Link::Unknown,
+                        howling: true,
+                    };
                     continue;
                 }
 
-                let idx = *held(&plugged);
+                let idx = held(&plugged).clone();
 
                 // All of the deciding, none of the doing — so that which
                 // decision drives which move is something a test can read.
                 let (now, acts) = guard.tick(
-                    adapter::routing(idx, preferred.as_deref()),
-                    idx,
+                    adapter::routing(idx.as_ref(), preferred.as_deref()),
+                    idx.as_ref(),
                     preferred.as_deref(),
                 );
 
@@ -2694,8 +2713,16 @@ fn main() -> Result<()> {
                         // and for good.
                         adapter::Act::Unwatch(i) => {
                             let mut p = held(&plugged);
-                            if *p == Some(i) {
+                            if p.as_ref().is_some_and(|q| q.index == i) {
                                 *p = None;
+                            }
+                        }
+                        // The application moved to a new stream. Same plug, new
+                        // index — the operator chose an application, not a
+                        // number, so this needs no announcement and gets none.
+                        adapter::Act::Adopt(i) => {
+                            if let Some(p) = held(&plugged).as_mut() {
+                                p.index = i;
                             }
                         }
                     }
