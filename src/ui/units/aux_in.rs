@@ -248,7 +248,8 @@ fn shelf(a: &crate::state::Aux) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{Link, Where};
+    use crate::adapter::route::Where;
+    use crate::adapter::Link;
 
     /// A sink, as the answer names it.
     fn at(sink: u64, desc: &str) -> Where {

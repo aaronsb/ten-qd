@@ -227,7 +227,8 @@ fn fader(buf: &mut Buffer, x: u16, y: u16, value: f32, theme: &Theme, hits: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{Link, Where};
+    use crate::adapter::route::Where;
+    use crate::adapter::Link;
 
     /// The control head as text and styles. OUTPUT is the only thing here that
     /// makes a claim about the outside world, so it is the only thing that can
