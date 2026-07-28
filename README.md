@@ -191,6 +191,7 @@ measured to make the meters honest.
 | [docs/tuner.md](docs/tuner.md) | FM demodulation on an RTL-SDR, and calibrating it against the band |
 | [docs/design.md](docs/design.md) | the panel language: glyphs, colour, and what is invented |
 | [docs/memory.md](docs/memory.md) | the 12-volt memory: what persists, where, and how it heals |
+| [docs/the-rack-is-an-output-device.md](docs/the-rack-is-an-output-device.md) | why the rack has to *be* a sink rather than a program that plays sound — decided, not yet built |
 | [docs/the-ad.md](docs/the-ad.md) | the 1986 advertisement this came from, and what was taken from it |
 | [docs/panel-reference.html](docs/panel-reference.html) | the original HTML prototype this was ported from |
 
