@@ -209,6 +209,11 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         (crate::adapter::Link::Contested(w), Some(src)) => {
             format!("{src} — held on \"{}\"; the rack cannot get it back", w.desc)
         }
+        // Not examined. Withholding the claim rather than making it, because
+        // "· via aux" would be an assertion about a path nobody looked at.
+        (crate::adapter::Link::Unknown, Some(src)) => {
+            format!("{src} — not checked; the rack is untangling its own output")
+        }
         _ => shelf(a),
     };
     let max = inner.width.saturating_sub(SPINE + 2) as usize;
@@ -371,6 +376,17 @@ mod tests {
         assert_eq!(fault, Some(theme.ink_red), "a plug that came out is an alert");
         let (_, ok) = link_lamp(Link::Seated, 0);
         assert_eq!(ok, Some(theme.led_g), "a seated plug is a mode, not an alarm");
+    }
+
+    /// A tick that examined nothing must not read as a tick that came back
+    /// clean. The guard spends a tick on a loop and looks at no routing at all;
+    /// drawing that as the ordinary "· via aux" would make the panel look
+    /// healthiest exactly when it has stopped checking itself.
+    #[test]
+    fn a_reading_nobody_took_is_not_drawn_as_a_clean_one() {
+        let panel = render(Link::Unknown, Some("Google Chrome"), 0);
+        assert!(panel.contains("not checked"), "{panel}");
+        assert!(!panel.contains("via aux"), "{panel}");
     }
 
     /// The stream ended. Nothing is plugged in, so the bay must stop describing

@@ -57,6 +57,38 @@ impl Stream {
     }
 }
 
+/// What application a stream belongs to.
+///
+/// One spelling, because the picker and the successor search have to agree
+/// about it — the picker names the application the operator chose, and the
+/// search looks for the stream that replaced it. Two spellings of "which app is
+/// this" would mean adopting a stream the operator never picked, or failing to
+/// adopt the one they did.
+fn app_of(props: &serde_json::Value) -> String {
+    let get = |k: &str| props.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    match get("application.name") {
+        a if !a.is_empty() => a.to_string(),
+        _ => get("application.process.binary").to_string(),
+    }
+}
+
+/// The plug the guard is watching: a sink-input index, and whose it is.
+///
+/// The index alone is not enough to watch anything for long. Applications tear
+/// down and rebuild their playback stream constantly — Chrome does it every few
+/// minutes, a track change is enough for some players — and each rebuild is a
+/// new index. Watching only the number means the plug is silently lost the
+/// first time that happens, and the bay goes on describing a signal path
+/// belonging to a stream that no longer exists.
+///
+/// So the *application* is the thing the operator actually chose, and the index
+/// is only where it happens to live right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plug {
+    pub index: u32,
+    pub app: String,
+}
+
 fn pactl(args: &[&str]) -> Result<String> {
     let out = Command::new("pactl")
         .args(args)
@@ -90,10 +122,7 @@ pub fn streams() -> Result<Vec<Stream>> {
                 return None;
             }
 
-            let app = match get("application.name") {
-                a if !a.is_empty() => a,
-                _ => get("application.process.binary"),
-            };
+            let app = app_of(props);
             Some(Stream {
                 index: s.get("index")?.as_u64()? as u32,
                 sink: s.get("sink").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
@@ -281,6 +310,14 @@ pub enum Link {
     /// What we routed is no longer on the graph — the stream ended. Ordinary,
     /// and not a fault: it is what stopping the music looks like from here.
     Gone,
+    /// Not examined. The guard spent this tick on something more urgent.
+    ///
+    /// Distinct from `Idle`, which is a *finding* — looked, nothing plugged in,
+    /// no claim to check. This is the absence of a finding, and the panel has to
+    /// render the difference: a reading nobody took must not be drawn as a
+    /// reading that came back clean, or the rack looks healthy precisely when it
+    /// has stopped checking itself.
+    Unknown,
 }
 
 impl Link {
@@ -348,9 +385,15 @@ pub fn reseat(index: u32) -> Result<()> {
 /// owed, and the rack takes it back without being asked.
 #[derive(Debug, Default)]
 pub struct Reseat {
-    /// The sink the attempt was spent on, by index — see [`Where`] for why not
-    /// by name.
+    /// The sink an attempt is currently spent on, by index — see [`Where`] for
+    /// why not by name. `None` means one is owed.
     spent_on: Option<u64>,
+    /// The sink being fought over, and how many attempts have been spent on it.
+    ///
+    /// Separate from `spent_on`, and it has to be: the count survives the plug
+    /// settling, which is the whole point. Losing it there would reset the
+    /// patience every time the grabber paused, and the wait would never grow.
+    fought: Option<(u64, u32)>,
     /// Consecutive sightings of the plug sitting where it belongs.
     held: u32,
 }
@@ -366,7 +409,26 @@ pub struct Reseat {
 /// to be mistaken for a glitch.
 const SETTLED: u32 = 30;
 
+/// How many times the threshold doubles before it stops growing — 30, 60, 120,
+/// 240 sightings, so a fourth exchange with the same grabber buys about four
+/// minutes of quiet and an eighth is conceded in all but name.
+const PATIENCE: u32 = 3;
+
 impl Reseat {
+    /// How long the plug must hold before a fresh attempt is owed on this sink.
+    ///
+    /// It grows, because a fixed threshold cannot remove the fight — only move
+    /// it. Against a grabber slower than the threshold, a fixed value trades one
+    /// move per period *forever*; the exchanges are bounded and self-announcing,
+    /// but they never stop. Doubling per exchange makes the rate decay instead:
+    /// a one-off mishap is still recovered immediately, and something that keeps
+    /// taking the same stream is given up on at a rate the operator can hear
+    /// receding rather than as a permanent tic.
+    fn threshold(&self) -> u32 {
+        let rounds = self.fought.map_or(1, |(_, n)| n.max(1));
+        SETTLED << (rounds - 1).min(PATIENCE)
+    }
+
     /// What to report, and whether to push the plug in before reporting it.
     pub fn judge(&mut self, seen: Link) -> (Link, bool) {
         match seen {
@@ -374,28 +436,47 @@ impl Reseat {
                 self.held = 0;
                 if self.spent_on == Some(where_it_is.sink) {
                     // Tried that already, and here it is again.
-                    (Link::Contested(where_it_is), false)
-                } else {
-                    self.spent_on = Some(where_it_is.sink);
-                    (Link::Adrift(where_it_is), true)
+                    return (Link::Contested(where_it_is), false);
                 }
+                // A fresh attempt, and the count of how many this sink has now
+                // cost — which is what makes the next wait longer than this one.
+                self.fought = match self.fought {
+                    Some((sink, n)) if sink == where_it_is.sink => {
+                        Some((sink, n.saturating_add(1)))
+                    }
+                    _ => Some((where_it_is.sink, 1)),
+                };
+                self.spent_on = Some(where_it_is.sink);
+                (Link::Adrift(where_it_is), true)
             }
             Link::Seated => {
                 self.held = self.held.saturating_add(1);
-                if self.held >= SETTLED {
+                if self.held >= self.threshold() {
                     self.spent_on = None;
                 }
                 (Link::Seated, false)
             }
             // Nothing plugged, or the stream ended. Whatever comes next is a
-            // different question and is owed its own attempt.
+            // different question and is owed its own attempt — and a different
+            // fight, so the patience built up over the last one goes too.
             other => {
                 self.spent_on = None;
+                self.fought = None;
                 self.held = 0;
                 (other, false)
             }
         }
     }
+}
+
+/// What one look at the graph found: the two readings, and whether the plug
+/// has moved to a stream the guard was not yet watching.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Verdict {
+    pub routing: Routing,
+    /// The sink-input the plugged application lives on now, when that is not
+    /// the one being watched.
+    pub successor: Option<u32>,
 }
 
 /// Both routing questions, answered together.
@@ -405,6 +486,10 @@ pub struct Routing {
     pub aux: Link,
     /// The rack's own output, against the device the panel claims it drives.
     pub output: Link,
+    /// The rack's output was found sitting on the rack's own input, and moved
+    /// off it. The one condition the guard fights rather than reports — and,
+    /// until now, the one it fought entirely in silence.
+    pub howling: bool,
 }
 
 /// Something the guard has decided to do about the graph.
@@ -428,6 +513,8 @@ pub enum Act {
     /// away the plug they just made, leaving the guard watching nothing while
     /// the bay went on describing a signal path.
     Unwatch(u32),
+    /// Watch this sink-input instead: the application moved to a new stream.
+    Adopt(u32),
 }
 
 /// The routing guard's whole decision, per tick.
@@ -456,34 +543,43 @@ impl Guard {
     /// deliberately spent.
     pub fn tick(
         &mut self,
-        raw: Option<Routing>,
-        plugged: Option<u32>,
+        raw: Option<Verdict>,
+        plugged: Option<&Plug>,
         driving: Option<&str>,
     ) -> (Option<Routing>, Vec<Act>) {
         let Some(raw) = raw else { return (None, Vec::new()) };
+        let mut acts = Vec::new();
 
-        if plugged != self.watching {
+        // The stream this tick is actually about — the one being watched, or
+        // the one that replaced it. Everything below is about *that* index, so
+        // that adopting a successor and seating it can happen in one tick
+        // rather than leaving the bay wrong for a second in between.
+        let about = raw.successor.or(plugged.map(|p| p.index));
+        if let Some(i) = raw.successor {
+            acts.push(Act::Adopt(i));
+        }
+
+        if about != self.watching {
             self.aux = Reseat::default();
-            self.watching = plugged;
+            self.watching = about;
         }
         if driving != self.driving.as_deref() {
             self.out = Reseat::default();
             self.driving = driving.map(str::to_string);
         }
 
-        let mut acts = Vec::new();
-        let (aux, push) = self.aux.judge(raw.aux);
-        if push && let Some(i) = plugged {
+        let (aux, push) = self.aux.judge(raw.routing.aux);
+        if push && let Some(i) = about {
             acts.push(Act::Reseat(i));
         }
-        if aux == Link::Gone && let Some(i) = plugged {
-            acts.push(Act::Unwatch(i));
+        if aux == Link::Gone && let Some(p) = plugged {
+            acts.push(Act::Unwatch(p.index));
         }
-        let (output, reroute) = self.out.judge(raw.output);
+        let (output, reroute) = self.out.judge(raw.routing.output);
         if reroute {
             acts.push(Act::Reroute);
         }
-        (Some(Routing { aux, output }), acts)
+        (Some(Routing { aux, output, ..Default::default() }), acts)
     }
 }
 
@@ -505,7 +601,7 @@ impl Guard {
 /// it had already conceded to, and the two would trade a move every other
 /// second for the rest of the run. The caller has to be able to tell "I looked
 /// and nothing is wrong" from "I could not look".
-pub fn routing(plugged: Option<u32>, want: Option<&str>) -> Option<Routing> {
+pub fn routing(plugged: Option<&Plug>, want: Option<&str>) -> Option<Verdict> {
     let (Ok(ij), Ok(sj)) = (
         pactl(&["-f", "json", "list", "sink-inputs"]),
         pactl(&["-f", "json", "list", "sinks"]),
@@ -529,9 +625,9 @@ pub fn routing(plugged: Option<u32>, want: Option<&str>) -> Option<Routing> {
 fn decide(
     inputs: &[serde_json::Value],
     sinks: &[serde_json::Value],
-    plugged: Option<u32>,
+    plugged: Option<&Plug>,
     want: Option<&str>,
-) -> Routing {
+) -> Verdict {
     let index_of = |s: &serde_json::Value| s.get("index").and_then(|i| i.as_u64());
     // Identity is the index; the description is only what to print. A sink
     // destroyed between the two reads above is in the inputs list and not the
@@ -561,24 +657,46 @@ fn decide(
             .and_then(index_of)
     };
 
+    // Anything that is not one of ours. A sink-input index is the server's, not
+    // ours: the stream we plugged can end at any moment and the number be handed
+    // to somebody else — and if that somebody is our own output, reporting it
+    // adrift would have the guard "recover" it onto our own input, which is the
+    // feedback loop every other guard in this file exists to prevent. The index
+    // is a weak identity, so it does not get to name us.
+    let theirs = |i: &serde_json::Value| !i.get("properties").is_some_and(is_ours);
+
     // The plugged stream, against our own sink.
     //
-    // Never match one of our own streams, however the index came to point at
-    // one. A sink-input index is the server's, not ours: the stream we plugged
-    // can end at any moment and the number be handed to somebody else — and if
-    // that somebody is our own output, reporting it adrift would have the guard
-    // "recover" it onto our own input, which is the feedback loop every other
-    // guard in this file exists to prevent. The index is a weak identity, so it
-    // does not get to name us.
+    // Resolved by index first and by *application* second. An application tears
+    // down and rebuilds its playback stream constantly — a track change is
+    // enough for some — and each rebuild is a new index. What the operator
+    // chose was the application; the index is only where it lived at the time.
+    // So when the tracked index is gone, the stream that replaced it is the
+    // same plug and gets picked up without anybody being asked.
+    let mut successor = None;
     let aux = match (plugged, named(SINK)) {
-        (Some(idx), Some(ours)) => {
-            let theirs = |i: &serde_json::Value| {
-                index_of(i) == Some(idx as u64) && !i.get("properties").is_some_and(is_ours)
-            };
-            match sink_of(&theirs) {
+        (Some(plug), Some(ours)) => {
+            let live = inputs
+                .iter()
+                .find(|i| index_of(i) == Some(plug.index as u64) && theirs(i))
+                .or_else(|| {
+                    inputs.iter().find(|i| {
+                        theirs(i)
+                            && i.get("properties").map(app_of).as_deref() == Some(&plug.app)
+                    })
+                });
+            match live {
                 None => Link::Gone,
-                Some(on) if on == ours => Link::Seated,
-                Some(on) => Link::Adrift(put(on)),
+                Some(i) => {
+                    if index_of(i) != Some(plug.index as u64) {
+                        successor = index_of(i).map(|x| x as u32);
+                    }
+                    match i.get("sink").and_then(|s| s.as_u64()) {
+                        Some(on) if on == ours => Link::Seated,
+                        Some(on) => Link::Adrift(put(on)),
+                        None => Link::Gone,
+                    }
+                }
             }
         }
         // No sink of ours means the adapter is not in, so nothing is plugged.
@@ -618,7 +736,7 @@ fn decide(
         }
     };
 
-    Routing { aux, output }
+    Verdict { routing: Routing { aux, output, howling: false }, successor }
 }
 
 /// Is the rack's own output sitting on the rack's own input?
@@ -797,6 +915,11 @@ mod tests {
     /// The graph as it actually stood on the machine where this was found:
     /// EasyEffects holding every stream, including ours, while the panel
     /// claimed the Bluetooth headphones. Indices are the real ones.
+    /// The plug, as the guard holds it: Chrome, at the index it lives on.
+    fn chrome(index: u32) -> Plug {
+        Plug { index, app: "Google Chrome".into() }
+    }
+
     /// A sink, as the answer names it. Indices match the fixtures below.
     fn at(sink: u64, desc: &str) -> Where {
         Where { sink, desc: desc.into() }
@@ -841,7 +964,7 @@ mod tests {
     #[test]
     fn a_plug_that_held_reads_seated() {
         let (i, s) = healthy();
-        assert_eq!(decide(&i, &s, Some(88131), None).aux, Link::Seated);
+        assert_eq!(decide(&i, &s, Some(&chrome(88131)), None).routing.aux, Link::Seated);
     }
 
     /// The whole point. `move-sink-input` was granted and then undone, and the
@@ -851,17 +974,21 @@ mod tests {
     fn a_plug_that_was_taken_back_names_who_took_it() {
         let (i, s) = stolen();
         assert_eq!(
-            decide(&i, &s, Some(88131), None).aux,
+            decide(&i, &s, Some(&chrome(88131)), None).routing.aux,
             Link::Adrift(at(47, "EasyEffects Sink"))
         );
     }
 
     /// A stream that ended is not a fault, and must not light a warning: that
     /// is what stopping the music looks like from here.
+    /// A plug whose application has stopped playing altogether — no stream at
+    /// the tracked index, and none belonging to it anywhere. That is what
+    /// stopping the music looks like from here, and must not raise an alarm.
     #[test]
-    fn a_stream_that_ended_is_gone_rather_than_pulled() {
+    fn an_application_that_stopped_playing_is_gone_rather_than_adrift() {
         let (i, s) = healthy();
-        let r = decide(&i, &s, Some(9999), None);
+        let gone = Plug { index: 9999, app: "mpv".into() };
+        let r = decide(&i, &s, Some(&gone), None).routing;
         assert_eq!(r.aux, Link::Gone);
         assert!(!r.aux.astray(), "a finished stream must not raise an alarm");
     }
@@ -869,7 +996,7 @@ mod tests {
     #[test]
     fn nothing_plugged_in_is_idle() {
         let (i, s) = healthy();
-        assert_eq!(decide(&i, &s, None, None).aux, Link::Idle);
+        assert_eq!(decide(&i, &s, None, None).routing.aux, Link::Idle);
     }
 
     /// Without our own sink there is no adapter in the rack, so there is
@@ -878,13 +1005,13 @@ mod tests {
     fn no_aux_sink_means_nothing_can_be_plugged() {
         let (i, mut s) = healthy();
         s.retain(|x| x["name"] != SINK);
-        assert_eq!(decide(&i, &s, Some(88131), None).aux, Link::Idle);
+        assert_eq!(decide(&i, &s, Some(&chrome(88131)), None).routing.aux, Link::Idle);
     }
 
     #[test]
     fn an_output_the_rack_really_drives_reads_seated() {
         let (i, s) = healthy();
-        assert_eq!(decide(&i, &s, None, Some("Muh Chickin Waffles")).output, Link::Seated);
+        assert_eq!(decide(&i, &s, None, Some("Muh Chickin Waffles")).routing.output, Link::Seated);
     }
 
     /// The failure the panel could not previously see: OUTPUT went on saying
@@ -895,7 +1022,7 @@ mod tests {
     fn an_output_that_was_re_homed_says_where_it_went() {
         let (i, s) = stolen();
         assert_eq!(
-            decide(&i, &s, None, Some("Muh Chickin Waffles")).output,
+            decide(&i, &s, None, Some("Muh Chickin Waffles")).routing.output,
             Link::Adrift(at(47, "EasyEffects Sink"))
         );
     }
@@ -909,7 +1036,7 @@ mod tests {
     fn an_output_device_that_went_away_says_so() {
         let (i, mut s) = healthy();
         s.retain(|x| x["description"] != "Muh Chickin Waffles");
-        let out = decide(&i, &s, None, Some("Muh Chickin Waffles")).output;
+        let out = decide(&i, &s, None, Some("Muh Chickin Waffles")).routing.output;
         assert_eq!(out, Link::Absent);
         assert!(out.astray(), "a device that is not there must not read as fine");
     }
@@ -920,7 +1047,7 @@ mod tests {
     fn no_output_stream_of_ours_is_not_an_alarm() {
         let (mut i, s) = healthy();
         i.retain(|x| x["properties"]["node.name"] != "alsa_playback.ten-qd");
-        let out = decide(&i, &s, None, Some("Muh Chickin Waffles")).output;
+        let out = decide(&i, &s, None, Some("Muh Chickin Waffles")).routing.output;
         assert_eq!(out, Link::Gone);
         assert!(!out.astray());
     }
@@ -930,7 +1057,7 @@ mod tests {
     #[test]
     fn following_the_default_makes_no_claim() {
         let (i, s) = stolen();
-        assert_eq!(decide(&i, &s, None, None).output, Link::Idle);
+        assert_eq!(decide(&i, &s, None, None).routing.output, Link::Idle);
     }
 
     /// `want` is a description and sinks are compared by index; the panel
@@ -945,7 +1072,7 @@ mod tests {
         }));
         // We are on 87446, whose *description* is the one asked for. Still
         // seated — the impostor's matching name must not steal the comparison.
-        assert_eq!(decide(&i, &s, None, Some("Muh Chickin Waffles")).output, Link::Seated);
+        assert_eq!(decide(&i, &s, None, Some("Muh Chickin Waffles")).routing.output, Link::Seated);
     }
 
     /// Both subjects are read from one graph, and they are independent: the
@@ -955,7 +1082,7 @@ mod tests {
     fn the_two_questions_are_answered_separately() {
         let (mut i, s) = stolen();
         i[0]["sink"] = serde_json::json!(87671); // Chrome plugged in fine
-        let r = decide(&i, &s, Some(88131), Some("Muh Chickin Waffles"));
+        let r = decide(&i, &s, Some(&chrome(88131)), Some("Muh Chickin Waffles")).routing;
         assert_eq!(r.aux, Link::Seated);
         assert!(r.output.astray(), "the output is not where the panel says");
     }
@@ -1018,10 +1145,50 @@ mod tests {
     fn a_recycled_index_can_never_make_the_guard_grab_our_own_output() {
         let (inputs, sinks) = healthy();
         // 87605 is ours, sitting on the headphones — exactly what a stale index
-        // pointing at a recycled stream would look like.
-        let r = decide(&inputs, &sinks, Some(87605), None);
-        assert_eq!(r.aux, Link::Gone, "our own stream must read as nothing to watch");
-        assert!(!r.aux.astray(), "and must never invite a re-seat");
+        // pointing at a recycled stream would look like. The application is one
+        // with nothing playing, so there is no successor to adopt either and
+        // the only candidate left is the one that must never be taken.
+        let stale = Plug { index: 87605, app: "mpv".into() };
+        let r = decide(&inputs, &sinks, Some(&stale), None);
+        assert_eq!(r.routing.aux, Link::Gone, "our own stream must read as nothing to watch");
+        assert!(!r.routing.aux.astray(), "and must never invite a re-seat");
+        assert_eq!(r.successor, None, "and must never be adopted");
+    }
+
+    /// The point of #10: an application that rebuilt its playback stream is the
+    /// same plug at a new index, and gets picked up without anybody being asked.
+    /// Chrome does this every few minutes; a track change is enough for some
+    /// players. Watching only the number loses the plug the first time it
+    /// happens, and the bay then describes a path belonging to a stream that no
+    /// longer exists.
+    #[test]
+    fn a_stream_the_application_replaced_is_adopted() {
+        let (mut inputs, sinks) = healthy();
+        // Chrome tore down 88131 and came back on a new index, on the default
+        // output rather than ours.
+        inputs[0]["index"] = serde_json::json!(99001);
+        inputs[0]["sink"] = serde_json::json!(87446);
+
+        let r = decide(&inputs, &sinks, Some(&chrome(88131)), None);
+        assert_eq!(r.successor, Some(99001), "the replacement is the same plug");
+        assert_eq!(
+            r.routing.aux,
+            Link::Adrift(at(87446, "Muh Chickin Waffles")),
+            "and it is judged where it actually is, so it can be seated at once"
+        );
+    }
+
+    /// Adoption must not reach past the operator's choice. A different
+    /// application playing is not the plug coming back.
+    #[test]
+    fn a_different_application_is_never_adopted() {
+        let (mut inputs, sinks) = healthy();
+        inputs[0]["index"] = serde_json::json!(99001);
+        inputs[0]["properties"]["application.name"] = serde_json::json!("Spotify");
+
+        let r = decide(&inputs, &sinks, Some(&chrome(88131)), None);
+        assert_eq!(r.successor, None, "Spotify is not Chrome");
+        assert_eq!(r.routing.aux, Link::Gone);
     }
 
     // --- the guard's wiring -------------------------------------------------
@@ -1034,7 +1201,7 @@ mod tests {
     fn a_drift_asks_for_the_plugged_stream_to_be_pushed_back() {
         let mut g = Guard::default();
         let raw = Routing { aux: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
-        let (said, acts) = g.tick(Some(raw), Some(88131), None);
+        let (said, acts) = g.tick(Some(Verdict { routing: raw, successor: None }), Some(&chrome(88131)), None);
         assert_eq!(acts, vec![Act::Reseat(88131)], "the plug must actually be pushed");
         assert_eq!(said.unwrap().aux, Link::Adrift(at(47, "EasyEffects Sink")));
     }
@@ -1045,8 +1212,12 @@ mod tests {
     #[test]
     fn each_subject_moves_only_itself() {
         let mut g = Guard::default();
-        let raw = Routing { aux: Link::Seated, output: Link::Adrift(at(47, "EasyEffects Sink")) };
-        let (_, acts) = g.tick(Some(raw), Some(88131), None);
+        let raw = Routing {
+            aux: Link::Seated,
+            output: Link::Adrift(at(47, "EasyEffects Sink")),
+            howling: false,
+        };
+        let (_, acts) = g.tick(Some(Verdict { routing: raw, successor: None }), Some(&chrome(88131)), None);
         assert_eq!(acts, vec![Act::Reroute], "the output drifted; the aux plug did not");
     }
 
@@ -1058,9 +1229,9 @@ mod tests {
     fn a_graph_that_could_not_be_read_changes_nothing() {
         let mut g = Guard::default();
         let ee = Routing { aux: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
-        g.tick(Some(ee.clone()), Some(88131), None); // one attempt, spent
-        assert_eq!(g.tick(None, Some(88131), None), (None, Vec::new()), "nothing seen, nothing done");
-        let (said, acts) = g.tick(Some(ee), Some(88131), None);
+        g.tick(Some(Verdict { routing: ee.clone(), successor: None }), Some(&chrome(88131)), None); // one attempt, spent
+        assert_eq!(g.tick(None, Some(&chrome(88131)), None), (None, Vec::new()), "nothing seen, nothing done");
+        let (said, acts) = g.tick(Some(Verdict { routing: ee, successor: None }), Some(&chrome(88131)), None);
         assert!(acts.is_empty(), "the failed read handed the attempt back");
         assert_eq!(said.unwrap().aux, Link::Contested(at(47, "EasyEffects Sink")));
     }
@@ -1072,13 +1243,13 @@ mod tests {
     fn a_different_stream_is_owed_its_own_attempt() {
         let mut g = Guard::default();
         let ee = Routing { aux: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
-        g.tick(Some(ee.clone()), Some(88131), None);
-        let (said, acts) = g.tick(Some(ee.clone()), Some(88131), None);
+        g.tick(Some(Verdict { routing: ee.clone(), successor: None }), Some(&chrome(88131)), None);
+        let (said, acts) = g.tick(Some(Verdict { routing: ee.clone(), successor: None }), Some(&chrome(88131)), None);
         assert!(acts.is_empty(), "same plug, same sink — conceded");
         assert_eq!(said.unwrap().aux, Link::Contested(at(47, "EasyEffects Sink")));
 
         // The operator plugs in a different application.
-        let (said, acts) = g.tick(Some(ee), Some(99999), None);
+        let (said, acts) = g.tick(Some(Verdict { routing: ee, successor: None }), Some(&chrome(99999)), None);
         assert_eq!(acts, vec![Act::Reseat(99999)]);
         assert_eq!(said.unwrap().aux, Link::Adrift(at(47, "EasyEffects Sink")));
     }
@@ -1096,7 +1267,7 @@ mod tests {
     fn a_stream_that_ended_is_dropped_by_name_not_blindly() {
         let mut g = Guard::default();
         let raw = Routing { aux: Link::Gone, ..Default::default() };
-        let (_, acts) = g.tick(Some(raw), Some(88131), None);
+        let (_, acts) = g.tick(Some(Verdict { routing: raw, successor: None }), Some(&chrome(88131)), None);
         assert!(
             acts.contains(&Act::Unwatch(88131)),
             "the index it judged has to travel with the instruction: {acts:?}"
@@ -1111,13 +1282,13 @@ mod tests {
     fn a_different_output_device_is_owed_its_own_attempt() {
         let mut g = Guard::default();
         let ee = Routing { output: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
-        g.tick(Some(ee.clone()), None, Some("Muh Chickin Waffles"));
-        let (said, acts) = g.tick(Some(ee.clone()), None, Some("Muh Chickin Waffles"));
+        g.tick(Some(Verdict { routing: ee.clone(), successor: None }), None, Some("Muh Chickin Waffles"));
+        let (said, acts) = g.tick(Some(Verdict { routing: ee.clone(), successor: None }), None, Some("Muh Chickin Waffles"));
         assert!(acts.is_empty(), "same target, same grabber — conceded");
         assert_eq!(said.unwrap().output, Link::Contested(at(47, "EasyEffects Sink")));
 
         // The operator picks a different output.
-        let (said, acts) = g.tick(Some(ee), None, Some("USB Audio Speakers"));
+        let (said, acts) = g.tick(Some(Verdict { routing: ee, successor: None }), None, Some("USB Audio Speakers"));
         assert_eq!(acts, vec![Act::Reroute], "the new device is owed an attempt");
         assert_eq!(said.unwrap().output, Link::Adrift(at(47, "EasyEffects Sink")));
     }
@@ -1132,10 +1303,10 @@ mod tests {
         let mut g = Guard::default();
         let first = Routing { aux: Link::Adrift(at(47, "Digital Output")), ..Default::default() };
         let second = Routing { aux: Link::Adrift(at(48, "Digital Output")), ..Default::default() };
-        g.tick(Some(first.clone()), Some(88131), None);
-        let (_, acts) = g.tick(Some(first), Some(88131), None);
+        g.tick(Some(Verdict { routing: first.clone(), successor: None }), Some(&chrome(88131)), None);
+        let (_, acts) = g.tick(Some(Verdict { routing: first, successor: None }), Some(&chrome(88131)), None);
         assert!(acts.is_empty(), "same sink — conceded");
-        let (_, acts) = g.tick(Some(second), Some(88131), None);
+        let (_, acts) = g.tick(Some(Verdict { routing: second, successor: None }), Some(&chrome(88131)), None);
         assert_eq!(acts, vec![Act::Reseat(88131)], "a different sink with the same name");
     }
 
@@ -1178,6 +1349,32 @@ mod tests {
             r.judge(Link::Seated);
         }
         assert!(r.judge(ee).1, "after settling, the same sink is owed a fresh attempt");
+    }
+
+    /// A fixed threshold cannot end the fight, only move it: against a grabber
+    /// slower than the threshold it trades one move per period *forever*. So
+    /// the wait doubles per exchange with the same sink. A one-off mishap still
+    /// recovers immediately; something that keeps taking the same stream is
+    /// given up on at a rate the operator hears receding rather than as a
+    /// permanent tic.
+    #[test]
+    fn a_repeat_grabber_is_given_up_on_by_degrees() {
+        let mut r = Reseat::default();
+        let ee = || Link::Adrift(at(47, "EasyEffects Sink"));
+
+        let mut waits = Vec::new();
+        for exchange in 0..5 {
+            assert!(r.judge(ee()).1, "exchange {exchange} must begin with an attempt");
+            // How long the plug must now sit still before another is owed.
+            let mut ticks = 0;
+            while r.spent_on.is_some() {
+                ticks += 1;
+                r.judge(Link::Seated);
+            }
+            waits.push(ticks);
+        }
+
+        assert_eq!(waits, vec![30, 60, 120, 240, 240], "{waits:?}");
     }
 
     /// Ending the stream clears the slate: the next plug starts fresh, rather
