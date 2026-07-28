@@ -551,6 +551,13 @@ pub struct AuxState {
     pub artist: String,
     /// Whether audio is actually arriving over the cable.
     pub live: bool,
+    /// Whether the stream we plugged in is still on our sink.
+    ///
+    /// Plugging something in is a *request*, and the desktop is free to undo
+    /// it a moment later — see [`crate::adapter::Link`]. Without this the bay
+    /// would go on naming a source it no longer carries, which is the one
+    /// thing the panel is not allowed to do.
+    pub link: crate::adapter::Link,
 }
 
 impl AuxState {
@@ -916,6 +923,15 @@ pub struct Stack {
     /// that unit is dispatched and counted down by the render loop, so an
     /// action on a folded-away or hidden unit still shows on its bar.
     pub blink: [u8; 7],
+    /// Frames drawn since the panel came up.
+    ///
+    /// The `blink` array above is a countdown — one flash, then out. This is
+    /// the other kind: a phase, for indicators that have to keep flashing for
+    /// as long as a condition lasts. A warning that flashes once is a warning
+    /// you can miss by looking away.
+    pub frame: u64,
+    /// Whether the rack's own output is still on the device OUTPUT names.
+    pub link: crate::adapter::Link,
 }
 
 // ---------------------------------------------------------------------------

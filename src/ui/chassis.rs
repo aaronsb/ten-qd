@@ -118,6 +118,22 @@ pub fn vfd(buf: &mut Buffer, x: u16, y: u16, text: &str, theme: &Theme) {
     }
 }
 
+/// How long a blinking warning stays lit, and how long it stays dark, in
+/// frames — roughly half a second each way at the panel's frame rate. That is
+/// a car's turn signal, which is the rate the eye already reads as "attend to
+/// this" without reading as an emergency.
+const BLINK_FRAMES: u64 = 15;
+
+/// Whether a warning that blinks is lit on this frame.
+///
+/// Distinct from `Stack::blink`, which is a countdown: one flash to acknowledge
+/// a keypress, then out. This is for a condition somebody *else* is causing,
+/// which will not clear on its own and must not be missable by looking away
+/// for a moment.
+pub fn blinking(frame: u64) -> bool {
+    (frame / BLINK_FRAMES).is_multiple_of(2)
+}
+
 /// A boxed indicator legend — APS, M SCAN, REPEAT, DISC and friends.
 pub fn boxed(
     buf: &mut Buffer,

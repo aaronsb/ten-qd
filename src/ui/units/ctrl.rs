@@ -126,12 +126,28 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let name = stack.output.clone().unwrap_or_else(|| "system default".into());
     let name: String = name.chars().take(34).collect();
     let name = format!("{name} ▸");
+    // Naming a device is a claim that the rack is driving it, and the desktop
+    // can move our output stream out from under that claim at any moment. When
+    // it has, the name goes red and LINK blinks beside it: the picker still
+    // shows what was chosen, because that is what the key does, but the panel
+    // stops asserting it is where the sound is going. This is the failure that
+    // had OUTPUT reading a set of headphones while every sample went somewhere
+    // else entirely.
+    let astray = stack.link.astray();
     buf.set_string(
         x + 8,
         oy,
         &name,
-        Style::default().fg(theme.ink_white).bg(theme.chassis),
+        Style::default()
+            .fg(if astray { theme.ink_red } else { theme.ink_white })
+            .bg(theme.chassis),
     );
+    if astray {
+        let lx = x + 9 + name.chars().count() as u16;
+        if lx + 6 <= inner.x + inner.width {
+            chassis::boxed(buf, lx, oy, "LINK", theme, chassis::blinking(stack.frame), false);
+        }
+    }
     hits.add_row(x, oy, 44, Command::OutputsOpen);
 
     chassis::model_corner(buf, inner, &["CONTROL HEAD LT-581"], theme);
@@ -195,5 +211,75 @@ fn fader(buf: &mut Buffer, x: u16, y: u16, value: f32, theme: &Theme, hits: &mut
         };
         buf.set_string(x + 2 + i, y, ch, Style::default().fg(fg).bg(theme.chassis));
         hits.add_row(x + 2 + i, y, 1, Command::Fader(i as f32 / (W - 1) as f32));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::{Link, Where};
+
+    /// The control head as text and styles. OUTPUT is the only thing here that
+    /// makes a claim about the outside world, so it is the only thing that can
+    /// be wrong about it.
+    fn render(link: Link, output: Option<&str>) -> (String, Option<ratatui::style::Color>) {
+        let stack =
+            Stack { output: output.map(str::to_string), link, ..Default::default() };
+        let area = Rect::new(0, 0, 120, 12);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::for_stack(&stack);
+        draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+
+        let text: String = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The colour of the device name is the claim: white asserts the rack is
+        // driving it, red withdraws that.
+        let name = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buf[(x, y)].symbol() == "M" && buf[(x + 1, y)].symbol() == "u"
+            })
+            .map(|(x, y)| buf[(x, y)].style().fg)
+            .unwrap_or(None);
+        (text, name)
+    }
+
+    /// Naming a device is a claim that the rack is driving it. When the desktop
+    /// has moved our output out from under that claim, the panel has to stop
+    /// making it — this is the failure the commit describes, where OUTPUT read
+    /// a set of headphones while every sample went to EasyEffects.
+    #[test]
+    fn an_output_the_rack_is_not_driving_is_not_asserted() {
+        let theme = Theme::for_stack(&Stack::default());
+        let (_, colour) =
+            render(Link::Adrift(Where { sink: 47, desc: "EasyEffects Sink".into() }), Some("Muh Chickin Waffles"));
+        assert_eq!(colour, Some(theme.ink_red), "the claim must be withdrawn, not merely annotated");
+    }
+
+    #[test]
+    fn an_output_the_rack_really_drives_is_asserted_plainly() {
+        let theme = Theme::for_stack(&Stack::default());
+        let (text, colour) = render(Link::Seated, Some("Muh Chickin Waffles"));
+        assert_eq!(colour, Some(theme.ink_white), "{text}");
+    }
+
+    /// A device that has left the machine is the same false claim wearing a
+    /// different hat: unplug the headphones and the sound goes to whatever
+    /// PipeWire falls back to, while the name sits there unchanged.
+    #[test]
+    fn an_output_device_that_is_not_there_is_not_asserted_either() {
+        let theme = Theme::for_stack(&Stack::default());
+        let (_, colour) = render(Link::Absent, Some("Muh Chickin Waffles"));
+        assert_eq!(colour, Some(theme.ink_red));
+    }
+
+    /// Following the system default is not a claim about any device, so there
+    /// is nothing there to withdraw.
+    #[test]
+    fn following_the_default_is_drawn_plainly() {
+        let (text, _) = render(Link::Idle, None);
+        assert!(text.contains("system default"), "{text}");
     }
 }
