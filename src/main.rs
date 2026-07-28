@@ -344,9 +344,7 @@ impl App {
                             // today — with the sink unloaded there is nothing
                             // to be seated against — but that is the adapter's
                             // absence doing the work, not an intention.
-                            if let Ok(mut p) = self.plugged.lock() {
-                                *p = None;
-                            }
+                            *held(&self.plugged) = None;
                             patch.aux = Some(Default::default());
                         }
                         patch.aux_power = Some(on);
@@ -917,9 +915,7 @@ impl App {
                         // Tell the route guard what to watch. `plug` only means
                         // the request was accepted; whether it held is a
                         // different question, asked a second from now.
-                        if let Ok(mut p) = self.plugged.lock() {
-                            *p = Some(stream.index);
-                        }
+                        *held(&self.plugged) = Some(stream.index);
                         let mut t = self.stack.aux.state.clone();
                         t.link = adapter::Link::Seated;
                         t.source = Some(stream.label());
@@ -1198,9 +1194,7 @@ impl App {
                                 ..Default::default()
                             });
                             // Tell the loop guard where "back" is now.
-                            if let Ok(mut g) = self.guard_target.lock() {
-                                *g = Some(desc.clone());
-                            }
+                            *held(&self.guard_target) = Some(desc.clone());
                             self.status(format!("output: {desc}"));
                         }
                         Err(e) => self.status(format!("could not route output: {e}")),
@@ -1668,7 +1662,7 @@ impl App {
         // Never `unwrap_or_default()` here: a poisoned lock would read as
         // `Idle` on both counts — every warning silently off, and the panel
         // back to claiming a signal path it has not checked.
-        let seen = self.routing.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let seen = held(&self.routing).clone();
         if self.stack.link != seen.output {
             // Edge-triggered. The condition can last for hours, and a status
             // line rewritten every second is a line nobody can read.
@@ -2653,20 +2647,9 @@ fn main() -> Result<()> {
         let seen = app.routing.clone();
         let mut guard = adapter::Guard::default();
         std::thread::Builder::new().name("ten-qd/routeguard".into()).spawn(move || {
-            // A poisoned lock must not read as good news. Every payload here is
-            // plain, always-consistent data, so taking the value a panicking
-            // thread left behind is strictly better than inventing a default —
-            // which for `preferred` would silently mean "follow the system
-            // default" and start moving the operator's output to a device they
-            // did not choose.
-            macro_rules! held {
-                ($m:expr) => {
-                    $m.lock().unwrap_or_else(|e| e.into_inner())
-                };
-            }
             loop {
                 std::thread::sleep(Duration::from_millis(1000));
-                let preferred = held!(want).clone();
+                let preferred = held(&want).clone();
 
                 // The loop, which is the one thing worth fighting over.
                 if adapter::own_output_is_looping() {
@@ -2678,16 +2661,19 @@ fn main() -> Result<()> {
                     // showing a reading that is no longer being taken — the
                     // condition can persist, when there is no safe output to
                     // move to or the move keeps failing.
-                    *held!(seen) = adapter::Routing::default();
+                    *held(&seen) = adapter::Routing::default();
                     continue;
                 }
 
-                let idx = *held!(plugged);
+                let idx = *held(&plugged);
 
                 // All of the deciding, none of the doing — so that which
                 // decision drives which move is something a test can read.
-                let (now, acts) =
-                    guard.tick(adapter::routing(idx, preferred.as_deref()), idx);
+                let (now, acts) = guard.tick(
+                    adapter::routing(idx, preferred.as_deref()),
+                    idx,
+                    preferred.as_deref(),
+                );
 
                 for act in acts {
                     match act {
@@ -2699,21 +2685,26 @@ fn main() -> Result<()> {
                                 let _ = adapter::route_own_output(&s.name);
                             }
                         }
+                        // Only if it is still the plug we judged. Reading the
+                        // index, asking the server about it and clearing it are
+                        // three steps with no lock held across them, and the
+                        // operator can plug something new in between the first
+                        // and the last — clearing blind would throw their plug
+                        // away and leave the guard watching nothing, silently
+                        // and for good.
+                        adapter::Act::Unwatch(i) => {
+                            let mut p = held(&plugged);
+                            if *p == Some(i) {
+                                *p = None;
+                            }
+                        }
                     }
                 }
 
                 // A failed read is not an observation: say nothing rather than
                 // publish a healthy-looking default.
                 let Some(now) = now else { continue };
-
-                // A stream that has ended stops being watched. The index was the
-                // server's, not ours, and it may already have been handed to
-                // somebody else — see the identity check in `decide`.
-                if now.aux == adapter::Link::Gone {
-                    *held!(plugged) = None;
-                }
-
-                *held!(seen) = now;
+                *held(&seen) = now;
             }
         })?;
     }
@@ -2758,6 +2749,22 @@ fn silence_stderr() -> Option<i32> {
         libc::close(null);
         Some(saved)
     }
+}
+
+/// Take a lock, and take the value even if the thread that held it panicked.
+///
+/// Every mutex shared between the panel and the route guard carries plain,
+/// always-consistent data — an index, a device name, a pair of readings — so
+/// there is no half-written state for a panic to have left behind. Which makes
+/// the usual `.ok()` or `.unwrap_or_default()` strictly worse than useless
+/// here: both fail *toward* good news. A poisoned `routing` reads as "nothing
+/// is wrong" and silently switches off every warning on the panel; a poisoned
+/// `guard_target` reads as "follow the system default" and starts moving the
+/// operator's output to a device they did not choose; a poisoned `plugged`
+/// turns a plug into a no-op the panel nonetheless reports as done. Keeping the
+/// last known value is the only reading that cannot invent health.
+fn held<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn restore_stderr(saved: Option<i32>) {

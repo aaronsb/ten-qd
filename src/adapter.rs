@@ -310,6 +310,14 @@ impl Link {
 /// a stream we had just restored back onto a sink that is about to vanish, and
 /// the unload would then tip it onto the system default instead of the sink it
 /// came from, quietly breaking the one promise eject makes.
+///
+/// This *narrows* that window rather than closing it: the guard can read this
+/// flag and still be beaten to the fork. But it goes from two `pactl`
+/// round-trips to the gap between an atomic load and an `exec` — some four
+/// orders of magnitude — for a consequence of one stream landing on the default
+/// instead of where it came from, once, at shutdown. Closing it properly wants
+/// a mutex held across both of eject's calls, which is a lot of machinery for
+/// that.
 static QUIESCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Push the plug back in: one `move-sink-input`, same as the original.
@@ -411,6 +419,15 @@ pub enum Act {
     Reseat(u32),
     /// Put our own output back on the device the panel names.
     Reroute,
+    /// Stop watching this sink-input: the stream it named has ended.
+    ///
+    /// Carries the index it is about, and the caller must check that this is
+    /// still the index being watched before acting. Judging a tick takes two
+    /// `pactl` round-trips with no lock held, and the operator can plug
+    /// something new in during that window — a blind clear would then throw
+    /// away the plug they just made, leaving the guard watching nothing while
+    /// the bay went on describing a signal path.
+    Unwatch(u32),
 }
 
 /// The routing guard's whole decision, per tick.
@@ -422,7 +439,12 @@ pub enum Act {
 pub struct Guard {
     aux: Reseat,
     out: Reseat,
+    /// The plug each memory is about. An attempt is spent on *a particular
+    /// thing being in a particular place*, so when either subject changes the
+    /// memory of it has to go — otherwise the new one inherits a concession
+    /// made about the old and is reported lost without one attempt being made.
     watching: Option<u32>,
+    driving: Option<String>,
 }
 
 impl Guard {
@@ -432,18 +454,30 @@ impl Guard {
     /// and nothing is done — a failed read is not an observation, and feeding
     /// it to [`Reseat`] as though it were would hand back an attempt that was
     /// deliberately spent.
-    pub fn tick(&mut self, raw: Option<Routing>, plugged: Option<u32>) -> (Option<Routing>, Vec<Act>) {
+    pub fn tick(
+        &mut self,
+        raw: Option<Routing>,
+        plugged: Option<u32>,
+        driving: Option<&str>,
+    ) -> (Option<Routing>, Vec<Act>) {
         let Some(raw) = raw else { return (None, Vec::new()) };
 
         if plugged != self.watching {
             self.aux = Reseat::default();
             self.watching = plugged;
         }
+        if driving != self.driving.as_deref() {
+            self.out = Reseat::default();
+            self.driving = driving.map(str::to_string);
+        }
 
         let mut acts = Vec::new();
         let (aux, push) = self.aux.judge(raw.aux);
         if push && let Some(i) = plugged {
             acts.push(Act::Reseat(i));
+        }
+        if aux == Link::Gone && let Some(i) = plugged {
+            acts.push(Act::Unwatch(i));
         }
         let (output, reroute) = self.out.judge(raw.output);
         if reroute {
@@ -1000,7 +1034,7 @@ mod tests {
     fn a_drift_asks_for_the_plugged_stream_to_be_pushed_back() {
         let mut g = Guard::default();
         let raw = Routing { aux: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
-        let (said, acts) = g.tick(Some(raw), Some(88131));
+        let (said, acts) = g.tick(Some(raw), Some(88131), None);
         assert_eq!(acts, vec![Act::Reseat(88131)], "the plug must actually be pushed");
         assert_eq!(said.unwrap().aux, Link::Adrift(at(47, "EasyEffects Sink")));
     }
@@ -1012,7 +1046,7 @@ mod tests {
     fn each_subject_moves_only_itself() {
         let mut g = Guard::default();
         let raw = Routing { aux: Link::Seated, output: Link::Adrift(at(47, "EasyEffects Sink")) };
-        let (_, acts) = g.tick(Some(raw), Some(88131));
+        let (_, acts) = g.tick(Some(raw), Some(88131), None);
         assert_eq!(acts, vec![Act::Reroute], "the output drifted; the aux plug did not");
     }
 
@@ -1024,9 +1058,9 @@ mod tests {
     fn a_graph_that_could_not_be_read_changes_nothing() {
         let mut g = Guard::default();
         let ee = Routing { aux: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
-        g.tick(Some(ee.clone()), Some(88131)); // one attempt, spent
-        assert_eq!(g.tick(None, Some(88131)), (None, Vec::new()), "nothing seen, nothing done");
-        let (said, acts) = g.tick(Some(ee), Some(88131));
+        g.tick(Some(ee.clone()), Some(88131), None); // one attempt, spent
+        assert_eq!(g.tick(None, Some(88131), None), (None, Vec::new()), "nothing seen, nothing done");
+        let (said, acts) = g.tick(Some(ee), Some(88131), None);
         assert!(acts.is_empty(), "the failed read handed the attempt back");
         assert_eq!(said.unwrap().aux, Link::Contested(at(47, "EasyEffects Sink")));
     }
@@ -1038,15 +1072,54 @@ mod tests {
     fn a_different_stream_is_owed_its_own_attempt() {
         let mut g = Guard::default();
         let ee = Routing { aux: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
-        g.tick(Some(ee.clone()), Some(88131));
-        let (said, acts) = g.tick(Some(ee.clone()), Some(88131));
+        g.tick(Some(ee.clone()), Some(88131), None);
+        let (said, acts) = g.tick(Some(ee.clone()), Some(88131), None);
         assert!(acts.is_empty(), "same plug, same sink — conceded");
         assert_eq!(said.unwrap().aux, Link::Contested(at(47, "EasyEffects Sink")));
 
         // The operator plugs in a different application.
-        let (said, acts) = g.tick(Some(ee), Some(99999));
+        let (said, acts) = g.tick(Some(ee), Some(99999), None);
         assert_eq!(acts, vec![Act::Reseat(99999)]);
         assert_eq!(said.unwrap().aux, Link::Adrift(at(47, "EasyEffects Sink")));
+    }
+
+    /// A stream that ended asks to be dropped *by name*, so the caller can
+    /// check it is still the plug in question.
+    ///
+    /// Judging a tick means reading the index, asking the server two questions
+    /// about it, and only then deciding — with no lock held across any of it.
+    /// The operator can plug something new in during that window; clearing
+    /// blind would throw their plug away, and the guard would then watch
+    /// nothing at all while the bay went on describing a signal path. Silent,
+    /// permanent, and exactly the failure this whole mechanism exists to stop.
+    #[test]
+    fn a_stream_that_ended_is_dropped_by_name_not_blindly() {
+        let mut g = Guard::default();
+        let raw = Routing { aux: Link::Gone, ..Default::default() };
+        let (_, acts) = g.tick(Some(raw), Some(88131), None);
+        assert!(
+            acts.contains(&Act::Unwatch(88131)),
+            "the index it judged has to travel with the instruction: {acts:?}"
+        );
+    }
+
+    /// Choosing a different output device is a new question, exactly as
+    /// choosing a different stream is. Without this the new device inherits a
+    /// concession made about the old one and is reported lost without a single
+    /// attempt — the same defect as for the aux plug, on the other subject.
+    #[test]
+    fn a_different_output_device_is_owed_its_own_attempt() {
+        let mut g = Guard::default();
+        let ee = Routing { output: Link::Adrift(at(47, "EasyEffects Sink")), ..Default::default() };
+        g.tick(Some(ee.clone()), None, Some("Muh Chickin Waffles"));
+        let (said, acts) = g.tick(Some(ee.clone()), None, Some("Muh Chickin Waffles"));
+        assert!(acts.is_empty(), "same target, same grabber — conceded");
+        assert_eq!(said.unwrap().output, Link::Contested(at(47, "EasyEffects Sink")));
+
+        // The operator picks a different output.
+        let (said, acts) = g.tick(Some(ee), None, Some("USB Audio Speakers"));
+        assert_eq!(acts, vec![Act::Reroute], "the new device is owed an attempt");
+        assert_eq!(said.unwrap().output, Link::Adrift(at(47, "EasyEffects Sink")));
     }
 
     /// Two sinks can share a description — a pair of identical interfaces, or
@@ -1059,10 +1132,10 @@ mod tests {
         let mut g = Guard::default();
         let first = Routing { aux: Link::Adrift(at(47, "Digital Output")), ..Default::default() };
         let second = Routing { aux: Link::Adrift(at(48, "Digital Output")), ..Default::default() };
-        g.tick(Some(first.clone()), Some(88131));
-        let (_, acts) = g.tick(Some(first), Some(88131));
+        g.tick(Some(first.clone()), Some(88131), None);
+        let (_, acts) = g.tick(Some(first), Some(88131), None);
         assert!(acts.is_empty(), "same sink — conceded");
-        let (_, acts) = g.tick(Some(second), Some(88131));
+        let (_, acts) = g.tick(Some(second), Some(88131), None);
         assert_eq!(acts, vec![Act::Reseat(88131)], "a different sink with the same name");
     }
 
