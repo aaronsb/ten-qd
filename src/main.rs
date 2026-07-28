@@ -130,6 +130,15 @@ struct App {
     /// has to be told when the operator changes output, or it would restore
     /// whatever was remembered at start-up for the rest of the run.
     guard_target: Arc<std::sync::Mutex<Option<String>>>,
+    /// The sink-input the operator plugged into the aux bay, shared with the
+    /// route guard so it knows which stream to keep an eye on. An index rather
+    /// than a name: it is what `move-sink-input` was given, so it is what the
+    /// answer has to be about.
+    plugged: Arc<std::sync::Mutex<Option<u32>>>,
+    /// What the route guard last saw. Written once a second by that thread and
+    /// read every frame by the panel — `pactl` costs far too much to ask at
+    /// thirty frames a second.
+    routing: Arc<std::sync::Mutex<adapter::Routing>>,
 }
 
 impl App {
@@ -204,6 +213,8 @@ impl App {
             log_tick: None,
             streams: Vec::new(),
             guard_target: Arc::new(std::sync::Mutex::new(mem.output.clone())),
+            plugged: Arc::new(std::sync::Mutex::new(None)),
+            routing: Arc::new(std::sync::Mutex::new(adapter::Routing::default())),
         }
     }
 
@@ -895,7 +906,14 @@ impl App {
                 match a.plug(&stream) {
                     Ok(()) => {
                         self.mpris.prefer(Some(stream.app.clone()));
+                        // Tell the route guard what to watch. `plug` only means
+                        // the request was accepted; whether it held is a
+                        // different question, asked a second from now.
+                        if let Ok(mut p) = self.plugged.lock() {
+                            *p = Some(stream.index);
+                        }
                         let mut t = self.stack.aux.state.clone();
+                        t.link = adapter::Link::Seated;
                         t.source = Some(stream.label());
                         self.stack.apply(Patch { aux: Some(t), ..Default::default() });
                         self.aux_open = false;
@@ -1635,6 +1653,26 @@ impl App {
         for b in &mut self.stack.blink {
             *b = b.saturating_sub(1);
         }
+        self.stack.frame = self.stack.frame.wrapping_add(1);
+
+        // What the route guard last saw. Read here rather than asked here:
+        // `pactl` is three orders of magnitude too slow for a frame.
+        let seen = self.routing.lock().ok().map(|r| r.clone()).unwrap_or_default();
+        if self.stack.link != seen.output {
+            // Edge-triggered. The condition can last for hours, and a status
+            // line rewritten every second is a line nobody can read.
+            let name = self.stack.output.clone().unwrap_or_else(|| "the default".into());
+            match &seen.output {
+                adapter::Link::Adrift(on) => {
+                    self.status(format!("output drifted onto \"{on}\" — putting it back on \"{name}\""))
+                }
+                adapter::Link::Contested(on) => {
+                    self.status(format!("\"{on}\" is holding the rack's output away from \"{name}\""))
+                }
+                _ => {}
+            }
+            self.stack.link = seen.output;
+        }
 
         let Some(engine) = &self.engine else { return };
 
@@ -1700,11 +1738,27 @@ impl App {
                 next.player = np.as_ref().map(|n| n.player.clone());
                 next.title = np.as_ref().map(|n| n.title.clone()).unwrap_or_default();
                 next.artist = np.as_ref().map(|n| n.artist.clone()).unwrap_or_default();
+                next.link = seen.aux.clone();
             } else {
                 next = Default::default();
             }
+            // Say it once, when it happens. The bay goes on showing it for as
+            // long as it is true; the status line is for the moment it changed,
+            // because the operator may well be looking at another unit.
+            // A drift is described; only a stream that would not stay put after
+            // being pushed back in gets somebody blamed for it.
+            let what = a.source.clone().unwrap_or_else(|| "the cable".into());
+            let note = match (&next.link, &a.link) {
+                (adapter::Link::Adrift(on), was) if !was.astray() => {
+                    Some(format!("{what} came off the aux input onto \"{on}\" — plugging it back in"))
+                }
+                (adapter::Link::Contested(who), was) if !matches!(was, adapter::Link::Contested(_)) => {
+                    Some(format!("\"{who}\" keeps taking {what} back — the rack has stopped trying"))
+                }
+                _ => None,
+            };
             if next != *a {
-                self.stack.apply(Patch { aux: Some(next), ..Default::default() });
+                self.stack.apply(Patch { aux: Some(next), status: note, ..Default::default() });
             }
         }
 
@@ -2536,26 +2590,68 @@ fn main() -> Result<()> {
         return screenshot(&mut app, 110, h);
     }
 
-    // Keep the rack's own output off its own input, continuously.
+    // Watch the rack's own routing, once a second.
     //
-    // Two separate things can put it there. The desktop's "send everything to
-    // ten-qd" is one, and it is a perfectly reasonable thing to click. The
-    // other is simply restarting while our sink is the system default, because
-    // a new stream lands on the default before anything of ours can object.
-    // Either way the result is a howl, so this watches rather than assuming.
+    // Two jobs, and the difference between them is the whole design.
+    //
+    // It *acts* on one condition only: the rack's output landed on the rack's
+    // own input. The desktop's "send everything to ten-qd" does that, and it is
+    // a perfectly reasonable thing to click; so does restarting while our sink
+    // is the system default, because a new stream lands on the default before
+    // anything of ours can object. Either way the result is a howl, and a howl
+    // has to stop whether or not anyone is looking at the panel.
+    //
+    // Everything else gets one attempt, and then the truth — see
+    // [`adapter::Reseat`]. `move-sink-input` is a request with no memory, so a
+    // policy agent that wants a stream can take it back every second for as
+    // long as it likes, and EasyEffects with "process all output streams" does
+    // exactly that. Matching it move for move is a war between two processes
+    // with equal privileges, which neither wins and the operator hears as
+    // stuttering. But refusing to try at all is worse in the commoner case:
+    // when the grabber *quits*, its sink goes with it and WirePlumber drops the
+    // orphaned streams onto the system default, where they will sit forever
+    // with nobody contesting them. One push, remembered against the sink it was
+    // found on, handles both — the fight is conceded after a single exchange,
+    // and the tidying-up is done without being asked.
     {
         let want = app.guard_target.clone();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _ = stop;
-        std::thread::Builder::new().name("ten-qd/loopguard".into()).spawn(move || {
+        let plugged = app.plugged.clone();
+        let seen = app.routing.clone();
+        let mut aux_reseat = adapter::Reseat::default();
+        let mut out_reseat = adapter::Reseat::default();
+        std::thread::Builder::new().name("ten-qd/routeguard".into()).spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(1000));
-                if !adapter::own_output_is_looping() {
+                let preferred = want.lock().ok().and_then(|g| g.clone());
+
+                // The loop, which is the one thing worth fighting over.
+                if adapter::own_output_is_looping() {
+                    if let Some(s) = adapter::safe_output(preferred.as_deref()) {
+                        let _ = adapter::route_own_output(&s.name);
+                    }
                     continue;
                 }
-                let preferred = want.lock().ok().and_then(|g| g.clone());
-                if let Some(s) = adapter::safe_output(preferred.as_deref()) {
+
+                let idx = plugged.lock().ok().and_then(|p| *p);
+                let raw = adapter::routing(idx, preferred.as_deref());
+
+                // One attempt each, then the truth. `judge` decides whether
+                // this is a plug worth pushing back in or a fight already lost;
+                // the push happens here so the deciding stays testable.
+                let (aux, reseat_aux) = aux_reseat.judge(raw.aux);
+                if reseat_aux && let Some(i) = idx {
+                    let _ = adapter::reseat(i);
+                }
+
+                let (output, reroute) = out_reseat.judge(raw.output);
+                if reroute
+                    && let Some(s) = adapter::safe_output(preferred.as_deref())
+                {
                     let _ = adapter::route_own_output(&s.name);
+                }
+
+                if let Ok(mut g) = seen.lock() {
+                    *g = adapter::Routing { aux, output };
                 }
             }
         })?;

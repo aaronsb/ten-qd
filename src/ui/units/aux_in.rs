@@ -143,6 +143,23 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
                 .add_modifier(Modifier::BOLD),
         );
         chassis::boxed_green(buf, right, w.y + 3, "MPRIS", theme, a.state.player.is_some(), true);
+
+        // LINK: is the stream we plugged in still on our sink?
+        //
+        // Green because a seated plug is a mode, red because a plug that has
+        // come out is an alert — the panel's existing grammar, and the reason
+        // there are two `boxed` helpers. It blinks rather than sitting lit,
+        // because the signal is not going where the panel says it is, and that
+        // is not a thing to notice only if you happen to be looking.
+        let lx = right + 8;
+        if lx + 6 <= w.x + w.width {
+            if a.state.link.astray() {
+                chassis::boxed(buf, lx, w.y + 3, "LINK", theme, chassis::blinking(stack.frame), true);
+            } else {
+                let seated = matches!(a.state.link, crate::adapter::Link::Seated);
+                chassis::boxed_green(buf, lx, w.y + 3, "LINK", theme, seated, true);
+            }
+        }
     }
 
     // --- keys -------------------------------------------------------------
@@ -174,15 +191,25 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     // actually plugged in. MPRIS will happily report a player that is playing
     // straight to the speakers, and saying that came through the rack would be
     // the panel describing a signal path that does not exist.
-    let strip = match (&a.state.source, a.state.title.is_empty()) {
-        (Some(src), true) => format!("{src} · via aux"),
-        (Some(_), false) if a.state.artist.is_empty() => {
-            format!("{} · via aux", a.state.title)
+    //
+    // A plug that has come out outranks all of it: everything below this line
+    // describes what is coming through the rack, and when the answer is
+    // "nothing" that is the only sentence worth the row.
+    //
+    // The two ways of saying it are not interchangeable. A stream sitting on
+    // some other sink is *located*, because most of the time nothing did it on
+    // purpose — a virtual sink's owner quits and WirePlumber tips the orphans
+    // onto the default, and the device they land on did nothing. Only a stream
+    // that would not stay put after being pushed back in gets somebody named,
+    // and by then the naming is evidence rather than a guess.
+    let strip = match (&a.state.link, &a.state.source) {
+        (crate::adapter::Link::Adrift(on), Some(src)) => {
+            format!("{src} — went to \"{on}\", not through the rack")
         }
-        (Some(_), false) => format!("{} — {} · via aux", a.state.artist, a.state.title),
-        (None, _) => {
-            format!("nothing plugged in — send audio to \"{}\"", crate::adapter::DESCRIPTION)
+        (crate::adapter::Link::Contested(who), Some(src)) => {
+            format!("{src} — held on \"{who}\"; the rack cannot get it back")
         }
+        _ => shelf(a),
     };
     let max = inner.width.saturating_sub(SPINE + 2) as usize;
     let strip: String = strip.chars().take(max).collect();
@@ -191,7 +218,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
         ky + 3,
         &strip,
         Style::default()
-            .fg(theme.ink_grey)
+            .fg(if a.state.link.astray() { theme.ink_red } else { theme.ink_grey })
             .bg(theme.chassis)
             .add_modifier(Modifier::ITALIC),
     );
@@ -199,9 +226,137 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     chassis::model_corner(buf, inner, &["AUXILIARY INPUT QA-581"], theme);
 }
 
+/// What the shelf strip says while the cable is behaving.
+fn shelf(a: &crate::state::Aux) -> String {
+    match (&a.state.source, a.state.title.is_empty()) {
+        (Some(src), true) => format!("{src} · via aux"),
+        (Some(_), false) if a.state.artist.is_empty() => {
+            format!("{} · via aux", a.state.title)
+        }
+        (Some(_), false) => format!("{} — {} · via aux", a.state.artist, a.state.title),
+        (None, _) => {
+            format!("nothing plugged in — send audio to \"{}\"", crate::adapter::DESCRIPTION)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::Link;
+
+    /// The bay as text, so what the panel claims can be asserted on.
+    fn render(link: Link, source: Option<&str>, frame: u64) -> String {
+        let mut stack = Stack::default();
+        stack.aux.state.source = source.map(str::to_string);
+        stack.aux.state.link = link;
+        stack.frame = frame;
+        let area = Rect::new(0, 0, 120, 12);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::for_stack(&stack);
+        draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+        (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The failure this unit was extended for. A stream that is not on our
+    /// sink must not go on being described as a signal path.
+    #[test]
+    fn a_stream_that_is_not_on_our_sink_stops_claiming_a_path() {
+        let panel = render(Link::Adrift("EasyEffects Sink".into()), Some("Google Chrome"), 0);
+        assert!(panel.contains("not through the rack"), "{panel}");
+        assert!(!panel.contains("via aux"), "the rack must not claim a path it has not got:\n{panel}");
+    }
+
+    /// A sink a stream merely landed on is a bystander. When EasyEffects quits,
+    /// its sink goes with it and WirePlumber tips the orphans onto the default
+    /// output — the headphones they land on did nothing, and saying they "took"
+    /// the stream sends the operator to argue with the wrong program.
+    #[test]
+    fn a_bystander_sink_is_located_not_blamed() {
+        let panel = render(Link::Adrift("Muh Chickin Waffles".into()), Some("Google Chrome"), 0);
+        assert!(panel.contains("went to \"Muh Chickin Waffles\""), "{panel}");
+        for accusation in ["taken", "took", "holding", "held"] {
+            assert!(!panel.contains(accusation), "accused a bystander of {accusation}:\n{panel}");
+        }
+    }
+
+    /// Once the rack has pushed the plug back in and been overruled, naming the
+    /// culprit is evidence rather than a guess — and the panel says plainly
+    /// that it has stopped trying, so the operator knows to go and fix it.
+    #[test]
+    fn a_stream_something_is_holding_names_it() {
+        let panel = render(Link::Contested("EasyEffects Sink".into()), Some("Google Chrome"), 0);
+        assert!(panel.contains("held on \"EasyEffects Sink\""), "{panel}");
+        assert!(panel.contains("cannot get it back"), "{panel}");
+    }
+
+    /// The complement, and the one that would catch a warning stuck on: a plug
+    /// that held says so, in the ordinary language of the shelf.
+    #[test]
+    fn a_plug_that_held_still_reads_as_a_signal_path() {
+        let panel = render(Link::Seated, Some("Google Chrome"), 0);
+        assert!(panel.contains("via aux"), "{panel}");
+        assert!(!panel.contains("not through the rack"), "{panel}");
+    }
+
+    /// Whether the LINK segment is lit on this frame.
+    ///
+    /// Read off the style, not the text: an unlit segment is still drawn, the
+    /// same way an unlit segment of a real VFD is still a segment you can see.
+    /// Asking whether the panel *contains* "LINK" answers a question about the
+    /// glyph, not about the lamp.
+    fn link_lit(link: Link, frame: u64) -> bool {
+        let mut stack = Stack::default();
+        stack.aux.state.source = Some("Google Chrome".into());
+        stack.aux.state.link = link;
+        stack.frame = frame;
+        let area = Rect::new(0, 0, 120, 12);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::for_stack(&stack);
+        draw(&mut buf, area, &stack, &theme, &mut HitMap::new());
+        for y in 0..area.height {
+            for x in 0..area.width.saturating_sub(4) {
+                if ["L", "I", "N", "K"].iter().enumerate().all(|(i, c)| {
+                    buf[(x + i as u16, y)].symbol() == *c
+                }) {
+                    return buf[(x, y)].style().add_modifier.contains(Modifier::BOLD);
+                }
+            }
+        }
+        panic!("the bay drew no LINK segment at all");
+    }
+
+    /// A blinking warning is only a warning if it comes back. Half a second
+    /// lit, half a second dark, and lit again — asserted across the wrap, so a
+    /// phase that flashes once and sticks cannot pass.
+    #[test]
+    fn the_warning_blinks_rather_than_flashing_once() {
+        let pulled = Link::Contested("EasyEffects Sink".into());
+        assert!(link_lit(pulled.clone(), 0), "must be lit on the frame the fault appears");
+        assert!(!link_lit(pulled.clone(), 20), "must go dark between flashes");
+        assert!(link_lit(pulled, 35), "and must come back — a single flash can be missed");
+    }
+
+    /// A seated plug is a steady lamp, not a blinking one: it must read the
+    /// same on every frame, or it would look like a fault.
+    #[test]
+    fn a_seated_plug_does_not_blink() {
+        for f in [0, 20, 35, 100] {
+            assert!(link_lit(Link::Seated, f), "seated must stay lit, frame {f}");
+        }
+    }
+
+    /// `Gone` is a stream that ended, which is what stopping the music looks
+    /// like from here. Lighting a fault for it would train the operator to
+    /// ignore the lamp.
+    #[test]
+    fn a_stream_that_ended_raises_no_alarm() {
+        let panel = render(Link::Gone, Some("Google Chrome"), 0);
+        assert!(!panel.contains("taken back"), "{panel}");
+    }
 
     #[test]
     fn a_dead_cable_lights_nothing() {

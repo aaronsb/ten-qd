@@ -126,12 +126,28 @@ pub fn draw(buf: &mut Buffer, area: Rect, stack: &Stack, theme: &Theme, hits: &m
     let name = stack.output.clone().unwrap_or_else(|| "system default".into());
     let name: String = name.chars().take(34).collect();
     let name = format!("{name} ▸");
+    // Naming a device is a claim that the rack is driving it, and the desktop
+    // can move our output stream out from under that claim at any moment. When
+    // it has, the name goes red and LINK blinks beside it: the picker still
+    // shows what was chosen, because that is what the key does, but the panel
+    // stops asserting it is where the sound is going. This is the failure that
+    // had OUTPUT reading a set of headphones while every sample went somewhere
+    // else entirely.
+    let astray = stack.link.astray();
     buf.set_string(
         x + 8,
         oy,
         &name,
-        Style::default().fg(theme.ink_white).bg(theme.chassis),
+        Style::default()
+            .fg(if astray { theme.ink_red } else { theme.ink_white })
+            .bg(theme.chassis),
     );
+    if astray {
+        let lx = x + 9 + name.chars().count() as u16;
+        if lx + 6 <= inner.x + inner.width {
+            chassis::boxed(buf, lx, oy, "LINK", theme, chassis::blinking(stack.frame), false);
+        }
+    }
     hits.add_row(x, oy, 44, Command::OutputsOpen);
 
     chassis::model_corner(buf, inner, &["CONTROL HEAD LT-581"], theme);
